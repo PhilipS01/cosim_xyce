@@ -1,15 +1,23 @@
 Toy Problem aus RL glied mit Xyce loesen
 .INCLUDE sim_params.inc
 
+* Zeit ist jetzt ABSOLUT und kontinuierlich (Checkpoint/Restart über Zeitfenster), nicht
+* mehr 0..dt_field pro Fenster. Daher:
+*   - Quellenphase nutzt `time` direkt (kein +t_abs_start mehr).
+*   - Fenster-LOKALE (akkumulierte) Zeit für die Sekanten-Terme = (time - t_abs_start).
+
 * Port node p gegen ground. Behavioral source = EMF minus serieller Kopplungsdrop Rs/Ls.
 * Amplitude/Frequenz aus sim_params.inc (amp_src, f_src) → single source of truth in C++.
 * V(p) = Vsrc - Rs*I(Vmeas) - Ls*dI/dt   (Two-way coupling: V(p) reagiert auf Interface-Strom.)
 * Rs = Ls = 0 → V(p) = Vsrc (one-way, alter trivialer Fall).
 * Ls-Term nutzt dieselbe akkumulierte Sekante wie Biface/FEM (konsistente Diskretisierung).
+* HINWEIS: Versuch, Ls als echtes L-Device zu modellieren scheiterte — eine BDF-Induktivitaet in
+* Reihe mit dem near-ideal-current-source Feld-ROM (Biface) ist steif und inkonsistent mit der
+* per-Fenster-Sekante; der Zeitschritt kollabiert. Die behaviorale Matched-Sekante bleibt korrekt.
 Bsrc p 0 V = {
-+ amp_src*sin(2*pi*f_src*(time+t_abs_start))
++ amp_src*sin(2*pi*f_src*time)
 + - Rs*I(Vmeas)
-+ - IF(time <= eps_t, Ls*dIdt0, Ls*(I(Vmeas)-I0)/time)
++ - IF((time - t_abs_start) <= eps_t, Ls*dIdt0, Ls*(I(Vmeas)-I0)/(time - t_abs_start))
 + }
 
 * Alte Feld-/Interface-Waveforms aus WR-Iteration k
@@ -23,12 +31,14 @@ Vmeas p nx 0
 * I(Vmeas) = I_field_prev + (V(p) - V(vfprev)) / (Rrom + Lrom/time)
 * Hergeleitet aus INTERFACE_condition in CoSimulation_WR.cpp mit akkumulierter Sekante.
 Biface nx 0 I = {
-+ IF(time <= eps_t,
++ IF((time - t_abs_start) <= eps_t,
 +   I0,
-+   V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/time)
++   V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/(time - t_abs_start))
 + )
 + }
 
-.tran {dt_print} {t_stop} 0 UIC
+* .OPTIONS RESTART und .tran werden pro Zeitfenster vom C++-Master generiert
+* (Fenster 1: UIC-Transient ab 0; Fenster k>1: Restart ab Checkpoint). Siehe WriteRestartDirectives.
+.INCLUDE restart.inc
 .print tran V(p) V(nx) I(Vmeas)
 .end

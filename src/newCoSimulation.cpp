@@ -1,5 +1,6 @@
 #include "../include/Header.h"
 #include <cstddef>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <ios>
@@ -300,14 +301,24 @@ void MasterProcess()
         const double t_stop = step_field * dt_field;
         WriteSimParams("sim_params.inc", 0.0, dt_field, t_start, I0, R_ROM, L_ROM, Frequency, V_src_amplitude, dIdt_0, g_cfg.R_series, g_cfg.L_series, N_xyce_coupling_intervals);
 
-        // initialisiere mit zuletzt akzeptierten Werten.
+        // Fenster-spezifische Restart/.tran-Direktiven generieren (von wr_circuit.cir inkludiert).
+        // Fenster 1: frischer UIC-Transient ab 0; Fenster k>1: Restart aus "restart_state".
+        WriteRestartDirectives("restart.inc", step_field == 1, dt_field, "ckpt_out", "restart_state");
+
+        // initialisiere mit zuletzt akzeptierten Werten. Zeitstempel sind jetzt ABSOLUT
+        // ([t_start, t_stop]), da Xyce die PWL-FILE-Quellen an der absoluten Simulationszeit
+        // auswertet (Restart startet bei t_start, nicht bei 0).
         // vf_prev_k.pwl: Portspannungs-Rampe mit getragener Anfangssteigung dVdt_0 → V(vfprev)
         // hat konsistente Anfangsableitung für den Biface-Ausdruck (auch bei Rs/Ls korrekt, da
         // dVdt_0 aus der konvergierten V(p)-Endsteigung des Vorfensters stammt).
-        WriteInitialPwl("vf_prev_k.pwl", 0.0, dt_field, V0, dVdt_0);
+        WriteInitialPwl("vf_prev_k.pwl", t_start, t_stop, V0, dVdt_0);
         // i_prev_k.pwl: lineare Rampe mit Steigung dIdt_0 → V(iprev) hat konsistente
         // Anfangsableitung passend zur akkumulierten Sekante im FEM-Solver.
-        WriteInitialPwl("i_prev_k.pwl",   0.0, dt_field, I0, dIdt_0);
+        WriteInitialPwl("i_prev_k.pwl",   t_start, t_stop, I0, dIdt_0);
+
+        // Veraltete Checkpoint-Kandidaten dieses Prefixes entfernen, damit CommitCheckpoint
+        // nach der WR-Schleife garantiert den frisch erzeugten Kandidaten dieses Fensters waehlt.
+        ClearCheckpoints("ckpt_out");
 
         CircuitWaveform circuit_sol; // circuit solution array (nur für Ausgabe/Visualisierung gebraucht)
 
@@ -324,7 +335,7 @@ void MasterProcess()
             // Circuit Solver aufrufen: Biface liefert I(Vmeas) = INTERFACE_condition(V(p), V(vfprev), V(iprev)).
             // ReadXyceResults schreibt V(p)-Waveform nach vf_prev_k.pwl für FEM-Eingang.
             RunXyce("wr_circuit.cir");
-            ReadXyceResults("wr_circuit.cir.prn", circuit_sol, 0.0, dt_field, N_xyce_coupling_intervals);
+            ReadXyceResults("wr_circuit.cir.prn", circuit_sol, t_start, t_stop, N_xyce_coupling_intervals);
 
             // FEM Solver aufrufen (dummy, voltage-driven):
             // liest vf_prev_k.pwl (Portspannung V(p) von Xyce)
@@ -390,9 +401,15 @@ void MasterProcess()
             fprintf(file_Field, "%-10lu %-17.8e %-17.8e %-17.8e\n", global_field_index++, t_stop, V_field, I_field);
             fflush(file_Field);
 
-            // die Xycelösung des Zeitfensters an die vorigen anhängen
+            // Konvergierten Endzustand als Restart-Basis fuers naechste Fenster sichern.
+            // (Alle WR-Iterationen schrieben denselben Kandidaten ckpt_out<t_stop>; der
+            // neueste ist der konvergierte.)
+            CommitCheckpoint("ckpt_out", "restart_state");
+
+            // die Xycelösung des Zeitfensters an die vorigen anhängen.
+            // Waveforms tragen jetzt ABSOLUTE Zeit → Offset 0.0 (kein erneutes Verschieben).
             const bool skip_first_point = (step_field > 1);
-            appendCircuitWaveformXyceStyle(file_Circuit, circuit_sol, t_start, global_circuit_index, skip_first_point);
+            appendCircuitWaveformXyceStyle(file_Circuit, circuit_sol, 0.0, global_circuit_index, skip_first_point);
 
             // auch die Feld-WAVEFORMS (also nicht nur Endpunkte) speichern wir im Xyce Format ab
             // dafür lesen wir die konvergierten Waveforms ein (letzte Iteration)
@@ -403,14 +420,14 @@ void MasterProcess()
             // damit appendFieldWaveformXyceStyle übereinstimmende Zeitstempel sieht.
             // (vf_conv hat N_xyce_coupling_intervals+1 Knoten, i_conv hat N_field_eval_intervals+1)
             Waveform vf_endpoints = resampleWaveformUniform(
-                vf_conv, 0.0, dt_field, N_field_eval_intervals
+                vf_conv, t_start, t_stop, N_field_eval_intervals
             );
             Waveform i_endpoints = resampleWaveformUniform(
-                i_conv, 0.0, dt_field, N_field_eval_intervals
+                i_conv, t_start, t_stop, N_field_eval_intervals
             );
 
-            // und hängen sie an die bisherigen Zeitfenster an
-            appendFieldWaveformXyceStyle(file_Field_waveform, vf_endpoints, i_endpoints, t_start, global_field_waveform_index, skip_first_point);
+            // und hängen sie an die bisherigen Zeitfenster an (Waveforms bereits absolut → Offset 0.0)
+            appendFieldWaveformXyceStyle(file_Field_waveform, vf_endpoints, i_endpoints, 0.0, global_field_waveform_index, skip_first_point);
 
             // Festhalten der Endwerte für die Anfangswerte des nächsten Zeitfensters
             V0 = vf_conv.y.back(); // Portspannung am Fensterende (= V(p) bei t=dt_field)
@@ -456,9 +473,9 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     // Reads the port voltage waveform stored by ReadXyceResults from V(p).
     const Waveform vport = readPWLFile("vf_prev_k.pwl");
 
-    if (abs(vport.t.front()) > 1e-14) {
-        throw runtime_error("vf_prev_k.pwl does not start at local time 0.");
-    }
+    // Zeit ist jetzt absolut (vport.t.front() = absoluter Fensteranfang, nicht 0). Der
+    // FEM-Solver ist offset-agnostisch: t_acc wird unten als (t[j] - front) gemessen, also
+    // korrekt unabhaengig vom absoluten Startzeitpunkt. Daher keine "startet bei 0"-Pruefung.
 
     const size_t Nv = vport.t.size();
     if (Nv < 2) {
@@ -699,9 +716,9 @@ void RunXyce(const string& filename) {
 
 void WriteSimParams(
     const string& filename,
-    double t_start, // xyce simuliert immer von t=0, also kann man sich das eigentlich sparen
-    double t_window, // previously t_stop
-    double t_abs_start, // für Phase der Schaltungskomponenten
+    double t_start, // Print-Startzeit (absolut) = t_abs_start; Xyce gibt ab hier aus
+    double t_window, // Fensterlaenge dt_field
+    double t_abs_start, // absoluter Fensteranfang; jetzt für (time - t_abs_start) in den Sekanten-Termen
     double i0,
     double rrom,
     double lrom,
@@ -728,10 +745,14 @@ void WriteSimParams(
     // Zum vermeiden von Singularitäten in den Ableitungen
     const double eps_t = 1.0e-15;
 
+    // Zeit ist absolut/kontinuierlich (Checkpoint/Restart): tran-Stoppzeit ist der
+    // ABSOLUTE Fensterende-Zeitpunkt, nicht die Fensterlaenge.
+    const double t_stop_abs = t_abs_start + t_window;
+
     ofstream out(filename);
     out << scientific << setprecision(16);
     out << ".PARAM t_start      = " << t_start      << "\n";
-    out << ".PARAM t_stop       = " << t_window     << "\n";
+    out << ".PARAM t_stop       = " << t_stop_abs   << "\n";
     out << ".PARAM t_abs_start  = " << t_abs_start  << "\n";
     out << ".PARAM I0           = " << i0           << "\n";
     out << ".PARAM Rrom         = " << rrom         << "\n";
@@ -743,6 +764,102 @@ void WriteSimParams(
     out << ".PARAM dIdt0        = " << dIdt0        << "\n";
     out << ".PARAM Rs           = " << r_series     << "\n";
     out << ".PARAM Ls           = " << l_series     << "\n";
+}
+
+// Schreibt restart.inc: die fenster-spezifische .OPTIONS RESTART und .tran Zeile.
+// Zeit ist absolut → tran-Stoppzeit = {t_stop} (absolut), Print-Start = {t_abs_start}.
+//   Fenster 1: frischer UIC-Transient ab 0, schreibt Checkpoints (JOB=...).
+//   Fenster k>1: Restart aus committed_file (FILE=...), schreibt neue Checkpoints.
+// INITIAL_INTERVAL = Fensterlaenge → genau ein Checkpoint am (absoluten) Fensterende.
+// Als Literal geschrieben, da .OPTIONS sich nicht auf {param}-Expansion verlassen soll.
+void WriteRestartDirectives(
+    const string& filename,
+    bool first_window,
+    double dt_window,
+    const string& ckpt_out_prefix,
+    const string& committed_file)
+{
+    ofstream out(filename);
+    if (!out) {
+        throw runtime_error("WriteRestartDirectives: could not open " + filename);
+    }
+
+    out << scientific << setprecision(16);
+
+    if (first_window) {
+        out << ".OPTIONS RESTART PACK=0 JOB=" << ckpt_out_prefix
+            << " INITIAL_INTERVAL=" << dt_window << "\n";
+        // Frischer Transient ab 0; Print ab {t_abs_start} (=0 im ersten Fenster).
+        out << ".tran {dt_print} {t_stop} {t_abs_start} UIC\n";
+    } else {
+        out << ".OPTIONS RESTART FILE=" << committed_file
+            << " JOB=" << ckpt_out_prefix
+            << " INITIAL_INTERVAL=" << dt_window << "\n";
+        // Restart setzt Integrator auf die Checkpoint-Zeit; kein UIC.
+        out << ".tran {dt_print} {t_stop} {t_abs_start}\n";
+    }
+}
+
+// Loescht alte Checkpoint-Kandidaten <prefix>* im Arbeitsverzeichnis. Verhindert, dass
+// ein veralteter Kandidat aus einem frueheren Fenster faelschlich committed wird.
+void ClearCheckpoints(const string& prefix)
+{
+    namespace fs = std::filesystem;
+    for (const auto& entry : fs::directory_iterator(fs::current_path())) {
+        if (!entry.is_regular_file()) continue;
+        const string name = entry.path().filename().string();
+        if (name.rfind(prefix, 0) == 0) { // beginnt mit prefix
+            std::error_code ec;
+            fs::remove(entry.path(), ec);
+        }
+    }
+}
+
+// Sucht den Checkpoint <prefix>* mit der GROESSTEN Simulationszeit (= Fensterende) und
+// kopiert ihn nach committed_file als Restart-Basis fuers naechste Zeitfenster.
+// Die Sim-Zeit steht als Suffix im Dateinamen (Xyce: JOB + Zeit, z.B. ckpt_out0.02).
+// Max-Zeit (statt mtime) ist robust, weil Xyce beim Restart zusaetzlich einen Checkpoint
+// bei t=0 schreibt (ckpt_out0); der gewollte Endzustand hat immer die groesste Zeit.
+void CommitCheckpoint(const string& prefix, const string& committed_file)
+{
+    namespace fs = std::filesystem;
+    fs::path best;
+    double best_time = -1.0;
+    bool found = false;
+
+    for (const auto& entry : fs::directory_iterator(fs::current_path())) {
+        if (!entry.is_regular_file()) continue;
+        const string name = entry.path().filename().string();
+        if (name.rfind(prefix, 0) != 0) continue; // nicht unser Prefix
+
+        // Zeit-Suffix hinter dem Prefix parsen (z.B. "0", "0.02", "4e-04").
+        const string suffix = name.substr(prefix.size());
+        char* end = nullptr;
+        const double t = std::strtod(suffix.c_str(), &end);
+        if (end == suffix.c_str()) continue; // kein numerisches Suffix → ueberspringen
+
+        if (!found || t > best_time) {
+            best = entry.path();
+            best_time = t;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        throw runtime_error(
+            "CommitCheckpoint: no checkpoint file '" + prefix +
+            "*' produced by Xyce. Restart write failed?");
+    }
+    const fs::path& newest = best;
+
+    std::error_code ec;
+    fs::copy_file(newest, committed_file,
+                  fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        throw runtime_error("CommitCheckpoint: failed to copy " +
+                            newest.string() + " -> " + committed_file +
+                            ": " + ec.message());
+    }
 }
 
 // Linearer Resampler auf uniformes Grid mit N_intervals+1 Stuetzstellen ueber [t_start, t_stop].

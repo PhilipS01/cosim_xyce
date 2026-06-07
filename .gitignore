@@ -1,0 +1,20 @@
+# build
+main
+*.o
+
+# Xyce run outputs / coupling artifacts
+*.prn
+*.pwl
+ckpt_out*
+restart_state
+restart.inc
+coupling.inc
+xyce_stdout.log
+xyce_stderr.log
+Field.txt
+Circuit.txt
+WR_error.txt
+
+# scratch
+_cfg_*.txt
+*.log

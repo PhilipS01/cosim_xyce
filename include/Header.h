@@ -103,6 +103,22 @@ void RunXyce(const string& filename);
 
 void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double dIdt0, double r_series, double l_series, const unsigned N_coupling_intervals);
 
+// Generiert restart.inc (von wr_circuit.cir inkludiert): die fenster-spezifische
+// .OPTIONS RESTART und .tran Zeile. Fenster 1 (first_window=true): frischer UIC-Transient
+// ab t=0, schreibt Checkpoints (JOB). Fenster k>1: Restart aus committed_file (FILE=),
+// schreibt neue Checkpoints. Zeit ist absolut: tran-Stoppzeit = t_stop (absolut).
+void WriteRestartDirectives(const string& filename, bool first_window,
+                            double dt_window, const string& ckpt_out_prefix,
+                            const string& committed_file);
+
+// Loescht alte Checkpoint-Kandidaten <prefix>* vor der WR-Schleife (verhindert, dass ein
+// veralteter Kandidat als neuester ausgewaehlt wird).
+void ClearCheckpoints(const string& prefix);
+
+// Sucht den neuesten (nach mtime) Checkpoint <prefix>* und kopiert ihn nach committed_file
+// als Restart-Basis fuer das naechste Zeitfenster.
+void CommitCheckpoint(const string& prefix, const string& committed_file);
+
 inline void Write_Terminal_results(const char s[80], const double V, const double I)
 {
 	FILE* file = fopen(s, "w");
