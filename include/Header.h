@@ -111,6 +111,11 @@ void WriteRestartDirectives(const string& filename, bool first_window,
                             double dt_window, const string& ckpt_out_prefix,
                             const string& committed_file);
 
+// Generiert ls_branch.inc: serielles Ls-Bauteil zwischen Knoten a und b (PROTOTYPE).
+// Ls>0  → echte Induktivitaet "Ls_d a b {Ls} IC=0" (BDF, restart-nativ).
+// Ls==0 → winziger Widerstand "Rls_d a b 1e-9" (idealer Kurzschluss ohne degeneriertes L=0).
+void WriteLsBranch(const string& filename, double l_series);
+
 // Loescht alte Checkpoint-Kandidaten <prefix>* vor der WR-Schleife (verhindert, dass ein
 // veralteter Kandidat als neuester ausgewaehlt wird).
 void ClearCheckpoints(const string& prefix);

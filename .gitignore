@@ -9,6 +9,7 @@ ckpt_out*
 restart_state
 restart.inc
 coupling.inc
+ls_branch.inc
 xyce_stdout.log
 xyce_stderr.log
 Field.txt

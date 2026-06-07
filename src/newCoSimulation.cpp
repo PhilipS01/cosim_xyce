@@ -238,7 +238,7 @@ void MasterProcess()
     fflush(file_Field_waveform);
     
     FILE* file_Circuit = fopen("Circuit_solution.prn", "w");
-    fprintf(file_Circuit, "Index       TIME              V(P)              V(NX)             I(VMEAS)\n");
+    fprintf(file_Circuit, "Index       TIME              V(P)              I(LS)             I(LROM)\n");
     fflush(file_Circuit);
 
     FILE* file_WR_error = fopen("WR_error.txt", "w");
@@ -283,12 +283,19 @@ void MasterProcess()
     double I0 = 0.0;
     double V0 = 0.0;
     double dIdt_0 = 0.0;
+    // Deferred-correction Seed (icorr = I_FEM - i_rom) am Fensteranfang. Wird am Fensterende
+    // getragen → flacher Iter-1-Seed des naechsten Fensters. Fenster 1, Iter 1: 0.
+    double icorr0 = 0.0;
     // dV/dt der Portspannung am Fensteranfang (Seed-Slope für vf_prev_k.pwl). Wird am Fensterende
     // aus der konvergierten V(p)-Waveform getragen (topologie-agnostisch, korrekt auch mit Rs/Ls).
     // Fenster 1: Quellen-Steigung (bei I0=0,dIdt0=0 ist V(p)≈Vsrc).
     double dVdt_0 = V_src_amplitude * 2.0 * M_PI * Frequency * cos(2.0 * M_PI * Frequency * 0.0);
 
     //fprintf(file_Field, "%-10lu %-17.8e %-17.8e %-17.8e\n", global_field_index++, 0.0, V_field, I_field);
+
+    // Ls-Bauteil einmalig generieren (Ls konstant ueber alle Fenster): echtes L-Device fuer
+    // Ls>0 (restart-nativ), winziger Widerstands-Kurzschluss fuer Ls=0.
+    WriteLsBranch("ls_branch.inc", g_cfg.L_series);
 
     // Äußere Schleife der Zeitfenster
     // hier ist Feldintervall = WR-Zeitfenster
@@ -315,6 +322,9 @@ void MasterProcess()
         // i_prev_k.pwl: lineare Rampe mit Steigung dIdt_0 → V(iprev) hat konsistente
         // Anfangsableitung passend zur akkumulierten Sekante im FEM-Solver.
         WriteInitialPwl("i_prev_k.pwl",   t_start, t_stop, I0, dIdt_0);
+        // icorr_prev_k.pwl: Deferred-correction Quelle (Bcorr). Iter-1-Seed = flacher
+        // getragener Endwert des Vorfensters (absolute Zeit). Wird ab Iter 2 ueberschrieben.
+        WriteInitialPwl("icorr_prev_k.pwl", t_start, t_stop, icorr0, 0.0);
 
         // Veraltete Checkpoint-Kandidaten dieses Prefixes entfernen, damit CommitCheckpoint
         // nach der WR-Schleife garantiert den frisch erzeugten Kandidaten dieses Fensters waehlt.
@@ -325,6 +335,7 @@ void MasterProcess()
         unsigned WR_iteration;
         double WR_rel_Error = 1.0;
         bool WR_converged = false;
+        double icorr_end = icorr0; // getragener Korrektur-Endwert (fuer naechsten Fenster-Seed)
         Waveform i_prev_last_iter; // i_m^(k-1) für L1-Konvergenzkriterium; leer am Fensteranfang
         double V_field_last_iter = 0.0; // für terminal-skalar Kriterium (Referenz CoSimulation_WR.cpp)
         double I_field_last_iter = 0.0;
@@ -332,8 +343,9 @@ void MasterProcess()
         for (WR_iteration = 1; WR_iteration <= WRmaxSteps; WR_iteration++) {
             circuit_sol = CircuitWaveform{};
 
-            // Circuit Solver aufrufen: Biface liefert I(Vmeas) = INTERFACE_condition(V(p), V(vfprev), V(iprev)).
-            // ReadXyceResults schreibt V(p)-Waveform nach vf_prev_k.pwl für FEM-Eingang.
+            // Circuit Solver: reale Companion-Netzwerk-Kopplung. Bcorr nutzt icorr_prev_k.pwl
+            // (Korrektur der Vor-Iteration). ReadXyceResults schreibt V(p) nach vf_prev_k.pwl
+            // (FEM-Eingang) und liefert i_rom (= circuit_sol.i = I(Lrom_d)) für die Korrektur.
             RunXyce("wr_circuit.cir");
             ReadXyceResults("wr_circuit.cir.prn", circuit_sol, t_start, t_stop, N_xyce_coupling_intervals);
 
@@ -347,6 +359,21 @@ void MasterProcess()
             // i_prev = Feldstrom-Waveform dieser Iteration (FEM-Ausgang)
             Waveform i_prev = readPWLFile("i_prev_k.pwl");
             std::cout << "PWL points: " << i_prev.t.size() << std::endl;
+
+            // === Deferred correction fuer die NAECHSTE Iteration ===
+            // icorr(t) = I_FEM(t) - i_rom(t) auf dem Kopplungsraster. i_rom = I(Lrom_d) (roh aus
+            // Xyce, circuit_sol.i); I_FEM = FEM-Ausgang (i_prev). Bei Konvergenz gilt
+            // i_Ls = i_rom + icorr = I_FEM (ROM-Praekonditionierer kuerzt sich heraus).
+            Waveform irom_raw;
+            for (size_t n = 0; n < circuit_sol.t.size(); ++n)
+                irom_raw.push(circuit_sol.t[n], circuit_sol.i[n]);
+            const Waveform irom_cg = resampleWaveformUniform(irom_raw, t_start, t_stop, N_xyce_coupling_intervals);
+            const Waveform ifem_cg = resampleWaveformUniform(i_prev,   t_start, t_stop, N_xyce_coupling_intervals);
+            Waveform icorr;
+            for (size_t j = 0; j < irom_cg.t.size(); ++j)
+                icorr.push(irom_cg.t[j], ifem_cg.y[j] - irom_cg.y[j]);
+            writePWLFile("icorr_prev_k.pwl", icorr);
+            icorr_end = icorr.y.back(); // Endwert tragen → Seed des naechsten Fensters
 
             // Prüfe Konvergenzkriterium. Methode wählbar via g_cfg.wr_convergence_method:
             //   0 = Waveform-L1 des Feldstroms (dieses Codebase)
@@ -432,6 +459,7 @@ void MasterProcess()
             // Festhalten der Endwerte für die Anfangswerte des nächsten Zeitfensters
             V0 = vf_conv.y.back(); // Portspannung am Fensterende (= V(p) bei t=dt_field)
             I0 = I_field;          // Feldstrom am Fensterende (FEM-Ausgang)
+            icorr0 = icorr_end;    // konvergierter Korrektur-Endwert → flacher Seed naechstes Fenster
 
             // dI/dt am Fensterende = dI/dt am Anfang des nächsten Fensters (Stetigkeit)
             const size_t n_i = i_conv.t.size();
@@ -508,36 +536,29 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     );
     const size_t N = V_eval.t.size(); // = N_field_eval_intervals + 1
 
-    // KRITISCH: I_field-Berechnung muss exakt dasselbe akkumulierte Sekanten-Modell wie
-    // Biface in wr_circuit.cir verwenden, um konsistenten WR-Fixpunkt zu garantieren.
-    // Biface: I_c = V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/time)
-    // FEM-Herleitung: V_p = R_FEM*I_f + L_FEM*(I_f - I0)/t_acc
-    //   → I_f = (V_p + L_FEM*I0/t_acc) / (R_FEM + L_FEM/t_acc)  für t_acc > 0
-    //   → I_f = I_win_start                                     für t_acc = 0
-    const double t_win_start = V_eval.t.front();
-
+    // PROTOTYPE: per-step BACKWARD-EULER, history = previous step (NOT the window anchor).
+    // The companion-network coupling means Xyce integrates the real Rrom-Lrom branch with its
+    // BDF; for a consistent WR fixpoint (small residual floor) the FEM must integrate the same
+    // ODE the same way. BE step from I_{j-1} over h_j → matches Xyce's differential operator to
+    // O(h); refine N_field_eval_intervals to shrink the floor.
+    //   linear:  V_p = R*I_j + L*(I_j - I_{j-1})/h  →  I_j = (V_p + (L/h)I_{j-1})/(R + L/h)
+    //   sat.:    g(I) = R*I + (lambda(I) - lambda(I_{j-1}))/h - V_p = 0  (Newton)
     Waveform current;
+    double I_prev = I_win_start; // BE history; seeded by the window-start field state
     for (size_t j = 0; j < N; ++j) {
         double I_j;
         if (j == 0) {
-            // Singulärer Punkt t=0: Anfangsbedingung.
-            I_j = I_win_start;
+            I_j = I_win_start; // window-start initial condition
         } else {
-            // Akkumulierte Sekante: V_p = R*I_f + L*(I_f - I0)/t_acc
-            const double t_acc = V_eval.t[j] - t_win_start;
+            const double h = V_eval.t[j] - V_eval.t[j - 1];
             // Linear closed-form solution; also the Newton seed for the nonlinear case.
-            I_j = (V_eval.y[j] + L_FEM * I_win_start / t_acc)
-                / (R_FEM + L_FEM / t_acc);
+            I_j = (V_eval.y[j] + L_FEM * I_prev / h) / (R_FEM + L_FEM / h);
 
             if (saturating) {
-                // Implicit residual with the accumulated flux secant (same window-start
-                // reference as the linear case, so consistent with the Xyce Biface grid):
-                //   g(I) = R_FEM*I + (lambda(I) - lambda(I_win_start))/t_acc - V_p = 0
-                //   g'(I) = R_FEM + L(I)/t_acc
-                const double lam0 = flux(I_win_start);
+                const double lam_prev = flux(I_prev);
                 for (int it = 0; it < 50; ++it) {
-                    const double g  = R_FEM * I_j + (flux(I_j) - lam0) / t_acc - V_eval.y[j];
-                    const double gp = R_FEM + L_dyn(I_j) / t_acc;
+                    const double g  = R_FEM * I_j + (flux(I_j) - lam_prev) / h - V_eval.y[j];
+                    const double gp = R_FEM + L_dyn(I_j) / h;
                     const double dI = g / gp;
                     I_j -= dI;
                     if (std::fabs(dI) <= 1e-12 + 1e-10 * std::fabs(I_j)) break;
@@ -545,6 +566,7 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
             }
         }
         current.push(V_eval.t[j], I_j);
+        I_prev = I_j;
     }
 
     // This file is used by Xyce as V(iprev) in the next WR iteration.
@@ -634,10 +656,12 @@ double eval_WR_convergence_terminal(
 }
 
 
-// Reads Xyce .prn output produced by ".print tran V(p) V(nx) I(Vmeas)"
-// Columns: Index  time  V(p)  V(nx)  I(Vmeas)
+// Reads Xyce .prn output produced by ".print tran V(p) I(Ls_d) I(Lrom_d)" (PROTOTYPE).
+// Columns: Index  time  V(p)  I(Ls_d)=i_Ls(interface)  I(Lrom_d)=i_rom(ROM branch)
 // Writes V(p) resampled to vf_prev_k.pwl (port voltage for FEM voltage-driven input).
-// Writes last (V(nx), I(Vmeas)) to Circuit.txt.
+// circuit_raw carries (vp=V(p), vnx=i_Ls, i=i_rom) on the raw grid; i_rom is used by the
+// caller to build the deferred correction icorr = I_FEM - i_rom.
+// Writes terminal (V(p), i_Ls) to Circuit.txt for the terminal convergence metric.
 void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, double t_start, double t_stop, unsigned N_xyce_eval_points)
 {
     Waveform vp_raw;
@@ -670,11 +694,12 @@ void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, doubl
 
 		if (sscanf(line, "%lg %lg %lg %lg %lg", &idx, &time, &Vp, &Viface, &I) == 5)
 		{
+            // Viface = I(Ls_d) = interface current i_Ls;  I = I(Lrom_d) = ROM branch current i_rom.
             pushOrReplaceDuplicateTime(vp_raw, time, Vp);
             pushOrReplaceDuplicateTime(circuit_raw, time, Vp, Viface, I);
 
-            last_V = Viface;
-            last_I = I;
+            last_V = Vp;     // V(p) terminal (port voltage)
+            last_I = Viface; // i_Ls terminal (interface current)
 			step++;
 		}
 	}
@@ -797,6 +822,22 @@ void WriteRestartDirectives(
             << " INITIAL_INTERVAL=" << dt_window << "\n";
         // Restart setzt Integrator auf die Checkpoint-Zeit; kein UIC.
         out << ".tran {dt_print} {t_stop} {t_abs_start}\n";
+    }
+}
+
+// Generiert ls_branch.inc: serielles Ls-Bauteil a->b (PROTOTYPE companion-network).
+//   Ls>0  → echte Induktivitaet (BDF; traegt Strom+dI/dt nativ ueber Restart).
+//   Ls==0 → winziger Widerstand 1e-9 (idealer Kurzschluss; vermeidet degeneriertes L=0).
+void WriteLsBranch(const string& filename, double l_series)
+{
+    ofstream out(filename);
+    if (!out) {
+        throw runtime_error("WriteLsBranch: could not open " + filename);
+    }
+    if (l_series > 0.0) {
+        out << "Ls_d a b {Ls} IC=0\n";
+    } else {
+        out << "Rls_d a b 1e-9\n";
     }
 }
 
