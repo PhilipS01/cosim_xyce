@@ -363,9 +363,34 @@ ELEM_TYPE = {
 }
 
 
+def _read_netlist_lines(path, _depth=0):
+    """Read a netlist's physical lines, splicing .INCLUDE'd files inline so that
+    generated includes (ls_branch.inc, sim_params.inc, restart.inc) contribute
+    their devices/directives. Without this the Ls element -- which lives in the
+    generated ls_branch.inc, not in wr_circuit.cir -- is invisible in the diagram.
+    Missing includes are skipped (they only exist after a ./main run)."""
+    import re as _re
+    out = []
+    if _depth > 10 or not os.path.exists(path):
+        return out
+    base = os.path.dirname(path)
+    with open(path) as f:
+        for line in f.read().splitlines():
+            m = _re.match(r'\s*\.INCLUDE\s+"?([^"\s]+)"?', line, _re.IGNORECASE)
+            if m:
+                inc = m.group(1)
+                inc_path = inc if os.path.isabs(inc) else os.path.join(base, inc)
+                out.extend(_read_netlist_lines(inc_path, _depth + 1))
+            else:
+                out.append(line)
+    return out
+
+
 def parse_netlist(path):
     """Parse a SPICE netlist into elements + nodes. Joins '+' continuations,
-    skips comments (*) and directives (.) but keeps them as 'directives'."""
+    skips comments (*) and directives (.) but keeps them as 'directives'.
+    Follows .INCLUDE so generated includes (e.g. ls_branch.inc) are rendered."""
+    raw_lines = _read_netlist_lines(path)
     raw = ""
     if os.path.exists(path):
         with open(path) as f:
@@ -373,7 +398,7 @@ def parse_netlist(path):
 
     # Join continuation lines (leading '+') onto the previous logical line.
     logical = []
-    for line in raw.splitlines():
+    for line in raw_lines:
         s = line.rstrip()
         if not s:
             continue

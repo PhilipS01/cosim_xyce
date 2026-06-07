@@ -19,3 +19,7 @@ WR_error.txt
 # scratch
 _cfg_*.txt
 *.log
+
+# python
+__pycache__/
+*.pyc
