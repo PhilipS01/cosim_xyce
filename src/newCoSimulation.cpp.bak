@@ -1,0 +1,710 @@
+#include "../include/Header.h"
+#include <cstddef>
+#include <fstream>
+#include <iomanip>
+#include <ios>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+
+struct Waveform {
+    vector<double> t;
+    vector<double> y;
+
+    void push(double time, double value) {
+    if (!t.empty() && time <= t.back()) {
+        cerr << "Waveform time error: new time = " << time
+             << ", last time = " << t.back() << endl;
+        throw runtime_error("Waveform times must be strictly increasing.");
+    }
+        t.push_back(time);
+        y.push_back(value);
+    }
+};
+
+void pushOrReplaceDuplicateTime(Waveform& wf, double time, double value)
+{
+    const double absTol = 1e-15;
+    const double relTol = 1e-12;
+
+    if (wf.t.empty()) {
+        wf.push(time, value);
+        return;
+    }
+
+    const double lastTime = wf.t.back();
+    const double tol = absTol + relTol * std::max(std::abs(time), std::abs(lastTime));
+
+    if (time > lastTime + tol) {
+        wf.push(time, value);
+        return;
+    }
+
+    if (std::abs(time - lastTime) <= tol) {
+        // Same time point: keep the newest value.
+        wf.y.back() = value;
+        wf.t.back() = time;
+        return;
+    }
+
+    throw std::runtime_error("Xyce output times are decreasing.");
+}
+
+struct CircuitWaveform {
+    vector<double> t;
+    vector<double> vp;
+    vector<double> vnx;
+    vector<double> i;
+
+    void push(double time, double vp_value, double vnx_value, double i_value) {
+        if (!t.empty() && time <= t.back()) {
+            throw runtime_error("CircuitWaveform times must be strictly increasing.");
+        }
+
+        t.push_back(time);
+        vp.push_back(vp_value);
+        vnx.push_back(vnx_value);
+        i.push_back(i_value);
+    }
+};
+
+void pushOrReplaceDuplicateTime(
+    CircuitWaveform& wf,
+    double time,
+    double vp,
+    double vnx,
+    double i)
+{
+    const double absTol = 1e-15;
+    const double relTol = 1e-12;
+
+    if (wf.t.empty()) {
+        wf.push(time, vp, vnx, i);
+        return;
+    }
+
+    const double lastTime = wf.t.back();
+    const double tol = absTol + relTol * std::max(std::abs(time), std::abs(lastTime));
+
+    if (time > lastTime + tol) {
+        wf.push(time, vp, vnx, i);
+        return;
+    }
+
+    if (std::abs(time - lastTime) <= tol) {
+        wf.t.back() = time;
+        wf.vp.back() = vp;
+        wf.vnx.back() = vnx;
+        wf.i.back() = i;
+        return;
+    }
+
+    throw runtime_error("CircuitWaveform times are decreasing.");
+}
+
+
+void writePWLFile(const string& filename, const Waveform& wf) {
+    if (wf.t.size() != wf.y.size() || wf.t.empty()) {
+        throw runtime_error("Invalid waveform.");
+    }
+
+    ofstream out(filename);
+    if (!out) {
+        throw runtime_error("Could not open PWL file: " + filename);
+    }
+
+    out << scientific << setprecision(16);
+
+    for (size_t i = 0; i < wf.t.size(); ++i) {
+        out << wf.t[i] << " " << wf.y[i] << "\n";
+    }
+}
+
+// Schreibt 2-Punkt PWL als lineare Rampe von (t_start, value_start) mit Steigung `slope`.
+// slope=0 (default) → konstante PWL. slope ≠ 0 sorgt für konsistente Anfangsableitung
+// an V(iprev)/V(vfprev) am Fensteranfang (passend zur dIdt0-Verwendung in Biface IF-Guard).
+void WriteInitialPwl(
+    const char* filename,
+    double t_start,
+    double t_stop,
+    double value_start,
+    double slope = 0.0)
+{
+    FILE* file = fopen(filename, "w");
+    if (!file) {
+        throw std::runtime_error("Could not open PWL file.");
+    }
+
+    const double value_stop = value_start + slope * (t_stop - t_start);
+
+    fprintf(file, " %.16e %.16e\n", t_start, value_start);
+    fprintf(file, " %.16e %.16e\n", t_stop,  value_stop);
+
+    fclose(file);
+}
+
+Waveform readPWLFile(const string& filename)
+{
+    ifstream in(filename);
+    if (!in) {
+        throw runtime_error("Could not open PWL file: " + filename);
+    }
+
+    Waveform wf;
+
+    double t, y;
+    while (in >> t >> y) {
+        pushOrReplaceDuplicateTime(wf, t, y);
+    }
+
+    if (wf.t.empty()) {
+        throw runtime_error("PWL file contains no data: " + filename);
+    }
+
+    return wf;
+}
+
+
+//The master process coordinates the simulation
+//It can be realized where ever it's easiest, e.g., inside the circuit solver, or inside the FEM solver, or exterior
+void MasterProcess()
+{
+	cout << "Master process started" << endl;
+
+    // Datei für Feldlösung an Synchronisationszeitpunkten (entspricht hier Feldschritten)
+    FILE* file_Field = fopen("Field_solution.prn", "w");
+    fprintf(file_Field, "Index       TIME              V(FIELD)          I(FIELD)\n");
+    fflush(file_Field);
+
+    // Datei für die rekonstruierte/extrapolierte Feldlösung, d.h. die Felddaten die Xyce eingelesen hat
+    FILE* file_Field_waveform = fopen("Field_waveform_solution.prn", "w");
+    fprintf(file_Field_waveform, "Index       TIME              V(FIELD)          I(FIELD)\n");
+    fflush(file_Field_waveform);
+    
+    FILE* file_Circuit = fopen("Circuit_solution.prn", "w");
+    fprintf(file_Circuit, "Index       TIME              V(P)              V(NX)             I(VMEAS)\n");
+    fflush(file_Circuit);
+
+    FILE* file_WR_error = fopen("WR_error.txt", "w");
+    fprintf(file_WR_error, "   Time, WR_TotalRelErr, N_iterations, Converged \n");
+    fflush(file_WR_error);
+
+    unsigned long global_field_index = 0;
+    unsigned long global_field_waveform_index = 0;
+    unsigned long global_circuit_index = 0;
+
+    //The impedance values (inductance L, and resistance R) that are deploayed in the INTERFACE_condition are user input. 
+    //They are a kind of reduced order model of the field domain. Of course this is not exact, it's just an approxinmation
+    double L_ROM = 0.9 * 1.6e-7;
+    double R_ROM = 0.9 * 5.1e-4;
+    double Frequency = 50.0; // für das Toy-Problem orientieren wir uns der Einfachheit halber für die Feldschrittweite an der Frequenz der Schaltungsseitigen Spannungsquelle
+    
+    // Zeitintervalle und Zeitschritte
+    // Nur Feld (Schaltung macht Xyce dynamisch)
+    const unsigned N_periods = 1;
+    const unsigned N_field_steps_per_period_field = 50;
+    const unsigned N_steps_field = N_field_steps_per_period_field * N_periods;
+    const double dt_field = (1 / Frequency) / N_field_steps_per_period_field;
+    
+    // WR-Parameter
+    const unsigned WRmaxSteps = 20;
+    const double WR_tolerance = 1.0e-3;
+    // Auflösung des Strom-PWL `i_prev_k.pwl`, das Xyce in der naechsten WR-Iteration als V(iprev)
+    // in der Biface-Quelle einliest. Begrenzt die Dateigroesse (Xyce-Adaptiv-Output kann hunderte
+    // Punkte erzeugen) und glaettet Adaptiv-Artefakte. FEM-Seite braucht das feine Raster nicht
+    // mehr (nur Endpunkte + letzte 2 Samples fuer dIdt_end), aber Xyce-Feedback profitiert von
+    // moderater Aufloesung fuer die V(iprev)-Darstellung. Trade-off Konvergenzqualitaet vs. Kosten.
+    const unsigned N_xyce_coupling_intervals = 100;
+
+    // Anzahl Intervalle für FEM-Auswertung pro Fenster. FEM-PWL hat N+1 Punkte.
+    // Multi-rate erhalten: N_FEM << N_xyce_coupling_intervals (20) und << Xyce-intern adaptiv.
+    // Höher = bessere V_f-Approximation (wichtig bei gekrümmter Stromtrajektorie durch Sinusquelle).
+    const unsigned N_field_eval_intervals = 8;
+
+    // Initialisierung
+    double V_field = 0;
+    double I_field = 0;
+    double I0 = 0.0;
+    double V0 = 0.0;
+    double dIdt_0 = 0.0;
+
+    //fprintf(file_Field, "%-10lu %-17.8e %-17.8e %-17.8e\n", global_field_index++, 0.0, V_field, I_field);
+
+    // Äußere Schleife der Zeitfenster
+    // hier ist Feldintervall = WR-Zeitfenster
+    for (unsigned step_field = 1; step_field <= N_steps_field; step_field++) {
+        // nichtlineares Verhalten des RL-Gliedes (dummy)
+        //R_ROM *= 1.2;
+        //L_ROM *= 1.05;
+
+        const double t_start = (step_field - 1) * dt_field; // brauchen wir vor allem hier (in cpp), Xyce simuliert immer von 0 bis Stopzeitpunkt wenn man es aufruft. In xyce nutzen wir es nur für die Phase der restlichen Schaltung (z.B. Vsrc wenn Schaltung nur Spannungsquelle ist)
+        const double t_stop = step_field * dt_field;
+        WriteSimParams("sim_params.inc", 0.0, dt_field, t_start, V0, I0, R_ROM, L_ROM, dIdt_0, N_xyce_coupling_intervals);
+
+        // initialisiere mit zuletzt akzeptierten Werten.
+        // i_prev_k.pwl: lineare Rampe mit Steigung dIdt_0 → V(iprev) hat in 1. WR-Iteration
+        // konsistente Anfangsableitung passend zum IF(time<=eps_t, Lrom*dIdt0, ...) Guard.
+        WriteInitialPwl("i_prev_k.pwl",   0.0, dt_field, I0, dIdt_0);
+        WriteInitialPwl("vf_prev_k.pwl", 0.0, dt_field, V0);
+
+        CircuitWaveform circuit_sol; // circuit solution array (nur für Ausgabe/Visualisierung gebraucht)
+
+        unsigned WR_iteration;
+        double WR_rel_Error = 1.0;
+        bool WR_converged = false;
+        Waveform i_prev_last_iter; // i_m^(k-1) für L1-Konvergenzkriterium; leer am Fensteranfang
+        // WR-Iterationsschleife
+        for (WR_iteration = 1; WR_iteration <= WRmaxSteps; WR_iteration++) {
+            Waveform i_prev; // i_m^(k) dieser Iteration (resampled Xyce-Strom)
+            circuit_sol = CircuitWaveform{};
+
+            // Circuit Solver aufrufen und Resultat für V_circuit und I_circuit (i_prev) einlesen
+            RunXyce("wr_circuit.cir");
+            ReadXyceResults("wr_circuit.cir.prn", i_prev, circuit_sol, 0.0, dt_field, N_xyce_coupling_intervals); // pusht Schaltungsstrom in i_prev Waveform und schreibt PWL Datei (heißt zwar hier "prev", aber ist hier im Block aktuell und FEM-solver liest entsprechend I_c^{(k+1)}
+
+            std::cout << "PWL points: " << i_prev.t.size() << std::endl;
+
+            // FEM Solver aufrufen (dummy)
+            // liest i_prev_k.pwl
+            // schreibt vf_prev_k.pwl
+            // schreibt Endwerte in Field.txt
+            FEM_solver_current_driven_waveform(dIdt_0, N_field_eval_intervals);
+            Read_Terminal_results("Field.txt", V_field, I_field);
+
+            // Prüfe Konvergenzkriterium: L1-rel-Norm von (i_m^(k) - i_m^(k-1)) / i_m^(k)
+            WR_rel_Error = eval_WR_convergence(i_prev, i_prev_last_iter, WR_iteration);
+
+            if (WR_iteration > 1 && WR_rel_Error < WR_tolerance) {
+                WR_converged = true;
+                break;
+            }
+
+            // Stromwaveform für nächstes WR-Konvergenzkriterium aufheben
+            i_prev_last_iter = i_prev;
+        }
+
+        // Screen Output
+        //
+        // Resultate in Datei schreiben
+
+        PRINT(t_stop);
+        PRINT(WR_rel_Error);
+
+        fprintf(file_WR_error, "%12.3e ,  %12.3e ,  %d ,  %d \n", t_stop, WR_rel_Error, WR_iteration, int(WR_converged));
+        fflush(file_WR_error);
+
+
+        if (!WR_converged) {
+            throw runtime_error("WR did not converge on current time window. Stop simulation.");
+        } else {
+            PRINT("WR converged!");
+            PRINT(V_field);
+            PRINT(I_field);
+
+            // Feldlösung an den Endpunkten (hier gleich den Synchronisationspunkten) im Xyce Format speichern
+            fprintf(file_Field, "%-10lu %-17.8e %-17.8e %-17.8e\n", global_field_index++, t_stop, V_field, I_field);
+            fflush(file_Field);
+
+            // die Xycelösung des Zeitfensters an die vorigen anhängen
+            const bool skip_first_point = (step_field > 1);
+            appendCircuitWaveformXyceStyle(file_Circuit, circuit_sol, t_start, global_circuit_index, skip_first_point);
+
+            // auch die Feld-WAVEFORMS (also nicht nur Endpunkte) speichern wir im Xyce Format ab
+            // dafür lesen wir die konvergierten Waveforms ein (letzte Iteration)
+            Waveform vf_conv = readPWLFile("vf_prev_k.pwl"); // field voltage (2-point PWL)
+            Waveform i_conv  = readPWLFile("i_prev_k.pwl"); // last waveform of circuit current (coupling grid)
+
+            // Strom an gleichen N+1 Zeitpunkten wie vf_conv (FEM-Eval-Grid) sampeln,
+            // damit appendFieldWaveformXyceStyle übereinstimmende Zeitstempel sieht.
+            Waveform i_endpoints = resampleWaveformUniform(
+                i_conv, 0.0, dt_field, N_field_eval_intervals
+            );
+
+            // und hängen sie an die bisherigen Zeitfenster an
+            appendFieldWaveformXyceStyle(file_Field_waveform, vf_conv, i_endpoints, t_start, global_field_waveform_index, skip_first_point);
+
+            // Festhalten der Endwerte für die Anfangswerte des nächsten Zeitfensters
+            V0 = V_field;
+            I0 = I_field;
+
+            // dI/dt am Fensterende = dI/dt am Anfang des nächsten Fensters (Stetigkeit)
+            const size_t n_i = i_conv.t.size();
+            if (n_i >= 2) {
+                const double dt_end = i_conv.t[n_i - 1] - i_conv.t[n_i - 2];
+                dIdt_0 = (i_conv.y[n_i - 1] - i_conv.y[n_i - 2]) / dt_end;
+            } else {
+                dIdt_0 = 0.0;
+            }
+        }
+
+    }
+
+    fprintf(file_Circuit, "End\n");
+    fprintf(file_Field,   "End\n");
+    fclose(file_Circuit);
+    fclose(file_Field);
+    fclose(file_WR_error);
+    fclose(file_Field_waveform);
+
+}
+
+// mimmick FEM solver — evaluates field response at N_field_eval_intervals+1 äquidistanten
+// Punkten pro Fenster. Schreibt PWL für Xyce (stückweise linear). Multi-rate erhalten solange
+// N_field_eval_intervals << N_xyce_coupling_intervals und << Xyce-intern adaptiv.
+void FEM_solver_current_driven_waveform(double dIdt_start, unsigned N_field_eval_intervals)
+{
+    // Reads the current waveform produced by Xyce in the current WR iteration.
+    const Waveform current = readPWLFile("i_prev_k.pwl");
+
+    if (abs(current.t.front()) > 1e-14) {
+        throw runtime_error("i_prev_k.pwl does not start at local time 0.");
+    }
+
+    const size_t Nc = current.t.size();
+    if (Nc < 2) {
+        throw runtime_error("FEM_solver: i_prev_k.pwl needs at least 2 points.");
+    }
+    if (N_field_eval_intervals < 1) {
+        throw runtime_error("FEM_solver: N_field_eval_intervals must be >= 1.");
+    }
+
+    // FEM/reference parameters, intentionally different from ROM values.
+    const double L_FEM = 1.6e-7;
+    const double R_FEM = 5.1e-4;
+
+    const double t_start = current.t.front();
+    const double t_end   = current.t.back();
+
+    // Echtes Multi-rate: FEM re-sampled den eingelesenen Strom auf SEIN eigenes (gröberes) Grid und
+    // arbeitet danach nur noch mit diesen N+1 Werten.
+    const Waveform I_eval = resampleWaveformUniform(
+        current, t_start, t_end, N_field_eval_intervals
+    );
+    const size_t N = I_eval.t.size(); // = N_field_eval_intervals + 1
+
+    // KRITISCH: dI/dt muss exakt dasselbe Modell wie Biface in wr_circuit.cir verwenden, sonst
+    // unterschiedliche physikalische Modelle in den beiden Solvern → WR-Fixpunkt unerreichbar
+    // selbst bei R_ROM=R_FEM und L_ROM=L_FEM. Biface nutzt akkumulierte Sekante:
+    //   Lrom·(I(Vmeas) - I0)/time     für t > eps_t
+    //   Lrom·dIdt0                    für t <= eps_t (boundary)
+    // FEM matcht das hier: j=0 → dIdt_start (= dIdt0), sonst Sekante von Fensteranfang.
+    const double t_win_start = I_eval.t.front();
+    const double I_win_start = I_eval.y.front();
+
+    Waveform voltage;
+    for (size_t j = 0; j < N; ++j) {
+        double dIdt_j;
+        if (j == 0) {
+            // Singulärer Punkt t=t_start. Boundary-Condition aus voriger Fenster-Konvergenz.
+            dIdt_j = dIdt_start;
+        } else {
+            // Akkumulierte Sekante — identisches Modell wie Biface ROM-Term.
+            dIdt_j = (I_eval.y[j] - I_win_start)
+                   / (I_eval.t[j] - t_win_start);
+        }
+        const double V_j = R_FEM * I_eval.y[j] + L_FEM * dIdt_j;
+        voltage.push(I_eval.t[j], V_j);
+    }
+
+    // This file is used by Xyce in the next WR iteration (piecewise linear PWL).
+    writePWLFile("vf_prev_k.pwl", voltage);
+
+    // Terminal-Werte am Fensterende für Konvergenz-Propagation ins nächste Fenster.
+    Write_Terminal_results("Field.txt", voltage.y.back(), current.y.back());
+}
+
+// WR-Konvergenzkriterium auf Basis der Stromwaveforms benachbarter Iterationen:
+//
+//   ∫|i_m^(k)(t) - i_m^(k-1)(t)| dt   /   ∫|i_m^(k)(t)| dt   ≤   WR_tolerance
+//
+// Integration via Trapezregel über das Kopplungsraster (i_curr und i_prev_iter teilen sich
+// dasselbe uniforme Zeitgrid aus resampleWaveformUniform). Wegen Transmissionsbedingung
+// i_m^(k) = i_c^(k) wird hier der konvergierte/gerade berechnete Schaltungsstrom verwendet.
+double eval_WR_convergence(const Waveform& i_curr, const Waveform& i_prev_iter, const unsigned WR_iteration)
+{
+	if (WR_iteration < 2 || i_prev_iter.t.empty()) {
+		cout << "WR-step  " << WR_iteration << ": skip (no previous waveform)" << endl;
+		return 1.0;
+	}
+
+	if (i_curr.t.size() != i_prev_iter.t.size() || i_curr.t.size() < 2) {
+		throw runtime_error("eval_WR_convergence: waveform size mismatch or too small.");
+	}
+
+	double num = 0.0; // ∫ |i^(k) - i^(k-1)| dt
+	double den = 0.0; // ∫ |i^(k)|         dt
+	for (size_t n = 0; n + 1 < i_curr.t.size(); ++n) {
+		const double dt = i_curr.t[n + 1] - i_curr.t[n];
+
+		const double diff_a = std::fabs(i_curr.y[n]     - i_prev_iter.y[n]);
+		const double diff_b = std::fabs(i_curr.y[n + 1] - i_prev_iter.y[n + 1]);
+		num += 0.5 * (diff_a + diff_b) * dt;
+
+		const double abs_a = std::fabs(i_curr.y[n]);
+		const double abs_b = std::fabs(i_curr.y[n + 1]);
+		den += 0.5 * (abs_a + abs_b) * dt;
+	}
+
+	if (den <= 0.0) {
+		throw runtime_error("eval_WR_convergence: zero denominator (current waveform identically zero?).");
+	}
+
+	const double WR_relErr = num / den;
+	cout << "WR-step  " << WR_iteration
+	     << ", L1 rel current error = " << WR_relErr << endl;
+
+	return WR_relErr;
+}
+
+
+// Reads Xyce .prn output produced by ".print tran V(p) V(nx) I(BIFACE)"
+// Columns: Index  time  V(p)  I(BIFACE)
+// Populates V_circuit_array / I_circuit_array and writes final V/I to Circuit.txt
+void ReadXyceResults(const string& filename, Waveform& i_sampled, CircuitWaveform& circuit_raw, double t_start, double t_stop, unsigned N_xyce_eval_points)
+{
+    Waveform i_raw;
+
+    i_sampled.t.clear();
+    i_sampled.y.clear();
+
+    circuit_raw.t.clear();
+    circuit_raw.vp.clear();
+    circuit_raw.vnx.clear();
+    circuit_raw.i.clear();
+
+	FILE* file = fopen(filename.c_str(), "r");
+	if (!file)
+		throw runtime_error(string("Could not open Xyce results file: ") + filename);
+
+	char line[512];
+
+    // prüfe ob Datei leer ist, überspringt auch die erste Zeile (Header)
+    if (!fgets(line, sizeof(line), file)) {
+        fclose(file);
+        throw runtime_error("ReadXyceResults: empty file");
+    }
+
+    double last_V = 0.0;
+    double last_I = 0.0;
+	double idx, time, Vp, Viface, I;
+	unsigned step = 0;
+
+	while (fgets(line, sizeof(line), file))
+	{
+		if (strncmp(line, "End", 3) == 0) break;
+
+		if (sscanf(line, "%lg %lg %lg %lg %lg", &idx, &time, &Vp, &Viface, &I) == 5)
+		{
+            pushOrReplaceDuplicateTime(i_raw, time, I);
+            pushOrReplaceDuplicateTime(circuit_raw, time, Vp, Viface, I); // speichere Lösung
+
+            last_V = Viface;
+            last_I = I;
+			step++;
+		}
+	}
+
+	fclose(file);
+
+	if (step == 0)
+		throw runtime_error("ReadXyceResults: no data rows read");
+
+    // Resampling auf uniformes Grid. Zweck nach Umstellung auf 2-Punkt-FEM:
+    //  - Begrenzt PWL-Dateigroesse (Xyce adaptive Schrittweite -> ggf. hunderte Punkte)
+    //  - Glaettet Xyce-Adaptiv-Artefakte vor Wiederverwendung als V(iprev) in naechster WR-Iteration
+    //  - Erzeugt vorhersagbares Raster fuer Debug/Plot/Konvergenzanalyse
+    // FEM-Solver braucht das feine Raster nicht mehr (nutzt nur Endpunkte + letzte 2 Punkte fuer
+    // dIdt_end), Hauptnutzer ist die Biface-Quelle in der naechsten Xyce-WR-Iteration.
+    i_sampled = resampleWaveformUniform(
+        i_raw,
+        t_start,
+        t_stop,
+        N_xyce_eval_points
+    );
+
+    Write_Terminal_results("Circuit.txt", last_V, last_I); // speicher Endwerte für Konvergenzprüfung
+    writePWLFile("i_prev_k.pwl", i_sampled); // speicher re-sampled Waveform
+    cout << "Raw Xyce points: " << i_raw.t.size()
+         << ", coupling PWL points: " << i_sampled.t.size()
+         << endl;
+}
+
+void RunXyce(const string& filename) {
+    string cmd =
+        string("Xyce ") + filename +
+        " > xyce_stdout.log 2> xyce_stderr.log";
+
+    int ret = system(cmd.c_str());
+
+    if (ret != 0) {
+        throw runtime_error(
+            string("Xyce failed with exit code ") + to_string(ret) +
+            ". Check xyce_stdout.log and xyce_stderr.log."
+        );
+    }
+}
+
+void WriteSimParams(
+    const string& filename,
+    double t_start, // xyce simuliert immer von t=0, also kann man sich das eigentlich sparen
+    double t_window, // previously t_stop
+    double t_abs_start, // für Phase der Schaltungskomponenten
+    double vf0,
+    double i0,
+    double rrom,
+    double lrom,
+    double dIdt0,
+    const unsigned N_coupling_intervals
+)
+{
+    if (t_window <= 0.0) {
+        throw runtime_error("WriteSimParams: t_window (stopping time for xyce) must be positive.");
+    }
+
+    if (N_coupling_intervals < 1) {
+        throw runtime_error("WriteSimParams: N_coupling_intervals must be >= 1.");
+    }
+    
+    // Für xyce output/print times (dt_print)
+    // hier: output bei jedem re-sampling Punkt (siehe resampleWaveformUniform, welcher die xyce-Punkte reduziert)
+    const double h_coupling = t_window / static_cast<double>(N_coupling_intervals); 
+    
+    // Zum vermeiden von Singularitäten in den Ableitungen
+    const double eps_t = 1.0e-15;
+
+    ofstream out(filename);
+    out << scientific << setprecision(16);
+    out << ".PARAM t_start      = " << t_start      << "\n";
+    out << ".PARAM t_stop       = " << t_window     << "\n";
+    out << ".PARAM t_abs_start  = " << t_abs_start  << "\n";
+    out << ".PARAM vf0          = " << vf0          << "\n";
+    out << ".PARAM I0           = " << i0           << "\n";
+    out << ".PARAM Rrom         = " << rrom         << "\n";
+    out << ".PARAM Lrom         = " << lrom         << "\n";
+    out << ".PARAM dIdt0        = " << dIdt0        << "\n";
+    out << ".PARAM eps_t        = " << eps_t        << "\n";
+    out << ".PARAM dt_print     = " << h_coupling   << "\n";
+}
+
+// Linearer Resampler auf uniformes Grid mit N_intervals+1 Stuetzstellen ueber [t_start, t_stop].
+// Zweck: Xyce-Adaptiv-Output auf festes Raster reduzieren bevor er als V(iprev) PWL-Quelle in der
+// naechsten WR-Iteration wiederverwendet wird (siehe Aufruf in ReadXyceResults).
+Waveform resampleWaveformUniform(
+    const Waveform& raw,
+    double t_start,
+    double t_stop,
+    unsigned N_intervals)
+{
+    if (raw.t.size() != raw.y.size() || raw.t.empty()) {
+        throw runtime_error("Invalid raw waveform.");
+    }
+
+    if (N_intervals < 1) {
+        throw runtime_error("N_intervals must be >= 1.");
+    }
+
+    Waveform sampled;
+
+    size_t k = 0;
+
+    for (unsigned j = 0; j <= N_intervals; ++j) {
+        const double tau =
+            t_start
+            + (t_stop - t_start) * static_cast<double>(j)
+            / static_cast<double>(N_intervals);
+
+        while (k + 1 < raw.t.size() && raw.t[k + 1] < tau) {
+            ++k;
+        }
+
+        double value = raw.y.back();
+
+        if (tau <= raw.t.front()) {
+            value = raw.y.front();
+        } else if (tau >= raw.t.back()) {
+            value = raw.y.back();
+        } else {
+            const double t0 = raw.t[k];
+            const double t1 = raw.t[k + 1];
+            const double y0 = raw.y[k];
+            const double y1 = raw.y[k + 1];
+
+            const double alpha = (tau - t0) / (t1 - t0);
+            value = y0 + alpha * (y1 - y0);
+        }
+
+        sampled.push(tau, value);
+    }
+
+    return sampled;
+}
+
+void appendCircuitWaveformXyceStyle(
+    FILE* file,
+    const CircuitWaveform& wf,
+    double t_abs_start,
+    unsigned long& global_index,
+    bool skip_first_point)
+{
+    if (!file) {
+        throw runtime_error("appendCircuitWaveformXyceStyle: file is null.");
+    }
+
+    const size_t start = skip_first_point ? 1 : 0;
+
+    for (size_t n = start; n < wf.t.size(); ++n) {
+        const double t_abs = t_abs_start + wf.t[n];
+
+        fprintf(
+            file,
+            "%-10lu %-17.8e %-17.8e %-17.8e %-17.8e\n",
+            global_index++,
+            t_abs,
+            wf.vp[n],
+            wf.vnx[n],
+            wf.i[n]
+        );
+    }
+
+    fflush(file);
+}
+
+void appendFieldWaveformXyceStyle(
+    FILE* file,
+    const Waveform& vf,
+    const Waveform& i,
+    double t_abs_start,
+    unsigned long& global_index,
+    bool skip_first_point)
+{
+    if (!file) {
+        throw runtime_error("appendFieldWaveformXyceStyle: file is null.");
+    }
+
+    if (vf.t.size() != i.t.size()) {
+        throw runtime_error("appendFieldWaveformXyceStyle: size mismatch.");
+    }
+
+    const size_t start = skip_first_point ? 1 : 0;
+
+    for (size_t n = start; n < vf.t.size(); ++n) {
+        if (std::abs(vf.t[n] - i.t[n]) > 1e-12) {
+            throw runtime_error("appendFieldWaveformXyceStyle: time grid mismatch.");
+        }
+
+        const double t_abs = t_abs_start + vf.t[n];
+
+        fprintf(
+            file,
+            "%-10lu %-17.8e %-17.8e %-17.8e\n",
+            global_index++,
+            t_abs,
+            vf.y[n],
+            i.y[n]
+        );
+    }
+
+    fflush(file);
+}

@@ -1,0 +1,127 @@
+#ifndef HEADER_H
+#define HEADER_H
+
+
+#include <string>
+#include <time.h>
+#include <stdio.h>
+#include <math.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cassert>
+#include <cstring>
+using namespace std; 
+
+#define PRINT( X )   cout<< #X << " =  " << X << flush <<  endl
+
+
+// Tunable simulation parameters. Loaded from a key=value config file (sim_config.txt)
+// by LoadConfig(); any key absent in the file keeps the default set here. The UI writes
+// this file before invoking the solver.
+struct SimConfig
+{
+    // Reduced-order model (used inside the Xyce Biface interface condition)
+    double L_ROM = 0.9 * 1.6e-7;
+    double R_ROM = 0.9 * 5.1e-4;
+    // "True" field/FEM parameters (intentionally different from the ROM)
+    double L_FEM = 1.6e-7;
+    double R_FEM = 5.1e-4;
+    // Nonlinearity of the distributed (FEM) device. 0 = linear (constant L_FEM).
+    //   1 = magnetic saturation: flux lambda(I) = L_FEM*I_sat*atan(I/I_sat),
+    //       so the small-signal inductance L(I) = L_FEM/(1+(I/I_sat)^2) drops as
+    //       the core saturates. I_sat is the saturation current scale (A).
+    // The Xyce ROM (Biface) stays linear, so the nonlinearity is a genuine
+    // field/ROM model mismatch that the WR iteration must resolve.
+    unsigned nonlin_model = 0;
+    double I_sat = 100.0;
+    // Circuit voltage source Bsrc
+    double frequency = 50.0;
+    double amplitude = 1.0;
+    // Series coupling impedance between source EMF and the port (two-way coupling).
+    // Rs = Ls = 0 reproduces the one-way toy (port voltage == source voltage).
+    double R_series = 0.0;
+    double L_series = 0.0;
+    // Time stepping
+    unsigned N_periods = 1;
+    unsigned N_field_steps_per_source_period = 50;
+    // Coupling-grid resolutions
+    unsigned N_field_eval_intervals = 1;
+    unsigned N_xyce_coupling_intervals = 100;
+    // Waveform relaxation
+    unsigned WRmaxSteps = 20;
+    double WR_tolerance = 1.0e-3;
+    // WR convergence metric: 0 = waveform L1 of the field-current (this codebase),
+    //                        1 = terminal-scalar metric of the reference CoSimulation_WR.cpp
+    unsigned wr_convergence_method = 0;
+};
+
+extern SimConfig g_cfg;
+
+// Parse key=value lines (also accepts "key value"); '#' starts a comment; unknown keys
+// are ignored; missing file leaves all defaults. Returns true if the file was opened.
+bool LoadConfig(const string& filename);
+
+
+void MasterProcess();
+
+void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eval_intervals);
+
+void CIRCUIT_solver(const double dt_circuit, const unsigned N_dt_circuit_per_dt_field, const double time_field);
+
+double INTERFACE_condition(	const bool reset, const double dt_circuit, const double dt_field,
+							double& V_circuit, double& I_circuit_last_time,
+							double& V_field_last_WR_it, double& V_field_last_time, double& I_field_last_WR_it, double& I_field_last_time);
+
+struct Waveform;
+struct CircuitWaveform;
+
+double eval_WR_convergence(const Waveform& i_curr, const Waveform& i_prev_iter, const unsigned WR_iteration);
+
+// Terminal-scalar WR convergence metric (port of the reference CoSimulation_WR.cpp).
+// Sums the field-vs-circuit mismatch and the iteration-to-iteration change of the
+// terminal V and I (relative when |value| > 0.1, absolute otherwise).
+double eval_WR_convergence_terminal(
+    double V_field, double I_field,
+    double V_circuit, double I_circuit,
+    double V_field_last_it, double I_field_last_it,
+    const unsigned WR_iteration);
+
+void pushOrReplaceDuplicateTime(Waveform& wf, double time, double value);
+void pushOrReplaceDuplicateTime(CircuitWaveform& wf, double time, double vp, double vnx, double i);
+
+void writePWLFile(const string& filename, const Waveform& wf);
+
+Waveform resampleWaveformUniform(const Waveform& raw, double t_start, double t_stop, unsigned N_intervals);
+
+void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, double t_start, double t_stop, unsigned N_coupling_intervals);
+
+void appendCircuitWaveformXyceStyle(FILE* file, const CircuitWaveform& wf, double t_start, unsigned long& global_index, bool skip_first_point);
+
+void appendFieldWaveformXyceStyle(FILE* file, const Waveform& vf, const Waveform& i, double t_abs_start, unsigned long& global_index, bool skip_first_point);
+
+void RunXyce(const string& filename);
+
+void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double dIdt0, double r_series, double l_series, const unsigned N_coupling_intervals);
+
+inline void Write_Terminal_results(const char s[80], const double V, const double I)
+{
+	FILE* file = fopen(s, "w");
+	fprintf(file, " %12.5e   % 12.5e", V, I);
+	fflush(file);
+	fclose(file);
+}
+
+inline void Read_Terminal_results(const char s[80], double& V, double& I)
+{
+	FILE* file = fopen(s, "r");
+	const int l_char = 256;
+	char in[l_char];
+	char* ptr_in = &in[0];
+
+	fgets(ptr_in, l_char, file);
+	sscanf(ptr_in, "%lg %lg", &V, &I);
+	fclose(file);
+}
+
+
+#endif

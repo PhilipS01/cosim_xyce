@@ -1,0 +1,34 @@
+Toy Problem aus RL glied mit Xyce loesen
+.INCLUDE sim_params.inc
+
+* Port node p gegen ground. Behavioral source = EMF minus serieller Kopplungsdrop Rs/Ls.
+* Amplitude/Frequenz aus sim_params.inc (amp_src, f_src) → single source of truth in C++.
+* V(p) = Vsrc - Rs*I(Vmeas) - Ls*dI/dt   (Two-way coupling: V(p) reagiert auf Interface-Strom.)
+* Rs = Ls = 0 → V(p) = Vsrc (one-way, alter trivialer Fall).
+* Ls-Term nutzt dieselbe akkumulierte Sekante wie Biface/FEM (konsistente Diskretisierung).
+Bsrc p 0 V = {
++ amp_src*sin(2*pi*f_src*(time+t_abs_start))
++ - Rs*I(Vmeas)
++ - IF(time <= eps_t, Ls*dIdt0, Ls*(I(Vmeas)-I0)/time)
++ }
+
+* Alte Feld-/Interface-Waveforms aus WR-Iteration k
+VFprev vfprev   0 PWL FILE "vf_prev_k.pwl"
+VIprev iprev    0 PWL FILE "i_prev_k.pwl"
+
+* Nullvoltquelle zur Strommessung des aktuellen Interface-Stroms
+Vmeas p nx 0
+
+* Akkumulierte Interface-Bedingung (Strom-Quelle, voltage-driven FEM)
+* I(Vmeas) = I_field_prev + (V(p) - V(vfprev)) / (Rrom + Lrom/time)
+* Hergeleitet aus INTERFACE_condition in CoSimulation_WR.cpp mit akkumulierter Sekante.
+Biface nx 0 I = {
++ IF(time <= eps_t,
++   I0,
++   V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/time)
++ )
++ }
+
+.tran {dt_print} {t_stop} 0 UIC
+.print tran V(p) V(nx) I(Vmeas)
+.end
