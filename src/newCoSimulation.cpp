@@ -283,9 +283,9 @@ void MasterProcess()
     double I0 = 0.0;
     double V0 = 0.0;
     double dIdt_0 = 0.0;
-    // Deferred-correction Seed (icorr = I_FEM - i_rom) am Fensteranfang. Wird am Fensterende
-    // getragen → flacher Iter-1-Seed des naechsten Fensters. Fenster 1, Iter 1: 0.
-    double icorr0 = 0.0;
+    // Deferred-correction Seed (V_corr = V_p - Z_rom*I_FEM) am Fensteranfang. Wird am
+    // Fensterende getragen → flacher Iter-1-Seed des naechsten Fensters. Fenster 1, Iter 1: 0.
+    double vcorr0 = 0.0;
     // dV/dt der Portspannung am Fensteranfang (Seed-Slope für vf_prev_k.pwl). Wird am Fensterende
     // aus der konvergierten V(p)-Waveform getragen (topologie-agnostisch, korrekt auch mit Rs/Ls).
     // Fenster 1: Quellen-Steigung (bei I0=0,dIdt0=0 ist V(p)≈Vsrc).
@@ -322,9 +322,9 @@ void MasterProcess()
         // i_prev_k.pwl: lineare Rampe mit Steigung dIdt_0 → V(iprev) hat konsistente
         // Anfangsableitung passend zur akkumulierten Sekante im FEM-Solver.
         WriteInitialPwl("i_prev_k.pwl",   t_start, t_stop, I0, dIdt_0);
-        // icorr_prev_k.pwl: Deferred-correction Quelle (Bcorr). Iter-1-Seed = flacher
-        // getragener Endwert des Vorfensters (absolute Zeit). Wird ab Iter 2 ueberschrieben.
-        WriteInitialPwl("icorr_prev_k.pwl", t_start, t_stop, icorr0, 0.0);
+        // vcorr_prev_k.pwl: Deferred-correction Quelle (Vcorr, Serien-Spannung). Iter-1-Seed =
+        // flacher getragener Endwert des Vorfensters (absolute Zeit). Wird ab Iter 2 ueberschrieben.
+        WriteInitialPwl("vcorr_prev_k.pwl", t_start, t_stop, vcorr0, 0.0);
 
         // Veraltete Checkpoint-Kandidaten dieses Prefixes entfernen, damit CommitCheckpoint
         // nach der WR-Schleife garantiert den frisch erzeugten Kandidaten dieses Fensters waehlt.
@@ -335,7 +335,7 @@ void MasterProcess()
         unsigned WR_iteration;
         double WR_rel_Error = 1.0;
         bool WR_converged = false;
-        double icorr_end = icorr0; // getragener Korrektur-Endwert (fuer naechsten Fenster-Seed)
+        double vcorr_end = vcorr0; // getragener Korrektur-Endwert (fuer naechsten Fenster-Seed)
         Waveform i_prev_last_iter; // i_m^(k-1) für L1-Konvergenzkriterium; leer am Fensteranfang
         double V_field_last_iter = 0.0; // für terminal-skalar Kriterium (Referenz CoSimulation_WR.cpp)
         double I_field_last_iter = 0.0;
@@ -343,9 +343,9 @@ void MasterProcess()
         for (WR_iteration = 1; WR_iteration <= WRmaxSteps; WR_iteration++) {
             circuit_sol = CircuitWaveform{};
 
-            // Circuit Solver: reale Companion-Netzwerk-Kopplung. Bcorr nutzt icorr_prev_k.pwl
-            // (Korrektur der Vor-Iteration). ReadXyceResults schreibt V(p) nach vf_prev_k.pwl
-            // (FEM-Eingang) und liefert i_rom (= circuit_sol.i = I(Lrom_d)) für die Korrektur.
+            // Circuit Solver: reale Companion-Netzwerk-Kopplung. Vcorr (Serien-Spannung) nutzt
+            // vcorr_prev_k.pwl (Korrektur der Vor-Iteration). ReadXyceResults schreibt V(p) nach
+            // vf_prev_k.pwl (FEM-Eingang); fuer die Serien-Korrektur braucht es V(p) und I_FEM.
             RunXyce("wr_circuit.cir");
             ReadXyceResults("wr_circuit.cir.prn", circuit_sol, t_start, t_stop, N_xyce_coupling_intervals);
 
@@ -360,20 +360,23 @@ void MasterProcess()
             Waveform i_prev = readPWLFile("i_prev_k.pwl");
             std::cout << "PWL points: " << i_prev.t.size() << std::endl;
 
-            // === Deferred correction fuer die NAECHSTE Iteration ===
-            // icorr(t) = I_FEM(t) - i_rom(t) auf dem Kopplungsraster. i_rom = I(Lrom_d) (roh aus
-            // Xyce, circuit_sol.i); I_FEM = FEM-Ausgang (i_prev). Bei Konvergenz gilt
-            // i_Ls = i_rom + icorr = I_FEM (ROM-Praekonditionierer kuerzt sich heraus).
-            Waveform irom_raw;
-            for (size_t n = 0; n < circuit_sol.t.size(); ++n)
-                irom_raw.push(circuit_sol.t[n], circuit_sol.i[n]);
-            const Waveform irom_cg = resampleWaveformUniform(irom_raw, t_start, t_stop, N_xyce_coupling_intervals);
-            const Waveform ifem_cg = resampleWaveformUniform(i_prev,   t_start, t_stop, N_xyce_coupling_intervals);
-            Waveform icorr;
-            for (size_t j = 0; j < irom_cg.t.size(); ++j)
-                icorr.push(irom_cg.t[j], ifem_cg.y[j] - irom_cg.y[j]);
-            writePWLFile("icorr_prev_k.pwl", icorr);
-            icorr_end = icorr.y.back(); // Endwert tragen → Seed des naechsten Fensters
+            // === Deferred correction fuer die NAECHSTE Iteration (SERIES VOLTAGE, resistive ROM) ===
+            // V_corr(t) = V_p(t) - Rrom*I_FEM(t)  auf dem Kopplungsraster.
+            //   V_p   = Portspannung (vf_prev_k.pwl, von ReadXyceResults bereits aufs Kopplungs-
+            //           raster resampelt),  I_FEM = FEM-Ausgang (i_prev).
+            // KVL im Netlist: V_p = Rrom*i_Ls + V_corr → i_Ls = (V_p - V_corr)/Rrom = I_FEM
+            // EXAKT an jedem Kopplungsknoten (keine Ableitung, kein FD/BDF-Mismatch).
+            // Bewusst rein resistiver ROM: ein induktiver Z_rom wuerde im Serien-Form den
+            // V_corr-Fehler mit 1/Z_rom verstaerken (R+L-ROM konvergiert schlechter als Norton).
+            const Waveform vp_cg   = readPWLFile("vf_prev_k.pwl");
+            const Waveform ifem_cg = resampleWaveformUniform(i_prev, t_start, t_stop, N_xyce_coupling_intervals);
+            Waveform vcorr;
+            for (size_t j = 0; j < vp_cg.t.size(); ++j) {
+                const double v = vp_cg.y[j] - R_ROM * ifem_cg.y[j];
+                vcorr.push(vp_cg.t[j], v);
+            }
+            writePWLFile("vcorr_prev_k.pwl", vcorr);
+            vcorr_end = vcorr.y.back(); // Endwert tragen → Seed des naechsten Fensters
 
             // Prüfe Konvergenzkriterium. Methode wählbar via g_cfg.wr_convergence_method:
             //   0 = Waveform-L1 des Feldstroms (dieses Codebase)
@@ -459,7 +462,7 @@ void MasterProcess()
             // Festhalten der Endwerte für die Anfangswerte des nächsten Zeitfensters
             V0 = vf_conv.y.back(); // Portspannung am Fensterende (= V(p) bei t=dt_field)
             I0 = I_field;          // Feldstrom am Fensterende (FEM-Ausgang)
-            icorr0 = icorr_end;    // konvergierter Korrektur-Endwert → flacher Seed naechstes Fenster
+            vcorr0 = vcorr_end;    // konvergierter Korrektur-Endwert → flacher Seed naechstes Fenster
 
             // dI/dt am Fensterende = dI/dt am Anfang des nächsten Fensters (Stetigkeit)
             const size_t n_i = i_conv.t.size();
@@ -656,11 +659,11 @@ double eval_WR_convergence_terminal(
 }
 
 
-// Reads Xyce .prn output produced by ".print tran V(p) I(Ls_d) I(Lrom_d)" (PROTOTYPE).
-// Columns: Index  time  V(p)  I(Ls_d)=i_Ls(interface)  I(Lrom_d)=i_rom(ROM branch)
-// Writes V(p) resampled to vf_prev_k.pwl (port voltage for FEM voltage-driven input).
-// circuit_raw carries (vp=V(p), vnx=i_Ls, i=i_rom) on the raw grid; i_rom is used by the
-// caller to build the deferred correction icorr = I_FEM - i_rom.
+// Reads Xyce .prn output produced by ".print tran V(p) I(Vmeas) I(Vcorr)" (PROTOTYPE, Thevenin).
+// Columns: Index  time  V(p)  I(Vmeas)=i_Ls(interface)  I(Vcorr)=i_Ls(series, redundant)
+// Writes V(p) resampled to vf_prev_k.pwl (port voltage for the FEM and the series correction).
+// circuit_raw carries (vp=V(p), vnx=i_Ls, i=i_Ls) on the raw grid; the series correction is
+// built from V(p) and the FEM current (no separate ROM-branch current i_rom anymore).
 // Writes terminal (V(p), i_Ls) to Circuit.txt for the terminal convergence metric.
 void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, double t_start, double t_stop, unsigned N_xyce_eval_points)
 {
@@ -694,7 +697,7 @@ void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, doubl
 
 		if (sscanf(line, "%lg %lg %lg %lg %lg", &idx, &time, &Vp, &Viface, &I) == 5)
 		{
-            // Viface = I(Ls_d) = interface current i_Ls;  I = I(Lrom_d) = ROM branch current i_rom.
+            // Viface = I(Vmeas) = interface current i_Ls;  I = I(Vcorr) = same series current (unused).
             pushOrReplaceDuplicateTime(vp_raw, time, Vp);
             pushOrReplaceDuplicateTime(circuit_raw, time, Vp, Viface, I);
 

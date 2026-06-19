@@ -20,22 +20,23 @@ Rs_d  emf a  {Rs}
 * 0V-Strommesser b->p: Interface-Strom i_Ls = I(Vmeas), unabhaengig vom Ls-Bauteilnamen.
 Vmeas b p 0
 
-* === Field ROM as a REAL companion R-L branch: port p -> ground ===
-* This is the WR preconditioner (Norton admittance 1/(Rrom + s*Lrom)), now
-* BDF-integrated so it is consistent with the real Ls inductor. It cancels out
-* at the WR fixpoint (only sets the convergence rate, not the answer).
-Rrom_d p  m  {Rrom}
-Lrom_d m  0  {Lrom} IC=0
+* === Field ROM as a REAL companion RESISTANCE, IN SERIES with the correction (Thevenin) ===
+* WR preconditioner = Rrom only (no Lrom!). The ROM resistor carries the FULL interface
+* current i_Ls (p -> Rrom_d -> g). A purely RESISTIVE ROM is deliberate: in the series
+* (Thevenin) form i_Ls = (V_p - V_corr)/Z_rom, so a small inductive Z_rom would amplify
+* the V_corr discretization slack by 1/Z_rom (measured: an R+L series ROM converges WORSE
+* than Norton). With Z_rom = Rrom the closure i_Ls = I_FEM is exact and well-conditioned.
+Rrom_d p  g  {Rrom}
 
-* === Lagged FEM correction (deferred-correction Norton source) ===
-* icorr = I_FEM^(k-1) - i_rom^(k-1), supplied on an isolated reference node via a
-* PWL-FILE source (absolute time grid). Bcorr injects it as a current p->0, so the
-* interface current  i_Ls = i_rom + icorr  ->  I_FEM  at convergence.
-Vcorr icorr 0 PWL FILE "icorr_prev_k.pwl"
-Bcorr p 0 I = { V(icorr) }
+* === Lagged FEM correction as a SERIES VOLTAGE source (Thevenin dual of the former
+*     parallel current source Bcorr). Much better conditioned for resistive coupling. ===
+* V_corr = V_p^(k-1) - Rrom*I_FEM^(k-1)   (= Joerg's dV_field, resistive ROM).
+* KVL: V_p = Rrom*i_Ls + V_corr  =>  i_Ls = (V_p - V_corr)/Rrom -> I_FEM at the fixpoint
+* (algebraic, no derivative, exact at every coupling node). PWL FILE on absolute time grid.
+Vcorr g 0 PWL FILE "vcorr_prev_k.pwl"
 
 * .OPTIONS RESTART und .tran werden pro Zeitfenster vom C++-Master generiert (restart.inc).
 .INCLUDE restart.inc
-* Ausgaben: Portspannung, Interface-Strom (I(Vmeas)) und ROM-Zweigstrom (I(Lrom_d)).
-.print tran V(p) I(Vmeas) I(Lrom_d)
+* Ausgaben: Portspannung, Interface-Strom (I(Vmeas)) und Serien-Strom (I(Vcorr) = i_Ls).
+.print tran V(p) I(Vmeas) I(Vcorr)
 .end
