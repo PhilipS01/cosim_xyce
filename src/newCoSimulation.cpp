@@ -57,6 +57,7 @@ bool LoadConfig(const string& filename)
         else if (key == "WRmaxSteps")                       g_cfg.WRmaxSteps = (unsigned)val;
         else if (key == "WR_tolerance")                     g_cfg.WR_tolerance = val;
         else if (key == "wr_convergence_method")            g_cfg.wr_convergence_method = (unsigned)val;
+        else if (key == "wr_relaxation")                    g_cfg.wr_relaxation = val;
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
     }
     return true;
@@ -370,10 +371,15 @@ void MasterProcess()
             // V_corr-Fehler mit 1/Z_rom verstaerken (R+L-ROM konvergiert schlechter als Norton).
             const Waveform vp_cg   = readPWLFile("vf_prev_k.pwl");
             const Waveform ifem_cg = resampleWaveformUniform(i_prev, t_start, t_stop, N_xyce_coupling_intervals);
+            // Under-relaxation: V_corr^k = theta*V_corr_raw + (1-theta)*V_corr^(k-1). Die Vor-Iteration
+            // steht noch in vcorr_prev_k.pwl (oder dem Seed) → aufs Kopplungsraster resampeln (Seed hat 2 Pkt).
+            const double theta = g_cfg.wr_relaxation;
+            const Waveform vcorr_prev = resampleWaveformUniform(
+                readPWLFile("vcorr_prev_k.pwl"), t_start, t_stop, N_xyce_coupling_intervals);
             Waveform vcorr;
             for (size_t j = 0; j < vp_cg.t.size(); ++j) {
-                const double v = vp_cg.y[j] - R_ROM * ifem_cg.y[j];
-                vcorr.push(vp_cg.t[j], v);
+                const double v_raw = vp_cg.y[j] - R_ROM * ifem_cg.y[j];
+                vcorr.push(vp_cg.t[j], theta * v_raw + (1.0 - theta) * vcorr_prev.y[j]);
             }
             writePWLFile("vcorr_prev_k.pwl", vcorr);
             vcorr_end = vcorr.y.back(); // Endwert tragen → Seed des naechsten Fensters

@@ -53,6 +53,9 @@ struct SimConfig
     // WR convergence metric: 0 = waveform L1 of the field-current (this codebase),
     //                        1 = terminal-scalar metric of the reference CoSimulation_WR.cpp
     unsigned wr_convergence_method = 0;
+    // WR under-relaxation of the deferred correction: V_corr^k = theta*V_corr_raw + (1-theta)*V_corr^(k-1).
+    // theta=1 -> no relaxation (plain V2). theta<1 damps the WR iteration (handles strong inductive coupling).
+    double wr_relaxation = 1.0;
 };
 
 extern SimConfig g_cfg;
