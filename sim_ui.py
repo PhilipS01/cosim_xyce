@@ -51,8 +51,9 @@ PARAMS = [
     ("N_field_steps_per_source_period", "Field steps / source period",  50,       "int",   (2, 200, 1)),
     ("N_field_eval_intervals",          "FEM eval intervals / window",  1,        "int",   (1, 64, 1)),
     ("N_xyce_coupling_intervals",       "Xyce coupling intervals",      100,      "int",   (2, 400, 1)),
-    ("WRmaxSteps",                      "WR max iterations",            20,       "int",   (1, 100, 1)),
+    ("WRmaxSteps",                      "WR max iterations",            20,       "int",   (1, 500, 1)),
     ("WR_tolerance",                    "WR tolerance",                 1.0e-3,   "float", None),
+    ("wr_relaxation",                   "WR under-relaxation (theta)",  1.0,      "float", None),
     ("wr_convergence_method",           "WR convergence metric",        0,        "choice",
         {0: "waveform L1 (this code)", 1: "terminal scalar (reference)"}),
 ]
