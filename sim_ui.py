@@ -54,6 +54,8 @@ PARAMS = [
     ("WRmaxSteps",                      "WR max iterations",            20,       "int",   (1, 500, 1)),
     ("WR_tolerance",                    "WR tolerance",                 1.0e-3,   "float", None),
     ("wr_relaxation",                   "WR under-relaxation (theta)",  1.0,      "float", None),
+    ("wr_accel",                        "WR interface acceleration",    0,        "choice",
+        {0: "Picard / relaxation", 1: "Anderson / IQN (strong coupling)"}),
     ("wr_convergence_method",           "WR convergence metric",        0,        "choice",
         {0: "waveform L1 (this code)", 1: "terminal scalar (reference)"}),
 ]
