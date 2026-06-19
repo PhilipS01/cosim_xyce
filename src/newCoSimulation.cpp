@@ -58,6 +58,7 @@ bool LoadConfig(const string& filename)
         else if (key == "WR_tolerance")                     g_cfg.WR_tolerance = val;
         else if (key == "wr_convergence_method")            g_cfg.wr_convergence_method = (unsigned)val;
         else if (key == "wr_relaxation")                    g_cfg.wr_relaxation = val;
+        else if (key == "wr_accel")                         g_cfg.wr_accel = (unsigned)val;
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
     }
     return true;
@@ -222,6 +223,74 @@ Waveform readPWLFile(const string& filename)
 }
 
 
+// Solve A x = b for a small dense m x m system (Gauss elimination, partial pivoting).
+static vector<double> gaussSolve(vector<vector<double>> A, vector<double> b)
+{
+    const size_t m = b.size();
+    for (size_t col = 0; col < m; ++col) {
+        // partial pivot
+        size_t piv = col;
+        for (size_t r = col + 1; r < m; ++r)
+            if (std::fabs(A[r][col]) > std::fabs(A[piv][col])) piv = r;
+        std::swap(A[col], A[piv]); std::swap(b[col], b[piv]);
+        const double d = A[col][col];
+        if (std::fabs(d) < 1e-300) continue; // singular column -> skip (regularized upstream)
+        for (size_t r = col + 1; r < m; ++r) {
+            const double f = A[r][col] / d;
+            for (size_t c = col; c < m; ++c) A[r][c] -= f * A[col][c];
+            b[r] -= f * b[col];
+        }
+    }
+    vector<double> x(m, 0.0);
+    for (size_t ii = m; ii-- > 0; ) {
+        double s = b[ii];
+        for (size_t c = ii + 1; c < m; ++c) s -= A[ii][c] * x[c];
+        x[ii] = (std::fabs(A[ii][ii]) < 1e-300) ? 0.0 : s / A[ii][ii];
+    }
+    return x;
+}
+
+// Anderson-accelerated interface step (robust IQN-type) for the fixed-point r(x)=G(x)-x=0.
+// X = history of interface inputs x^i, R = residuals r^i (last entry = current k); theta = mixing.
+// F_i = r^k - r^i (i<k). Solve least-squares min ||r^k - F gamma|| (normal equations), then
+//   x^{k+1} = (x^k + theta*r^k) - sum_i gamma_i [ (x^k - x^i) + theta*(r^k - r^i) ].
+// Reduces to relaxation (x^k + theta*r^k) when gamma=0, so it never stalls (unlike pure
+// projection) and corrects with the secant history when it helps.
+static vector<double> andersonStep(const vector<vector<double>>& X,
+                                   const vector<vector<double>>& R, double theta)
+{
+    const size_t k = X.size() - 1;     // current iterate index
+    const size_t n = X[k].size();      // interface vector length
+    const size_t m = k;                // number of secant columns (past iterates)
+    // Normal equations A (m x m) = F^T F, rhs = F^T r^k, with F_i = r^k - r^i.
+    vector<vector<double>> A(m, vector<double>(m, 0.0));
+    vector<double> rhs(m, 0.0);
+    for (size_t a = 0; a < m; ++a) {
+        for (size_t bcol = a; bcol < m; ++bcol) {
+            double s = 0.0;
+            for (size_t t = 0; t < n; ++t)
+                s += (R[k][t] - R[a][t]) * (R[k][t] - R[bcol][t]);
+            A[a][bcol] = s; A[bcol][a] = s;
+        }
+        double s = 0.0;
+        for (size_t t = 0; t < n; ++t) s += (R[k][t] - R[a][t]) * R[k][t];
+        rhs[a] = s;
+    }
+    // Tikhonov regularization (relative) against near-parallel columns near convergence.
+    double tr = 0.0; for (size_t a = 0; a < m; ++a) tr += A[a][a];
+    const double reg = 1e-8 * (tr / std::max<size_t>(m, 1)) + 1e-300;
+    for (size_t a = 0; a < m; ++a) A[a][a] += reg;
+    const vector<double> gamma = gaussSolve(A, rhs);
+    vector<double> xnext(n);
+    for (size_t t = 0; t < n; ++t) {
+        double v = X[k][t] + theta * R[k][t];   // Picard/relaxation base step
+        for (size_t a = 0; a < m; ++a)
+            v -= gamma[a] * ((X[k][t] - X[a][t]) + theta * (R[k][t] - R[a][t]));
+        xnext[t] = v;
+    }
+    return xnext;
+}
+
 //The master process coordinates the simulation
 //It can be realized where ever it's easiest, e.g., inside the circuit solver, or inside the FEM solver, or exterior
 void MasterProcess()
@@ -337,6 +406,8 @@ void MasterProcess()
         double WR_rel_Error = 1.0;
         bool WR_converged = false;
         double vcorr_end = vcorr0; // getragener Korrektur-Endwert (fuer naechsten Fenster-Seed)
+        // IQN-ILS Interface-Historie (pro Fenster zuruckgesetzt): Inputs x=V_corr und Residuen r.
+        std::vector<std::vector<double>> Xhist, Rhist;
         Waveform i_prev_last_iter; // i_m^(k-1) für L1-Konvergenzkriterium; leer am Fensteranfang
         double V_field_last_iter = 0.0; // für terminal-skalar Kriterium (Referenz CoSimulation_WR.cpp)
         double I_field_last_iter = 0.0;
@@ -371,16 +442,36 @@ void MasterProcess()
             // V_corr-Fehler mit 1/Z_rom verstaerken (R+L-ROM konvergiert schlechter als Norton).
             const Waveform vp_cg   = readPWLFile("vf_prev_k.pwl");
             const Waveform ifem_cg = resampleWaveformUniform(i_prev, t_start, t_stop, N_xyce_coupling_intervals);
-            // Under-relaxation: V_corr^k = theta*V_corr_raw + (1-theta)*V_corr^(k-1). Die Vor-Iteration
-            // steht noch in vcorr_prev_k.pwl (oder dem Seed) → aufs Kopplungsraster resampeln (Seed hat 2 Pkt).
-            const double theta = g_cfg.wr_relaxation;
+            // Fixpunkt-Sicht: Interface-Variable x = V_corr; eine Kopplungs-Auswertung liefert
+            // tilde = G(x) = V_p - Rrom*I_FEM; Residuum r = tilde - x. x^(k) steht noch in
+            // vcorr_prev_k.pwl (bzw. Seed) → aufs Kopplungsraster resampeln (Seed hat 2 Pkt).
             const Waveform vcorr_prev = resampleWaveformUniform(
                 readPWLFile("vcorr_prev_k.pwl"), t_start, t_stop, N_xyce_coupling_intervals);
-            Waveform vcorr;
-            for (size_t j = 0; j < vp_cg.t.size(); ++j) {
-                const double v_raw = vp_cg.y[j] - R_ROM * ifem_cg.y[j];
-                vcorr.push(vp_cg.t[j], theta * v_raw + (1.0 - theta) * vcorr_prev.y[j]);
+            const size_t Ncg = vp_cg.t.size();
+            std::vector<double> xk(Ncg), rk(Ncg);
+            for (size_t j = 0; j < Ncg; ++j) {
+                const double tilde = vp_cg.y[j] - R_ROM * ifem_cg.y[j]; // G(x)
+                xk[j] = vcorr_prev.y[j];
+                rk[j] = tilde - xk[j];                                  // residual r = G(x) - x
             }
+            Xhist.push_back(xk);
+            Rhist.push_back(rk);
+            // Anderson depth cap: keep only the most recent (mmax+1) iterates. Unlimited history
+            // makes the secant least-squares ill-conditioned near convergence -> garbage steps.
+            const size_t mmax = 8;
+            if (Xhist.size() > mmax + 1) { Xhist.erase(Xhist.begin()); Rhist.erase(Rhist.begin()); }
+
+            // Update: IQN-ILS (Broyden-type interface quasi-Newton) wenn wr_accel==1 und Historie
+            // vorhanden; sonst Picard/Unter-Relaxation x^(k+1) = x + theta*r (= theta*tilde + (1-theta)*x).
+            const double theta = g_cfg.wr_relaxation;
+            std::vector<double> xnext(Ncg);
+            if (g_cfg.wr_accel == 1 && Xhist.size() >= 2) {
+                xnext = andersonStep(Xhist, Rhist, theta);
+            } else {
+                for (size_t j = 0; j < Ncg; ++j) xnext[j] = xk[j] + theta * rk[j];
+            }
+            Waveform vcorr;
+            for (size_t j = 0; j < Ncg; ++j) vcorr.push(vp_cg.t[j], xnext[j]);
             writePWLFile("vcorr_prev_k.pwl", vcorr);
             vcorr_end = vcorr.y.back(); // Endwert tragen → Seed des naechsten Fensters
 

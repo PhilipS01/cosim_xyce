@@ -56,6 +56,11 @@ struct SimConfig
     // WR under-relaxation of the deferred correction: V_corr^k = theta*V_corr_raw + (1-theta)*V_corr^(k-1).
     // theta=1 -> no relaxation (plain V2). theta<1 damps the WR iteration (handles strong inductive coupling).
     double wr_relaxation = 1.0;
+    // Interface acceleration: 0 = fixed-point/relaxation (Picard, uses wr_relaxation),
+    //                         1 = interface quasi-Newton least-squares (IQN-ILS, Broyden-type).
+    // IQN-ILS builds an approximate interface Jacobian from past (input,residual) pairs ->
+    // far fewer iterations for strong (inductive) coupling. First iteration still uses relaxation.
+    unsigned wr_accel = 0;
 };
 
 extern SimConfig g_cfg;
