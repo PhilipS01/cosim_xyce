@@ -223,71 +223,75 @@ Waveform readPWLFile(const string& filename)
 }
 
 
-// Solve A x = b for a small dense m x m system (Gauss elimination, partial pivoting).
-static vector<double> gaussSolve(vector<vector<double>> A, vector<double> b)
+// IQN-ILS least-squares step with QR + column FILTERING (Degroote). Solves
+// min ||r^k - DR*gamma|| via modified Gram-Schmidt on the residual-difference columns DR,
+// DROPPING near-linearly-dependent columns (orthogonalized norm < eps*original norm) -- the
+// standard robust fix for the ill-conditioning that normal equations suffer near convergence.
+// Returns the step correction sum_j gamma_j DW[j] over the kept columns.
+static vector<double> iqnFilteredStep(const vector<vector<double>>& DR,
+                                      const vector<vector<double>>& DW,
+                                      const vector<double>& rk, double eps_filter)
 {
-    const size_t m = b.size();
-    for (size_t col = 0; col < m; ++col) {
-        // partial pivot
-        size_t piv = col;
-        for (size_t r = col + 1; r < m; ++r)
-            if (std::fabs(A[r][col]) > std::fabs(A[piv][col])) piv = r;
-        std::swap(A[col], A[piv]); std::swap(b[col], b[piv]);
-        const double d = A[col][col];
-        if (std::fabs(d) < 1e-300) continue; // singular column -> skip (regularized upstream)
-        for (size_t r = col + 1; r < m; ++r) {
-            const double f = A[r][col] / d;
-            for (size_t c = col; c < m; ++c) A[r][c] -= f * A[col][c];
-            b[r] -= f * b[col];
+    const size_t m = DR.size();
+    const size_t n = rk.size();
+    vector<vector<double>> Q;        // orthonormal basis of kept columns
+    vector<vector<double>> Rrow;     // R coefficients above diagonal (per kept column)
+    vector<double> Rdiag;
+    vector<size_t> kept;             // original column index of each kept column
+    for (size_t j = 0; j < m; ++j) {
+        vector<double> v = DR[j];
+        double orig = 0.0; for (double x : v) orig += x * x; orig = std::sqrt(orig);
+        vector<double> rc(Q.size(), 0.0);
+        for (size_t l = 0; l < Q.size(); ++l) {
+            double d = 0.0; for (size_t t = 0; t < n; ++t) d += Q[l][t] * v[t];
+            rc[l] = d;
+            for (size_t t = 0; t < n; ++t) v[t] -= d * Q[l][t];
         }
+        double rho = 0.0; for (double x : v) rho += x * x; rho = std::sqrt(rho);
+        if (orig > 0.0 && rho > eps_filter * orig) {        // keep this column
+            for (size_t t = 0; t < n; ++t) v[t] /= rho;
+            Q.push_back(std::move(v)); Rrow.push_back(rc); Rdiag.push_back(rho); kept.push_back(j);
+        }
+        // else: drop column j (redundant / noise)
     }
-    vector<double> x(m, 0.0);
-    for (size_t ii = m; ii-- > 0; ) {
-        double s = b[ii];
-        for (size_t c = ii + 1; c < m; ++c) s -= A[ii][c] * x[c];
-        x[ii] = (std::fabs(A[ii][ii]) < 1e-300) ? 0.0 : s / A[ii][ii];
+    const size_t p = Q.size();
+    vector<double> qtr(p);
+    for (size_t l = 0; l < p; ++l) { double d = 0.0; for (size_t t = 0; t < n; ++t) d += Q[l][t] * rk[t]; qtr[l] = d; }
+    vector<double> g(p, 0.0);                               // back-substitution: R g = Q^T r^k
+    for (size_t i = p; i-- > 0; ) {
+        double s = qtr[i];
+        for (size_t j = i + 1; j < p; ++j) s -= Rrow[j][i] * g[j];   // R[i][j] = Rrow[j][i]
+        g[i] = (std::fabs(Rdiag[i]) < 1e-300) ? 0.0 : s / Rdiag[i];
     }
-    return x;
+    vector<double> step(n, 0.0);
+    for (size_t idx = 0; idx < p; ++idx)
+        for (size_t t = 0; t < n; ++t) step[t] += g[idx] * DW[kept[idx]][t];
+    return step;
 }
 
-// Anderson-accelerated interface step (robust IQN-type) for the fixed-point r(x)=G(x)-x=0.
+// Anderson/IQN-ILS interface step for the fixed-point r(x)=G(x)-x=0.
 // X = history of interface inputs x^i, R = residuals r^i (last entry = current k); theta = mixing.
-// F_i = r^k - r^i (i<k). Solve least-squares min ||r^k - F gamma|| (normal equations), then
-//   x^{k+1} = (x^k + theta*r^k) - sum_i gamma_i [ (x^k - x^i) + theta*(r^k - r^i) ].
-// Reduces to relaxation (x^k + theta*r^k) when gamma=0, so it never stalls (unlike pure
-// projection) and corrects with the secant history when it helps.
+//   x^{k+1} = (x^k + theta*r^k) - sum_i gamma_i [ (x^k - x^i) + theta*(r^k - r^i) ],
+// gamma = filtered least-squares of min ||r^k - sum_i gamma_i(r^k - r^i)||. Reduces to relaxation
+// (x^k + theta*r^k) when no/useless history, so it never stalls.
 static vector<double> andersonStep(const vector<vector<double>>& X,
                                    const vector<vector<double>>& R, double theta)
 {
     const size_t k = X.size() - 1;     // current iterate index
     const size_t n = X[k].size();      // interface vector length
     const size_t m = k;                // number of secant columns (past iterates)
-    // Normal equations A (m x m) = F^T F, rhs = F^T r^k, with F_i = r^k - r^i.
-    vector<vector<double>> A(m, vector<double>(m, 0.0));
-    vector<double> rhs(m, 0.0);
-    for (size_t a = 0; a < m; ++a) {
-        for (size_t bcol = a; bcol < m; ++bcol) {
-            double s = 0.0;
-            for (size_t t = 0; t < n; ++t)
-                s += (R[k][t] - R[a][t]) * (R[k][t] - R[bcol][t]);
-            A[a][bcol] = s; A[bcol][a] = s;
+    vector<vector<double>> DR(m), DW(m);
+    for (size_t i = 0; i < m; ++i) {
+        DR[i].resize(n); DW[i].resize(n);
+        for (size_t t = 0; t < n; ++t) {
+            const double dr = R[k][t] - R[i][t];
+            DR[i][t] = dr;
+            DW[i][t] = (X[k][t] - X[i][t]) + theta * dr;
         }
-        double s = 0.0;
-        for (size_t t = 0; t < n; ++t) s += (R[k][t] - R[a][t]) * R[k][t];
-        rhs[a] = s;
     }
-    // Tikhonov regularization (relative) against near-parallel columns near convergence.
-    double tr = 0.0; for (size_t a = 0; a < m; ++a) tr += A[a][a];
-    const double reg = 1e-8 * (tr / std::max<size_t>(m, 1)) + 1e-300;
-    for (size_t a = 0; a < m; ++a) A[a][a] += reg;
-    const vector<double> gamma = gaussSolve(A, rhs);
+    const vector<double> step = iqnFilteredStep(DR, DW, R[k], 1e-6);
     vector<double> xnext(n);
-    for (size_t t = 0; t < n; ++t) {
-        double v = X[k][t] + theta * R[k][t];   // Picard/relaxation base step
-        for (size_t a = 0; a < m; ++a)
-            v -= gamma[a] * ((X[k][t] - X[a][t]) + theta * (R[k][t] - R[a][t]));
-        xnext[t] = v;
-    }
+    for (size_t t = 0; t < n; ++t) xnext[t] = X[k][t] + theta * R[k][t] - step[t];
     return xnext;
 }
 
@@ -406,7 +410,8 @@ void MasterProcess()
         double WR_rel_Error = 1.0;
         bool WR_converged = false;
         double vcorr_end = vcorr0; // getragener Korrektur-Endwert (fuer naechsten Fenster-Seed)
-        // IQN-ILS Interface-Historie (pro Fenster zuruckgesetzt): Inputs x=V_corr und Residuen r.
+        // IQN-ILS Interface-Historie, PRO FENSTER zurueckgesetzt (cross-window-Reuse getestet ->
+        // schlechter: das Interface-Operating-Point verschiebt sich pro Fenster zu stark).
         std::vector<std::vector<double>> Xhist, Rhist;
         Waveform i_prev_last_iter; // i_m^(k-1) für L1-Konvergenzkriterium; leer am Fensteranfang
         double V_field_last_iter = 0.0; // für terminal-skalar Kriterium (Referenz CoSimulation_WR.cpp)
@@ -456,9 +461,10 @@ void MasterProcess()
             }
             Xhist.push_back(xk);
             Rhist.push_back(rk);
-            // Anderson depth cap: keep only the most recent (mmax+1) iterates. Unlimited history
-            // makes the secant least-squares ill-conditioned near convergence -> garbage steps.
-            const size_t mmax = 8;
+            // Depth cap: keep only the most recent (mmax+1) iterates (sliding window, persists
+            // across time-windows). QR column-filtering in andersonStep handles the conditioning,
+            // so the cap can be generous; it just bounds cost and drops stale operating points.
+            const size_t mmax = 12;
             if (Xhist.size() > mmax + 1) { Xhist.erase(Xhist.begin()); Rhist.erase(Rhist.begin()); }
 
             // Update: IQN-ILS (Broyden-type interface quasi-Newton) wenn wr_accel==1 und Historie
