@@ -23,3 +23,5 @@ _cfg_*.txt
 # python
 __pycache__/
 *.pyc
+lambda_field.pwl
+Field_flux.txt

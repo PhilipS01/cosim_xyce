@@ -678,8 +678,22 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     // This file is used by Xyce as V(iprev) in the next WR iteration.
     writePWLFile("i_prev_k.pwl", current);
 
+    // === Fluss-Verkettung lambda_FEM(t) als Feld-Ausgang (fuer flux-/GenExt-Kopplung) ===
+    // Ein echter magnetoquasistatischer FEM rechnet lambda = oint A·dl DIREKT (raeumliches
+    // Integral des Vektorpotentials), keine Zeit-Integration. Der Dummy nutzt die
+    // Konstitutiv-Relation: linear lambda = L_FEM*I; Saettigung lambda(I)=L_FEM*I_sat*atan(I/I_sat)
+    // (dieselbe `flux`-Lambda wie im Newton oben → konsistent). lambda ist algebraisch in I,
+    // KEINE Ableitung. Xyce (Q-Interface) differenziert lambda spaeter selbst (geteilter Integrator).
+    auto lambda_of_I = [&](double I) { return saturating ? flux(I) : L_FEM * I; };
+    Waveform flux_wf;
+    for (size_t j = 0; j < current.t.size(); ++j)
+        flux_wf.push(current.t[j], lambda_of_I(current.y[j]));
+    writePWLFile("lambda_field.pwl", flux_wf);
+
     // Terminal-Werte am Fensterende für Konvergenz-Propagation ins nächste Fenster.
     Write_Terminal_results("Field.txt", vport.y.back(), current.y.back());
+    // Terminal-Fluss separat (V_p am Port, lambda am Fensterende).
+    Write_Terminal_results("Field_flux.txt", vport.y.back(), flux_wf.y.back());
 }
 
 // WR-Konvergenzkriterium auf Basis der Stromwaveforms benachbarter Iterationen:
