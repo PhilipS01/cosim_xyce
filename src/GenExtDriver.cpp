@@ -196,11 +196,27 @@ int main(int argc, char ** argv)
     double maxerr = 0.0;
     for (size_t j = 0; j < ts.size(); ++j) maxerr = std::max(maxerr, std::fabs(ic[j] - Ifem[j]));
 
-    // Deferred RESISTIVE correction for the NEXT window: voff(t) = (R_FEM - Rrom)*I_FEM(t).
-    // (Inductive part is already exact via Q=Lrom*i, Lrom=L_FEM -> no derivative here.)
-    std::vector<double> cv(ts.size());
-    for (size_t j = 0; j < ts.size(); ++j) cv[j] = (R_FEM - Rrom) * Ifem[j];
-    vci.setCorrection(ts, cv);
+    // Deferred RESISTIVE correction with a LINEAR PREDICTOR. Instead of zero-order
+    // holding this window's I_FEM into the next window (the deferred lag), extrapolate
+    // the field-current trajectory across the NEXT window from this window's exit
+    // (end value + end slope). voff(t) = (R_FEM - Rrom)*I_pred(t) over [t1, t1+dt].
+    // (Inductive part is exact via Q=Lrom*i, Lrom=L_FEM -> still derivative-free here.)
+    const double t_end = ts.back();
+    const double I_end = Ifem.back();
+    double slope = 0.0;
+    {
+      const double h = ts[ts.size()-1] - ts[ts.size()-2];
+      if (h > 0.0) slope = (Ifem[Ifem.size()-1] - Ifem[Ifem.size()-2]) / h;
+    }
+    const double t_nextEnd = std::min(t_end + dt_window, t_final);
+    std::vector<double> nts(n_sub + 1), ncv(n_sub + 1);
+    for (int j = 0; j <= n_sub; ++j) {
+      const double tt = t_end + (t_nextEnd - t_end) * (double)j / (double)n_sub;
+      const double Ipred = I_end + slope * (tt - t_end);
+      nts[j] = tt;
+      ncv[j] = (R_FEM - Rrom) * Ipred;
+    }
+    vci.setCorrection(nts, ncv);
 
     printf("  %6.4f  %9.3e   %12.4e    %9.3f  %9.3f\n",
            t1, t, maxerr, ic.back(), Ifem.back());
