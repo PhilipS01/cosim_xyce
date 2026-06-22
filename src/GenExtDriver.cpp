@@ -38,14 +38,22 @@
 class FieldRomVCI : public Xyce::Device::VectorComputeInterface
 {
 public:
-  FieldRomVCI(double Rrom, double Lrom)
-    : Rrom_(Rrom), Lrom_(Lrom)
+  FieldRomVCI(double Rrom, double Lrom, bool saturating = false, double Isat = 100.0)
+    : Rrom_(Rrom), Lrom_(Lrom), saturating_(saturating), Isat_(Isat)
   {
     jacStamp.resize(3);
     jacStamp[A_].resize(1);  jacStamp[A_][0] = BR_;
     jacStamp[B_].resize(1);  jacStamp[B_][0] = BR_;
     jacStamp[BR_].resize(3); jacStamp[BR_][0] = A_; jacStamp[BR_][1] = B_; jacStamp[BR_][2] = BR_;
   }
+
+  // Saturation flux model put in Q (the SHARED STATE Xyce differentiates itself):
+  //   lambda(i) = Lrom*Isat*atan(i/Isat)  -> dlambda/di = Lrom/(1+(i/Isat)^2) = differential L.
+  // So dQ/dt = L_dyn(i)*di/dt is the EXACT nonlinear inductive voltage, and dQdx = L_dyn(i)
+  // (the true differential inductance) lands in the Newton Jacobian -> implicit, no derivative
+  // computed in C++, no staircase. Linear limit (Isat->inf or saturating_=false): lambda=Lrom*i.
+  double flux(double i)  const { return saturating_ ? Lrom_ * Isat_ * std::atan(i / Isat_) : Lrom_ * i; }
+  double Ldyn(double i)  const { const double r = i / Isat_; return saturating_ ? Lrom_ / (1.0 + r*r) : Lrom_; }
 
   // Set the resistive correction waveform voff(t) for the upcoming window (absolute time).
   void setCorrection(const std::vector<double> & t, const std::vector<double> & v)
@@ -85,14 +93,14 @@ public:
     F[A_]  =  i;
     F[B_]  = -i;
     F[BR_] =  Rrom_ * i - (sV[A_] - sV[B_]) + voff;
-    Q[BR_] =  Lrom_ * i;
+    Q[BR_] =  flux(i);                 // nonlinear flux as a shared state
 
     dFdx[A_][BR_]  =  1.0;
     dFdx[B_][BR_]  = -1.0;
     dFdx[BR_][A_]  = -1.0;
     dFdx[BR_][B_]  =  1.0;
     dFdx[BR_][BR_] =  Rrom_;
-    dQdx[BR_][BR_] =  Lrom_;
+    dQdx[BR_][BR_] =  Ldyn(i);         // differential inductance dlambda/di in the Jacobian
     return true;
   }
 
@@ -101,6 +109,8 @@ public:
 private:
   static const int A_ = 0, B_ = 1, BR_ = 2;
   double Rrom_, Lrom_;
+  bool saturating_;
+  double Isat_;
   std::vector<double> ct_, cv_; // correction waveform (time, value)
 };
 
@@ -111,15 +121,30 @@ private:
 // -----------------------------------------------------------------------------
 static std::vector<double> femEvaluate(const std::vector<double> & t,
                                        const std::vector<double> & Vp,
-                                       double R_FEM, double L_FEM, double I_start)
+                                       double R_FEM, double L_FEM, double I_start,
+                                       bool saturating = false, double Isat = 100.0)
 {
+  // True field:  V_p = R_FEM*I + dlambda/dt,  lambda(I) = L_FEM*Isat*atan(I/Isat) (sat) or L_FEM*I.
+  // Backward Euler:  R_FEM*I_j + (lambda(I_j) - lambda(I_{j-1}))/h - V_p = 0  (Newton for sat).
+  auto flux  = [&](double I){ return saturating ? L_FEM * Isat * std::atan(I / Isat) : L_FEM * I; };
+  auto Ldyn  = [&](double I){ const double r = I / Isat; return saturating ? L_FEM / (1.0 + r*r) : L_FEM; };
   const size_t N = t.size();
   std::vector<double> I(N, 0.0);
   I[0] = I_start;
   for (size_t j = 1; j < N; ++j) {
     const double h = t[j] - t[j-1];
-    // (R + L/h) I_j = V_p + (L/h) I_{j-1}
-    I[j] = (Vp[j] + (L_FEM / h) * I[j-1]) / (R_FEM + L_FEM / h);
+    const double lam_prev = flux(I[j-1]);
+    double Ij = (Vp[j] + (Ldyn(I[j-1]) / h) * I[j-1]) / (R_FEM + Ldyn(I[j-1]) / h); // linear seed
+    if (saturating) {
+      for (int it = 0; it < 50; ++it) {
+        const double g  = R_FEM * Ij + (flux(Ij) - lam_prev) / h - Vp[j];
+        const double gp = R_FEM + Ldyn(Ij) / h;
+        const double dI = g / gp;
+        Ij -= dI;
+        if (std::fabs(dI) <= 1e-12 + 1e-10 * std::fabs(Ij)) break;
+      }
+    }
+    I[j] = Ij;
   }
   return I;
 }
@@ -129,12 +154,16 @@ int main(int argc, char ** argv)
 {
   const char * netlist = (argc > 1) ? argv[1] : "wr_genext.cir";
 
-  // Field + ROM parameters (linear toy). Lrom = L_FEM -> inductance exact & implicit;
+  // Field + ROM parameters. Lrom = L_FEM -> inductance exact & implicit;
   // Rrom deliberately != R_FEM so the deferred resistive correction has work to do.
   const double R_FEM = 5.1e-4;
-  const double L_FEM = 1.6e-7;
+  const double L_FEM = getenv("GENEXT_LFEM") ? atof(getenv("GENEXT_LFEM")) : 1.6e-7;
   const double Rrom  = 0.9 * R_FEM; // mismatched ROM resistance
   const double Lrom  = L_FEM;       // matched inductance (exact implicit)
+  // Magnetic saturation of the field: lambda(I)=L_FEM*Isat*atan(I/Isat). Enable via env
+  // GENEXT_SAT=1; Isat via GENEXT_ISAT (default 100 A; peak I ~150 A -> strong saturation).
+  const bool   saturating = (getenv("GENEXT_SAT") && atoi(getenv("GENEXT_SAT")) != 0);
+  const double Isat = getenv("GENEXT_ISAT") ? atof(getenv("GENEXT_ISAT")) : 100.0;
 
   // Time stepping (must match the netlist .tran stop).
   const double t_final   = 0.02;
@@ -157,8 +186,9 @@ int main(int argc, char ** argv)
   }
   const std::string dev = names.front();
 
-  FieldRomVCI vci(Rrom, Lrom);
-  printf("Attaching field ROM to YGENEXT device: %s (Rrom=%.3e Lrom=%.3e)\n", dev.c_str(), Rrom, Lrom);
+  FieldRomVCI vci(Rrom, Lrom, saturating, Isat);
+  printf("Attaching field ROM to YGENEXT device: %s (Rrom=%.3e Lrom=%.3e sat=%d Isat=%.1f)\n",
+         dev.c_str(), Rrom, Lrom, (int)saturating, Isat);
   xyce.setNumInternalVars(dev, 1);
   xyce.setJacStamp(dev, vci.jacStamp);
   xyce.setVectorLoader(dev, &vci);
@@ -190,7 +220,7 @@ int main(int argc, char ** argv)
     if (ts.size() < 2) break;
 
     // FEM over the captured V_p(t)  (ONE call per window -- multirate).
-    const std::vector<double> Ifem = femEvaluate(ts, vp, R_FEM, L_FEM, I_field_start);
+    const std::vector<double> Ifem = femEvaluate(ts, vp, R_FEM, L_FEM, I_field_start, saturating, Isat);
 
     // Transmission error (circuit i vs field I_FEM) on the captured grid.
     double maxerr = 0.0;
