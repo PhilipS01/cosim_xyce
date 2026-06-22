@@ -82,6 +82,15 @@ public:
                           std::vector<std::vector<double> > & dFdx,
                           std::vector<std::vector<double> > & dQdx) override
   {
+    // BACKWARD-STEP SAFETY: Xyce does adaptive stepping and may REJECT a step (LTE too
+    // large), then call us again at an EARLIER time (AppNote 3.6). This device is a PURE
+    // FUNCTION of (sV, time): F,Q,dFdx,dQdx are recomputed from the live solution and a
+    // pure interpolation voff(time); NOTHING is cached across calls. So a backward jump
+    // needs no rollback -- we just return the correct values for whatever time is asked.
+    // (We only count jumps for diagnostics; the count never changes the result.)
+    if (time < lastTime_ - 1e-18) ++backwardJumps_;
+    lastTime_ = time;
+
     const int n = static_cast<int>(sV.size()); // 3
     F.assign(n, 0.0); Q.assign(n, 0.0); B.clear();
     dFdx.assign(n, std::vector<double>(n, 0.0));
@@ -104,6 +113,8 @@ public:
     return true;
   }
 
+  long backwardJumps() const { return backwardJumps_; } // diagnostics (rejected-step retries)
+
   std::vector<std::vector<int> > jacStamp;
 
 private:
@@ -112,6 +123,8 @@ private:
   bool saturating_;
   double Isat_;
   std::vector<double> ct_, cv_; // correction waveform (time, value)
+  mutable double lastTime_ = -1e300; // for backward-jump detection (diagnostic only)
+  mutable long backwardJumps_ = 0;
 };
 
 // -----------------------------------------------------------------------------
@@ -257,6 +270,7 @@ int main(int argc, char ** argv)
   }
 
   xyce.finalize();
-  printf("\nGenExt driver finished.\n");
+  printf("\nGenExt driver finished. (device backward-jump retries handled: %ld)\n",
+         vci.backwardJumps());
   return 0;
 }
