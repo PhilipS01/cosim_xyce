@@ -4,7 +4,11 @@ WR GenExt skeleton: field as a YGENEXT device (implicit coupling)
 * via computeXyceVectors). Vmeas measures the interface current i_Ls = I(Vmeas).
 Bemf  emf 0  V = { sin(2*3.14159265358979*50*time) }
 Rs_d  emf a  6e-3
-Vmeas a  p   0
+* Series coupling inductance Ls (the reactive circuit-side coupling that caused the
+* partitioned WR wall). A REAL Xyce inductor -> solved implicitly together with the
+* field device (no lagged reactive term for it to fight). Value swept by the driver test.
+Ls_d  a  b  1.6e-7 IC=0
+Vmeas b  p   0
 * Field ROM device: 2 terminals (port p, ground). Loaded by the driver (R-L + Q=L*i).
 YGENEXT field p 0
 .tran 4e-6 0.02 0 UIC
