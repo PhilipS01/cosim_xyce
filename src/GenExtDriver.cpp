@@ -59,11 +59,13 @@ public:
   void setCorrection(const std::vector<double> & t, const std::vector<double> & v)
   { ct_ = t; cv_ = v; }
 
-  // BLACK-BOX mode: per-window linear surrogate probed from the FEM. Rrom=R_diff, and the flux
-  // is the tangent line lambda0 + L_diff*(i - i0) (i0=operating-point current, lambda0=true flux
-  // there) -> Q continuous across windows (both share i0,lambda0 at the boundary), slope updates.
-  void setProbed(double Rdiff, double Ldiff, double i0, double lambda0)
-  { Rrom_ = Rdiff; Lrom_ = Ldiff; i0_ = i0; lambda0_ = lambda0; linFlux_ = true; }
+  // BLACK-BOX mode: per-window probed surrogate. Rrom=R_diff; flux is a QUADRATIC around the
+  // operating point i0:  Q = lambda0 + L_diff*(i-i0) + 0.5*curv*(i-i0)^2,  so the differential
+  // inductance dQ/di = L_diff + curv*(i-i0) VARIES within the window (captures saturation
+  // curvature). curv=0 -> tangent line. lambda0 chosen by the driver for Q-continuity at the
+  // window boundary (offset is voltage-irrelevant; a Q jump would spike dQ/dt -> Xyce abort).
+  void setProbed(double Rdiff, double Ldiff, double i0, double lambda0, double curv = 0.0)
+  { Rrom_ = Rdiff; Lrom_ = Ldiff; curv_ = curv; i0_ = i0; lambda0_ = lambda0; linFlux_ = true; }
 
   double interpCorrection(double time) const
   {
@@ -108,15 +110,17 @@ public:
     F[A_]  =  i;
     F[B_]  = -i;
     F[BR_] =  Rrom_ * i - (sV[A_] - sV[B_]) + voff;
-    // Flux in Q: black-box -> probed tangent line lambda0+L_diff*(i-i0); else analytic lambda(i).
-    Q[BR_] =  linFlux_ ? (lambda0_ + Lrom_ * (i - i0_)) : flux(i);
+    // Flux in Q: black-box -> probed quadratic lambda0+L_diff*(i-i0)+0.5*curv*(i-i0)^2;
+    //            else analytic lambda(i).
+    const double di = i - i0_;
+    Q[BR_] =  linFlux_ ? (lambda0_ + Lrom_ * di + 0.5 * curv_ * di * di) : flux(i);
 
     dFdx[A_][BR_]  =  1.0;
     dFdx[B_][BR_]  = -1.0;
     dFdx[BR_][A_]  = -1.0;
     dFdx[BR_][B_]  =  1.0;
     dFdx[BR_][BR_] =  Rrom_;
-    dQdx[BR_][BR_] =  linFlux_ ? Lrom_ : Ldyn(i);  // differential inductance in the Jacobian
+    dQdx[BR_][BR_] =  linFlux_ ? (Lrom_ + curv_ * di) : Ldyn(i);  // differential inductance
     return true;
   }
 
@@ -129,8 +133,8 @@ private:
   double Rrom_, Lrom_;
   bool saturating_;
   double Isat_;
-  bool   linFlux_ = false;       // black-box: use probed tangent-line flux instead of analytic
-  double i0_ = 0.0, lambda0_ = 0.0;
+  bool   linFlux_ = false;       // black-box: use probed (quadratic) flux instead of analytic
+  double i0_ = 0.0, lambda0_ = 0.0, curv_ = 0.0;
   std::vector<double> ct_, cv_; // correction waveform (time, value)
   mutable double lastTime_ = -1e300; // for backward-jump detection (diagnostic only)
   mutable long backwardJumps_ = 0;
@@ -176,16 +180,17 @@ static std::vector<double> femEvaluate(const std::vector<double> & t,
 }
 
 // Probe the field's port Jacobian from BLACK-BOX outputs only (V_p, I_FEM, lambda_FEM over a
-// window): differential inductance L_diff = dlambda/dI (LS slope of lambda vs I), differential
-// resistance R_diff = d(V_p - dlambda/dt)/dI (LS slope; the field relation V_p = R*I + dlambda/dt
-// -> V_p - dlambda/dt = R*I). dlambda/dt by FD of the FEM's own smooth lambda output (only used
-// to FORM the surrogate, never re-differentiated by Xyce). For a linear field this recovers
-// R_FEM, L_FEM exactly; for saturation it gives the window-averaged differential values.
+// window). R_diff: LS slope of (V_p - dlambda/dt) vs I (field relation V_p = R*I + dlambda/dt).
+// Flux model lambda(I): QUADRATIC fit  lambda ~ a0 + a1*I + a2*I^2  (centered for conditioning)
+// -> differential inductance dlambda/dI = a1 + 2*a2*I = Lslope0 + curv*I, where Lslope0=a1 and
+// curv=2*a2. The quadratic captures the saturation CURVATURE within a window (the tangent line
+// = curv 0). dlambda/dt by FD of the FEM's smooth lambda (only to FORM the surrogate, never
+// re-differentiated by Xyce). Linear field: a2~0 -> recovers R_FEM, L_FEM; tangent line.
 static void probeJacobian(const std::vector<double> & t,
                           const std::vector<double> & Vp,
                           const std::vector<double> & I,
                           const std::vector<double> & lam,
-                          double & Rdiff, double & Ldiff)
+                          double & Rdiff, double & Lslope0, double & curv)
 {
   const size_t N = t.size();
   auto lsSlope = [&](const std::vector<double> & x, const std::vector<double> & y) {
@@ -194,7 +199,7 @@ static void probeJacobian(const std::vector<double> & t,
     const double d = (double)N*sxx - sx*sx;
     return (std::fabs(d) < 1e-300) ? 0.0 : ((double)N*sxy - sx*sy) / d;
   };
-  Ldiff = lsSlope(I, lam);
+  // R_diff (resistive Jacobian)
   std::vector<double> vres(N);
   for (size_t j = 0; j < N; ++j) {
     const double dlamdt = (j == 0) ? (lam[1]-lam[0])/(t[1]-t[0])
@@ -202,6 +207,28 @@ static void probeJacobian(const std::vector<double> & t,
     vres[j] = Vp[j] - dlamdt;
   }
   Rdiff = lsSlope(I, vres);
+
+  // Quadratic LS fit lambda ~ c0 + c1*x + c2*x^2 with x = I - Imean (centered -> conditioned).
+  double Imean = 0.0; for (double v : I) Imean += v; Imean /= (double)N;
+  double S0=N, S1=0,S2=0,S3=0,S4=0, T0=0,T1=0,T2=0;
+  for (size_t j = 0; j < N; ++j) {
+    const double x = I[j]-Imean, x2=x*x, y=lam[j];
+    S1+=x; S2+=x2; S3+=x2*x; S4+=x2*x2; T0+=y; T1+=x*y; T2+=x2*y;
+  }
+  // 3x3 normal equations [[S0 S1 S2],[S1 S2 S3],[S2 S3 S4]] [c0 c1 c2]^T = [T0 T1 T2]^T
+  double A[3][3] = {{S0,S1,S2},{S1,S2,S3},{S2,S3,S4}};
+  double b[3] = {T0,T1,T2};
+  for (int col=0; col<3; ++col) {
+    int piv=col; for(int r=col+1;r<3;++r) if(std::fabs(A[r][col])>std::fabs(A[piv][col])) piv=r;
+    for(int c=0;c<3;++c) std::swap(A[col][c],A[piv][c]); std::swap(b[col],b[piv]);
+    const double d=A[col][col]; if(std::fabs(d)<1e-300) continue;
+    for(int r=col+1;r<3;++r){ const double f=A[r][col]/d; for(int c=col;c<3;++c) A[r][c]-=f*A[col][c]; b[r]-=f*b[col]; }
+  }
+  double c[3]={0,0,0};
+  for(int ii=2;ii>=0;--ii){ double s=b[ii]; for(int cc=ii+1;cc<3;++cc) s-=A[ii][cc]*c[cc]; c[ii]=(std::fabs(A[ii][ii])<1e-300)?0.0:s/A[ii][ii]; }
+  // centered: dlambda/dI = c1 + 2*c2*(I-Imean). curv = 2*c2; Lslope0 = a1 (un-centered) = c1 - 2*c2*Imean.
+  curv    = 2.0 * c[2];
+  Lslope0 = c[1] - 2.0 * c[2] * Imean;
 }
 
 // -----------------------------------------------------------------------------
@@ -223,6 +250,9 @@ int main(int argc, char ** argv)
   // FEM's (V_p -> I_FEM, lambda_FEM) outputs each window. (R_FEM/L_FEM still live inside
   // femEvaluate as the opaque "FEM", but the device/coupling never reads them.)
   const bool   blackbox = (getenv("GENEXT_BLACKBOX") && atoi(getenv("GENEXT_BLACKBOX")) != 0);
+
+  // Source (for the cold-start pre-probe; must match the netlist Bemf).
+  const double freq = 50.0, amp = 1.0;
 
   // Time stepping (must match the netlist .tran stop).
   const double t_final   = 0.02;
@@ -246,7 +276,6 @@ int main(int argc, char ** argv)
   const std::string dev = names.front();
 
   FieldRomVCI vci(Rrom, Lrom, saturating, Isat);
-  if (blackbox) vci.setProbed(1.0e-3, 1.0e-6, 0.0, 0.0); // cold-start guess; refined per window by the probe
   printf("Attaching field ROM to YGENEXT device: %s (Rrom=%.3e Lrom=%.3e sat=%d Isat=%.1f blackbox=%d)\n",
          dev.c_str(), Rrom, Lrom, (int)saturating, Isat, (int)blackbox);
   xyce.setNumInternalVars(dev, 1);
@@ -261,9 +290,25 @@ int main(int argc, char ** argv)
   double I_field_start = 0.0; // FEM window-start current (carried)
   double Vp_start = 0.0;      // port voltage at window start (carried; 0 at t=0 with UIC)
   // Black-box device flux model, tracked for Q-continuity across windows. Q = curLam0 +
-  // curL*(i - curI0). The offset is physically irrelevant (constant flux -> no voltage); only
-  // continuity in the CIRCUIT current matters (else a Q jump -> dQ/dt spike -> Xyce abort).
-  double curR = 1.0e-3, curL = 1.0e-6, curI0 = 0.0, curLam0 = 0.0; // = cold-start setProbed above
+  // curL*(i-curI0) + 0.5*curC*(i-curI0)^2. The offset is voltage-irrelevant; only continuity
+  // in the CIRCUIT current matters (else a Q jump -> dQ/dt spike -> Xyce abort).
+  double curR = 1.0e-3, curL = 1.0e-6, curC = 0.0, curI0 = 0.0, curLam0 = 0.0;
+
+  // COLD-START PRE-PROBE: before the run, probe the FEM on a synthetic V_p ramp (the source's
+  // small-t slope, V_p ~ amp*2*pi*f*t) to get an initial Jacobian -> avoids the ~6-window
+  // cold-start transient that a generic guess would cause.
+  if (blackbox) {
+    const double w = 2.0 * M_PI * freq;
+    std::vector<double> pts(n_sub + 1), pvp(n_sub + 1);
+    for (int j = 0; j <= n_sub; ++j) { pts[j] = dt_window * (double)j / n_sub; pvp[j] = amp * w * pts[j]; }
+    std::vector<double> plam;
+    const std::vector<double> pI = femEvaluate(pts, pvp, R_FEM, L_FEM, 0.0, saturating, Isat, &plam);
+    double Rd, Ls0, cv; probeJacobian(pts, pvp, pI, plam, Rd, Ls0, cv);
+    curR = Rd; curL = Ls0; curC = cv; curI0 = 0.0; curLam0 = 0.0;
+    printf("pre-probe: R_diff=%.3e L_diff(0)=%.3e curv=%.3e\n", curR, curL, curC);
+  }
+  vci.setProbed(curR, curL, curI0, curLam0, curC); // initial device model
+
   printf("\n  window     t_end      max|i_circ-I_FEM|   i_end      I_FEM_end\n");
   while (t < t_final - 1e-12) {
     const double t0 = t;
@@ -295,16 +340,18 @@ int main(int argc, char ** argv)
     // PROBE (R_diff, L_diff) from the FEM outputs and set the device's per-window linearization.
     double Rsur = Rrom, Lsur = Lrom;
     if (blackbox) {
-      double Rdiff, Ldiff;
-      probeJacobian(ts, vp, Ifem, lam, Rdiff, Ldiff);
-      Rsur = Rdiff; Lsur = Ldiff;
-      // device for the NEXT window: keep the flux Q continuous in the CIRCUIT current at the
-      // boundary. iB = circuit current at window end; new offset = old model's Q at iB so the
-      // value matches (slope updates to Ldiff). Offset is voltage-irrelevant (constant flux).
-      const double iB = ic.back();
-      const double Qb = curLam0 + curL * (iB - curI0);  // old device Q at the boundary
-      curR = Rdiff; curL = Ldiff; curI0 = iB; curLam0 = Qb;
-      vci.setProbed(curR, curL, curI0, curLam0);
+      double Rdiff, Lslope0, curv;
+      probeJacobian(ts, vp, Ifem, lam, Rdiff, Lslope0, curv);
+      const double iB = ic.back();                     // circuit current at the window boundary
+      const double Ldiff_iB = Lslope0 + curv * iB;     // differential inductance dlambda/dI at iB
+      Rsur = Rdiff; Lsur = Ldiff_iB;
+      // Keep Q continuous in the circuit current at the boundary: new offset = old model's Q at
+      // iB (value-irrelevant for voltage; a jump would spike dQ/dt). Quadratic slope+curvature
+      // update. curOff/curL/curC track the old model to evaluate its Q at iB.
+      const double dB = iB - curI0;
+      const double Qb = curLam0 + curL * dB + 0.5 * curC * dB * dB; // old device Q at boundary
+      curR = Rdiff; curL = Ldiff_iB; curC = curv; curI0 = iB; curLam0 = Qb;
+      vci.setProbed(curR, curL, curI0, curLam0, curC);
     }
 
     // Deferred correction with a LINEAR PREDICTOR. Residual of the field vs the surrogate along
