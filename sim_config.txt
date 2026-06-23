@@ -16,3 +16,4 @@ N_xyce_coupling_intervals = 100
 WRmaxSteps = 20
 WR_tolerance = 0.001
 wr_convergence_method = 1
+wr_genext_blackbox = 0

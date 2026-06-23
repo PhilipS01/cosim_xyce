@@ -232,32 +232,95 @@ static void probeJacobian(const std::vector<double> & t,
 }
 
 // -----------------------------------------------------------------------------
+// Config (sim_config.txt, same key=value format as the partitioned solver) drives BOTH the
+// field model and the generated netlist. Env vars override (GENEXT_*).
+struct GxCfg {
+  double frequency = 50.0, amplitude = 1.0;
+  double R_series = 6.0e-3, L_series = 1.6e-7;   // circuit-side coupling (Rs, Ls)
+  double R_FEM = 5.1e-4, L_FEM = 1.6e-7;         // "true" field
+  double R_ROM = 4.59e-4;                        // ROM resistance (known-param device; Lrom=L_FEM)
+  double I_sat = 100.0;
+  int    nonlin_model = 0;                       // 1 -> magnetic saturation
+  int    N_periods = 1, N_field_steps = 50;      // -> t_final, dt_window
+  int    blackbox = 0;                           // 1 -> probe the Jacobian (no known field params)
+};
+
+static void loadGxCfg(const char * path, GxCfg & c)
+{
+  FILE * f = std::fopen(path, "r");
+  if (!f) { printf("loadGxCfg: '%s' not found, using defaults.\n", path); return; }
+  char line[256];
+  while (std::fgets(line, sizeof(line), f)) {
+    std::string s(line); const size_t h = s.find('#'); if (h != std::string::npos) s = s.substr(0, h);
+    for (char & ch : s) if (ch == '=' || ch == ',' || ch == '\t') ch = ' ';
+    std::string key; double val; std::istringstream iss(s);
+    if (!(iss >> key)) continue; if (!(iss >> val)) continue;
+    if      (key == "frequency")                       c.frequency = val;
+    else if (key == "amplitude")                       c.amplitude = val;
+    else if (key == "R_series")                        c.R_series = val;
+    else if (key == "L_series")                        c.L_series = val;
+    else if (key == "R_FEM")                           c.R_FEM = val;
+    else if (key == "L_FEM")                           c.L_FEM = val;
+    else if (key == "R_ROM")                           c.R_ROM = val;
+    else if (key == "I_sat")                           c.I_sat = val;
+    else if (key == "nonlin_model")                    c.nonlin_model = (int)val;
+    else if (key == "N_periods")                       c.N_periods = (int)val;
+    else if (key == "N_field_steps_per_source_period") c.N_field_steps = (int)val;
+    else if (key == "wr_genext_blackbox")              c.blackbox = (int)val;
+  }
+  std::fclose(f);
+}
+
+// Generate the YGENEXT netlist from config: EMF source, series Rs+Ls, the field device, .tran.
+static void writeGxNetlist(const char * path, const GxCfg & c, double t_final, double dt_print)
+{
+  FILE * f = std::fopen(path, "w");
+  if (!f) { fprintf(stderr, "writeGxNetlist: cannot open %s\n", path); return; }
+  std::fprintf(f, "WR GenExt netlist (generated from sim_config by GenExtDriver)\n");
+  std::fprintf(f, "Bemf  emf 0  V = { %.10g*sin(2*3.14159265358979*%.10g*time) }\n", c.amplitude, c.frequency);
+  std::fprintf(f, "Rs_d  emf a  %.10g\n", c.R_series);
+  if (c.L_series > 0.0) std::fprintf(f, "Ls_d  a  b  %.10g IC=0\n", c.L_series);
+  else                  std::fprintf(f, "Rls_d a  b  1e-9\n");   // Ls=0 -> tiny-R short
+  std::fprintf(f, "Vmeas b  p   0\n");
+  std::fprintf(f, "YGENEXT field p 0\n");
+  std::fprintf(f, ".tran %.10g %.10g 0 UIC\n", dt_print, t_final);
+  std::fprintf(f, ".print tran V(p) I(Vmeas)\n.end\n");
+  std::fclose(f);
+}
+
 int main(int argc, char ** argv)
 {
-  const char * netlist = (argc > 1) ? argv[1] : "wr_genext.cir";
+  const char * cfgpath = (argc > 1) ? argv[1] : "sim_config.txt";
+  GxCfg cfg; loadGxCfg(cfgpath, cfg);
+  // Env overrides (handy for sweeps/tests).
+  if (getenv("GENEXT_LFEM"))     cfg.L_FEM = atof(getenv("GENEXT_LFEM"));
+  if (getenv("GENEXT_ISAT"))     cfg.I_sat = atof(getenv("GENEXT_ISAT"));
+  if (getenv("GENEXT_SAT"))      cfg.nonlin_model = atoi(getenv("GENEXT_SAT"));
+  if (getenv("GENEXT_BLACKBOX")) cfg.blackbox = atoi(getenv("GENEXT_BLACKBOX"));
+  if (getenv("GENEXT_LS"))       cfg.L_series = atof(getenv("GENEXT_LS"));
 
-  // Field + ROM parameters. Lrom = L_FEM -> inductance exact & implicit;
-  // Rrom deliberately != R_FEM so the deferred resistive correction has work to do.
-  const double R_FEM = 5.1e-4;
-  const double L_FEM = getenv("GENEXT_LFEM") ? atof(getenv("GENEXT_LFEM")) : 1.6e-7;
-  const double Rrom  = 0.9 * R_FEM; // mismatched ROM resistance
-  const double Lrom  = L_FEM;       // matched inductance (exact implicit)
-  // Magnetic saturation of the field: lambda(I)=L_FEM*Isat*atan(I/Isat). Enable via env
-  // GENEXT_SAT=1; Isat via GENEXT_ISAT (default 100 A; peak I ~150 A -> strong saturation).
-  const bool   saturating = (getenv("GENEXT_SAT") && atoi(getenv("GENEXT_SAT")) != 0);
-  const double Isat = getenv("GENEXT_ISAT") ? atof(getenv("GENEXT_ISAT")) : 100.0;
-  // BLACK-BOX mode: the device does NOT use R_FEM/L_FEM; it PROBES (R_diff,L_diff) from the
-  // FEM's (V_p -> I_FEM, lambda_FEM) outputs each window. (R_FEM/L_FEM still live inside
-  // femEvaluate as the opaque "FEM", but the device/coupling never reads them.)
-  const bool   blackbox = (getenv("GENEXT_BLACKBOX") && atoi(getenv("GENEXT_BLACKBOX")) != 0);
+  const double R_FEM = cfg.R_FEM;
+  const double L_FEM = cfg.L_FEM;
+  const double Rrom  = cfg.R_ROM;   // known-param device resistance (mismatched on purpose)
+  const double Lrom  = L_FEM;       // matched inductance (exact implicit) in known-param mode
+  const bool   saturating = (cfg.nonlin_model == 1);
+  const double Isat = cfg.I_sat;
+  const bool   blackbox = (cfg.blackbox != 0);
 
-  // Source (for the cold-start pre-probe; must match the netlist Bemf).
-  const double freq = 50.0, amp = 1.0;
+  const char * netlist = "wr_genext.cir";
 
-  // Time stepping (must match the netlist .tran stop).
-  const double t_final   = 0.02;
-  const double dt_window = 4.0e-4;
+  // Source (for the pre-probe; matches the generated netlist Bemf).
+  const double freq = cfg.frequency, amp = cfg.amplitude;
+
+  // Time stepping from config: window = one field step; t_final = N_periods source periods.
+  const double dt_window = (1.0 / cfg.frequency) / (double)cfg.N_field_steps;
+  const double t_final   = (double)cfg.N_periods / cfg.frequency;
   const int    n_sub     = 20;      // sub-steps per window to capture V_p(t) for the FEM
+
+  // Generate the netlist from config (source, Rs, Ls, the YGENEXT field, .tran).
+  writeGxNetlist(netlist, cfg, t_final, dt_window / n_sub);
+  printf("Config: f=%.1f amp=%.3g Rs=%.3g Ls=%.3g R_FEM=%.3g L_FEM=%.3g sat=%d Isat=%.1f blackbox=%d\n",
+         cfg.frequency, cfg.amplitude, cfg.R_series, cfg.L_series, R_FEM, L_FEM, (int)saturating, Isat, (int)blackbox);
 
   Xyce::Circuit::GenCouplingSimulator xyce;
   char prog[] = "xyce";
@@ -306,8 +369,9 @@ int main(int argc, char ** argv)
     double Rd, Ls0, cv; probeJacobian(pts, pvp, pI, plam, Rd, Ls0, cv);
     curR = Rd; curL = Ls0; curC = cv; curI0 = 0.0; curLam0 = 0.0;
     printf("pre-probe: R_diff=%.3e L_diff(0)=%.3e curv=%.3e\n", curR, curL, curC);
+    vci.setProbed(curR, curL, curI0, curLam0, curC); // initial probed device model (black-box only)
   }
-  vci.setProbed(curR, curL, curI0, curLam0, curC); // initial device model
+  // (known-param mode keeps the analytic flux(i); setProbed is black-box only.)
 
   printf("\n  window     t_end      max|i_circ-I_FEM|   i_end      I_FEM_end\n");
   while (t < t_final - 1e-12) {
