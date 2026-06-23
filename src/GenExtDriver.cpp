@@ -243,6 +243,14 @@ struct GxCfg {
   int    nonlin_model = 0;                       // 1 -> magnetic saturation
   int    N_periods = 1, N_field_steps = 50;      // -> t_final, dt_window
   int    blackbox = 0;                           // 1 -> probe the Jacobian (no known field params)
+  // L1 iterative WR via Xyce-native checkpoint/restart (A). iterate=0 -> deferred (single pass,
+  // one long sim). iterate=1 -> each window is a separate restarted sim; voff is iterated to the
+  // transmission fixpoint by RE-RUNNING the window from its t0 checkpoint. max_iter=1 reduces to
+  // pure restart-based multirate (state carried by checkpoint, no in-window iteration).
+  int    iterate = 0;
+  int    max_iter = 20;                          // cap on per-window WR iterations
+  double tol = 1.0e-4;                           // WR converged when ||dvoff|| < tol*||voff|| (fixpoint)
+  double theta = 1.0;                            // under-relaxation: voff += theta*(r - voff)
 };
 
 static void loadGxCfg(const char * path, GxCfg & c)
@@ -267,25 +275,109 @@ static void loadGxCfg(const char * path, GxCfg & c)
     else if (key == "N_periods")                       c.N_periods = (int)val;
     else if (key == "N_field_steps_per_source_period") c.N_field_steps = (int)val;
     else if (key == "wr_genext_blackbox")              c.blackbox = (int)val;
+    else if (key == "wr_genext_iterate")               c.iterate = (int)val;
+    else if (key == "wr_genext_max_iter")              c.max_iter = (int)val;
+    else if (key == "wr_genext_tol")                   c.tol = val;
+    else if (key == "wr_genext_theta")                 c.theta = val;
   }
   std::fclose(f);
 }
 
 // Generate the YGENEXT netlist from config: EMF source, series Rs+Ls, the field device, .tran.
-static void writeGxNetlist(const char * path, const GxCfg & c, double t_final, double dt_print)
+//
+// WINDOW RESTART (resume == true): Xyce's NATIVE checkpoint/restart (.OPTIONS RESTART) does NOT
+//   round-trip the YGENEXT internal branch current -- verified by inspecting an unpacked checkpoint
+//   (the field current ~17 A is absent), consistent with AppNote 3.6 (GenExt internal vars are not
+//   first-class persistent state). And .IC on the internal node is ignored unless the OP is skipped.
+//   So we reconstruct the window-start state EXPLICITLY (the driver is the checkpoint store): the
+//   only memory in this circuit is the (series) inductor current i, so we seed it on BOTH the real
+//   inductor (Ls_d IC=i) and the field branch (.IC V(YGENEXT!FIELD_internalnode_0)=i), and use NOOP
+//   to skip the operating point and start transient directly from these ICs (AppNote 3.6 workaround;
+//   "all zeros except where specified by .IC"). The algebraic node voltages re-solve at the first
+//   step. resume == false -> fresh window from t=0 (UIC, all IC=0).
+static void writeGxNetlist(const char * path, const GxCfg & c, double t_final, double dt_print,
+                           bool resume = false, double iSeed = 0.0)
 {
   FILE * f = std::fopen(path, "w");
   if (!f) { fprintf(stderr, "writeGxNetlist: cannot open %s\n", path); return; }
   std::fprintf(f, "WR GenExt netlist (generated from sim_config by GenExtDriver)\n");
   std::fprintf(f, "Bemf  emf 0  V = { %.10g*sin(2*3.14159265358979*%.10g*time) }\n", c.amplitude, c.frequency);
   std::fprintf(f, "Rs_d  emf a  %.10g\n", c.R_series);
-  if (c.L_series > 0.0) std::fprintf(f, "Ls_d  a  b  %.10g IC=0\n", c.L_series);
+  if (c.L_series > 0.0) std::fprintf(f, "Ls_d  a  b  %.10g IC=%.10g\n", c.L_series, resume ? iSeed : 0.0);
   else                  std::fprintf(f, "Rls_d a  b  1e-9\n");   // Ls=0 -> tiny-R short
   std::fprintf(f, "Vmeas b  p   0\n");
   std::fprintf(f, "YGENEXT field p 0\n");
-  std::fprintf(f, ".tran %.10g %.10g 0 UIC\n", dt_print, t_final);
+  std::fprintf(f, ".tran %.10g %.10g 0 %s\n", dt_print, t_final, resume ? "NOOP" : "UIC");
+  if (resume) std::fprintf(f, ".IC V(YGENEXT!FIELD_internalnode_0)=%.10g\n", iSeed);
   std::fprintf(f, ".print tran V(p) I(Vmeas)\n.end\n");
   std::fclose(f);
+}
+
+// Linear interpolation of a (time,value) waveform; flat outside the range. Empty -> 0.
+static double interp1(double time, const std::vector<double> & T, const std::vector<double> & V)
+{
+  if (T.empty()) return 0.0;
+  if (time <= T.front()) return V.front();
+  if (time >= T.back())  return V.back();
+  for (size_t j = 1; j < T.size(); ++j)
+    if (time <= T[j]) { const double a = (time - T[j-1]) / (T[j] - T[j-1]); return V[j-1] + a*(V[j]-V[j-1]); }
+  return V.back();
+}
+
+// Per-call device configuration for runWindow (the VCI is rebuilt fresh each window/iteration,
+// since a restart needs a fresh GenCouplingSimulator lifecycle).
+struct DevCfg {
+  double Rrom, Lrom; bool sat; double Isat;
+  bool   probed = false; double pR = 0, pL = 0, pI0 = 0, pLam0 = 0, pCurv = 0;
+  std::vector<double> voffT, voffV;   // correction waveform over the window (absolute time)
+};
+struct WinCap { std::vector<double> ts, vp, ic; bool ok = false; long backJumps = 0; };
+
+// Run ONE window [t0,t1] as a self-contained Xyce lifecycle and capture V_p(t), i(t).
+// restart>=0 -> restart from the checkpoint at that time; ckpt>0 -> write checkpoints (so one
+// lands at t1 for the next window/iteration). The window-start sample (t0, Vp_start, I_seed) is
+// carried in (getSolution is only valid AFTER a simulateUntil; on a restart run the first solve
+// lands at the first sub-step, not t0). This is the rewind primitive: to iterate a window we just
+// call runWindow again with restart=t0 and an updated dev.voff -> Xyce re-solves the SAME window.
+static WinCap runWindow(const char * netlist, const GxCfg & cfg, double t0, double t1,
+                        double dt_print, int n_sub, bool resume,
+                        double Vp_start, double I_seed, const DevCfg & dev, double iBranchSeed)
+{
+  WinCap w;
+  // resume windows reconstruct the start state from the carried inductor current (see writeGxNetlist).
+  writeGxNetlist(netlist, cfg, t1, dt_print, resume, iBranchSeed);
+
+  Xyce::Circuit::GenCouplingSimulator xyce;
+  char prog[] = "xyce";
+  std::vector<char> nlbuf(netlist, netlist + std::string(netlist).size() + 1);
+  char * xargv[2] = { prog, nlbuf.data() };
+  if (xyce.initializeEarly(2, xargv) == Xyce::Circuit::Simulator::ERROR) return w;
+
+  std::vector<std::string> names;
+  if (!xyce.getDeviceNames("YGENEXT", names) || names.empty()) { xyce.finalize(); return w; }
+  const std::string d = names.front();
+
+  FieldRomVCI vci(dev.Rrom, dev.Lrom, dev.sat, dev.Isat);
+  if (dev.probed) vci.setProbed(dev.pR, dev.pL, dev.pI0, dev.pLam0, dev.pCurv);
+  vci.setCorrection(dev.voffT, dev.voffV);
+  xyce.setNumInternalVars(d, 1);
+  xyce.setJacStamp(d, vci.jacStamp);
+  xyce.setVectorLoader(d, &vci);
+  if (xyce.initializeLate() == Xyce::Circuit::Simulator::ERROR) { xyce.finalize(); return w; }
+
+  w.ts.push_back(t0); w.vp.push_back(Vp_start); w.ic.push_back(I_seed);
+  for (int s = 1; s <= n_sub; ++s) {
+    const double t_req = t0 + (t1 - t0) * (double)s / (double)n_sub;
+    double t_done = t0;
+    if (!xyce.simulateUntil(t_req, t_done)) { xyce.finalize(); return w; }
+    std::vector<double> sV;
+    if (xyce.getSolution(d, sV) && sV.size() >= 3) { w.ts.push_back(t_done); w.vp.push_back(sV[0]); w.ic.push_back(sV[2]); }
+    if (t_done < t_req - 1e-15) break;
+  }
+  w.backJumps = vci.backwardJumps();
+  xyce.finalize();
+  w.ok = (w.ts.size() >= 2);
+  return w;
 }
 
 int main(int argc, char ** argv)
@@ -298,6 +390,10 @@ int main(int argc, char ** argv)
   if (getenv("GENEXT_SAT"))      cfg.nonlin_model = atoi(getenv("GENEXT_SAT"));
   if (getenv("GENEXT_BLACKBOX")) cfg.blackbox = atoi(getenv("GENEXT_BLACKBOX"));
   if (getenv("GENEXT_LS"))       cfg.L_series = atof(getenv("GENEXT_LS"));
+  if (getenv("GENEXT_ITERATE"))  cfg.iterate  = atoi(getenv("GENEXT_ITERATE"));
+  if (getenv("GENEXT_MAXITER"))  cfg.max_iter = atoi(getenv("GENEXT_MAXITER"));
+  if (getenv("GENEXT_TOL"))      cfg.tol      = atof(getenv("GENEXT_TOL"));
+  if (getenv("GENEXT_THETA"))    cfg.theta    = atof(getenv("GENEXT_THETA"));
 
   const double R_FEM = cfg.R_FEM;
   const double L_FEM = cfg.L_FEM;
@@ -317,10 +413,137 @@ int main(int argc, char ** argv)
   const double t_final   = (double)cfg.N_periods / cfg.frequency;
   const int    n_sub     = 20;      // sub-steps per window to capture V_p(t) for the FEM
 
-  // Generate the netlist from config (source, Rs, Ls, the YGENEXT field, .tran).
-  writeGxNetlist(netlist, cfg, t_final, dt_window / n_sub);
   printf("Config: f=%.1f amp=%.3g Rs=%.3g Ls=%.3g R_FEM=%.3g L_FEM=%.3g sat=%d Isat=%.1f blackbox=%d\n",
          cfg.frequency, cfg.amplitude, cfg.R_series, cfg.L_series, R_FEM, L_FEM, (int)saturating, Isat, (int)blackbox);
+
+  // =========================================================================================
+  // (A) L1 ITERATIVE WR via per-window CHECKPOINT/RESTART (rewind).
+  // Each window [t0,t1] is a self-contained Xyce run (runWindow). Within a window the correction
+  // voff is iterated to the transmission fixpoint by RE-RUNNING the window from its start state --
+  // the "rewind" needed for iteration.
+  //   voff^(k+1) = voff^(k) + theta*(r^(k) - voff^(k)),  r = V_p - [Rsur*I_FEM + Lsur*dI_FEM/dt]
+  // recomputed on the SAME window (no extrapolation lag). Converges geometrically to the WR
+  // fixpoint (||dvoff||->0); the transmission residual then floors at the discretization level
+  // (coarse captured grid + per-window order-1 NOOP restart), which WR iterations cannot lower.
+  //
+  // CHECKPOINT/RESTART NOTE: Xyce's NATIVE .OPTIONS RESTART does NOT round-trip the YGENEXT
+  // internal branch current (verified by inspecting an unpacked checkpoint: the field current is
+  // absent; cf. AppNote 3.6). So the rewind/state-carry is DRIVER-MANAGED: we checkpoint by reading
+  // the window-end state (getSolution -> Vp, i; the only memory is the series inductor current) and
+  // restart by reconstructing it in a fresh run via NOOP + Ls IC + .IC on the field internal node
+  // (see writeGxNetlist). max_iter=1 reduces to pure restart-based multirate (no in-window iter).
+  // =========================================================================================
+  if (cfg.iterate) {
+    const double w_src = 2.0 * M_PI * freq;
+    printf("ITERATE mode: max_iter=%d tol=%.1e theta=%.3g  (driver-managed checkpoint/restart, NOOP+.IC)\n",
+           cfg.max_iter, cfg.tol, cfg.theta);
+
+    double Vp_start = 0.0, I_field_start = 0.0;          // carried across windows
+    double iBranch_start = 0.0;                          // circuit branch current at the boundary (.IC seed)
+    double curR = 1e-3, curL = 1e-6, curC = 0.0, curI0 = 0.0, curLam0 = 0.0; // black-box flux model
+    if (blackbox) {
+      std::vector<double> pts(n_sub+1), pvp(n_sub+1);
+      for (int j=0;j<=n_sub;++j){ pts[j]=dt_window*(double)j/n_sub; pvp[j]=amp*w_src*pts[j]; }
+      std::vector<double> plam;
+      const std::vector<double> pI = femEvaluate(pts,pvp,R_FEM,L_FEM,0.0,saturating,Isat,&plam);
+      double Rd,Ls0,cv; probeJacobian(pts,pvp,pI,plam,Rd,Ls0,cv);
+      curR=Rd; curL=Ls0; curC=cv;
+      printf("pre-probe: R_diff=%.3e L_diff(0)=%.3e curv=%.3e\n",curR,curL,curC);
+    }
+
+    std::vector<double> voffT, voffV;   // warm-start correction for the upcoming window (predictor)
+    printf("\n  window    t_end      iters   max|i-I_FEM|     i_end      I_FEM_end\n");
+    long totBack = 0; int win = 0;
+    for (double t0 = 0.0; t0 < t_final - 1e-12; t0 += dt_window, ++win) {
+      const double t1 = std::min(t0 + dt_window, t_final);
+      const bool resume = (win > 0);                    // window 0 fresh; else reconstruct from t0 state
+
+      DevCfg dev;
+      dev.Rrom = Rrom; dev.Lrom = Lrom; dev.sat = saturating; dev.Isat = Isat;
+      dev.voffT = voffT; dev.voffV = voffV;             // predictor warm start (abs time)
+
+      WinCap cap; std::vector<double> Ifem, lam, r;
+      double maxerr = 0.0, Rsur = Rrom, Lsur = Lrom;
+      int k = 0;
+      for (k = 0; k < cfg.max_iter; ++k) {
+        if (blackbox) { dev.probed=true; dev.pR=curR; dev.pL=curL; dev.pCurv=curC; dev.pI0=curI0; dev.pLam0=curLam0; }
+        cap = runWindow(netlist, cfg, t0, t1, dt_window/n_sub, n_sub, resume,
+                        Vp_start, I_field_start, dev, iBranch_start);
+        if (!cap.ok) { fprintf(stderr, "runWindow failed (window %d iter %d)\n", win, k); return 1; }
+        totBack += cap.backJumps;
+
+        // Resample onto a FIXED uniform window grid. Xyce's adaptive stepper lands on slightly
+        // different t_done points each iteration (different voff -> different LTE), which jitters
+        // the FD residual ~1% and prevents the WR fixpoint from settling. A fixed grid makes the
+        // residual operator identical every iteration -> voff converges cleanly.
+        { std::vector<double> tg(n_sub+1), vpg(n_sub+1), icg(n_sub+1);
+          for (int j=0;j<=n_sub;++j){ const double tt=t0+(t1-t0)*(double)j/n_sub;
+            tg[j]=tt; vpg[j]=interp1(tt,cap.ts,cap.vp); icg[j]=interp1(tt,cap.ts,cap.ic); }
+          cap.ts=tg; cap.vp=vpg; cap.ic=icg; }
+
+        Ifem = femEvaluate(cap.ts, cap.vp, R_FEM, L_FEM, I_field_start, saturating, Isat, &lam);
+        maxerr = 0.0;
+        for (size_t j=0;j<cap.ts.size();++j) maxerr = std::max(maxerr, std::fabs(cap.ic[j]-Ifem[j]));
+
+        Rsur = Rrom; Lsur = Lrom;
+        if (blackbox) { double Rd,Ls0,cv; probeJacobian(cap.ts,cap.vp,Ifem,lam,Rd,Ls0,cv);
+                        Rsur=Rd; Lsur=Ls0 + cv*cap.ic.back(); }
+
+        const size_t Nc = cap.ts.size();
+        r.assign(Nc, 0.0);
+        for (size_t j=0;j<Nc;++j) {
+          const double dIdt = (j==0)?(Ifem[1]-Ifem[0])/(cap.ts[1]-cap.ts[0])
+                                    :(Ifem[j]-Ifem[j-1])/(cap.ts[j]-cap.ts[j-1]);
+          r[j] = cap.vp[j] - (Rsur*Ifem[j] + Lsur*dIdt);
+        }
+
+        // WR update voff += theta*(r - voff), and its change ||dvoff|| = the WR convergence measure.
+        // (We converge on the voff FIXPOINT, not on the transmission maxerr: maxerr floors at the
+        //  discretization level -- coarse captured grid + per-window order-1 NOOP restart -- which
+        //  no number of WR iterations can lower. ||dvoff||->0 is the true "WR has converged" test.)
+        std::vector<double> voffNew(Nc);
+        double dvoff = 0.0, vscale = 1e-30;
+        for (size_t j=0;j<Nc;++j) {
+          const double vcur = interp1(cap.ts[j], dev.voffT, dev.voffV);
+          voffNew[j] = vcur + cfg.theta*(r[j]-vcur);
+          dvoff = std::max(dvoff, std::fabs(voffNew[j]-vcur));
+          vscale = std::max(vscale, std::fabs(voffNew[j]));
+        }
+        dev.voffT = cap.ts; dev.voffV = voffNew;
+
+        if (getenv("GENEXT_DEBUG") && win == (getenv("GENEXT_DBGWIN")?atoi(getenv("GENEXT_DBGWIN")):2))
+          fprintf(stderr, "   [w%d it%d] transm.maxerr=%.4e  ||dvoff||=%.3e (rel %.2e)  voff[end]=%.4e\n",
+                  win, k, maxerr, dvoff, dvoff/vscale, voffNew.back());
+        ++k;
+        if (dvoff < cfg.tol * vscale) break;            // WR fixpoint reached (voff stopped moving)
+      }
+
+      printf("  %6.4f  %9.3e   %5d   %12.4e   %9.3f  %9.3f\n",
+             t1, cap.ts.back(), k, maxerr, cap.ic.back(), Ifem.back());
+
+      // Predictor warm start for the NEXT window from the converged residual (end value + slope).
+      const size_t Nc = r.size();
+      const double r_end = r.back();
+      double r_slope = 0.0; { const double h = cap.ts[Nc-1]-cap.ts[Nc-2]; if (h>0) r_slope=(r[Nc-1]-r[Nc-2])/h; }
+      const double t2 = std::min(t1 + dt_window, t_final);
+      voffT.assign(n_sub+1, 0.0); voffV.assign(n_sub+1, 0.0);
+      for (int j=0;j<=n_sub;++j){ const double tt=t1+(t2-t1)*(double)j/n_sub; voffT[j]=tt; voffV[j]=r_end+r_slope*(tt-t1); }
+
+      if (blackbox) { const double iB=cap.ic.back(), dB=iB-curI0;
+                      const double Qb=curLam0 + curL*dB + 0.5*curC*dB*dB;
+                      double Rd,Ls0,cv; probeJacobian(cap.ts,cap.vp,Ifem,lam,Rd,Ls0,cv);
+                      curR=Rd; curL=Ls0+cv*iB; curC=cv; curI0=iB; curLam0=Qb; }
+
+      Vp_start = cap.vp.back(); I_field_start = Ifem.back();
+      iBranch_start = cap.ic.back();   // circuit branch current -> .IC seed for next window's restart
+    }
+    printf("\nGenExt ITERATE finished. (backward-jump retries handled: %ld)\n", totBack);
+    return 0;
+  }
+
+  // ----------------------------- deferred single-pass mode (default) -----------------------
+  // Generate the netlist from config (source, Rs, Ls, the YGENEXT field, .tran).
+  writeGxNetlist(netlist, cfg, t_final, dt_window / n_sub);
 
   Xyce::Circuit::GenCouplingSimulator xyce;
   char prog[] = "xyce";

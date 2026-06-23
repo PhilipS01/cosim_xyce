@@ -17,3 +17,10 @@ WRmaxSteps = 20
 WR_tolerance = 0.001
 wr_convergence_method = 1
 wr_genext_blackbox = 0
+# GenExt iterative WR via per-window checkpoint/restart (driver-managed NOOP+.IC rewind).
+# iterate=0 -> deferred single pass (most accurate: one continuous BDF run).
+# iterate=1 -> per-window WR iteration (demonstrates convergence + enables rewind/resumability).
+wr_genext_iterate = 0
+wr_genext_max_iter = 20
+wr_genext_tol = 1e-4
+wr_genext_theta = 1.0

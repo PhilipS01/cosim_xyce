@@ -28,3 +28,8 @@ Field_flux.txt
 genext_driver
 wr_genext.cir.prn
 wr_genext.cir
+
+# GenExt native-checkpoint test artifacts
+gxck*
+_cktest/
+_ind/
