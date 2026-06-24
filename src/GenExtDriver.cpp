@@ -20,6 +20,7 @@
 #include <N_DEV_VectorComputeInterface.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -243,10 +244,13 @@ struct GxCfg {
   int    nonlin_model = 0;                       // 1 -> magnetic saturation
   int    N_periods = 1, N_field_steps = 50;      // -> t_final, dt_window
   int    blackbox = 0;                           // 1 -> probe the Jacobian (no known field params)
-  // L1 iterative WR via Xyce-native checkpoint/restart (A). iterate=0 -> deferred (single pass,
-  // one long sim). iterate=1 -> each window is a separate restarted sim; voff is iterated to the
-  // transmission fixpoint by RE-RUNNING the window from its t0 checkpoint. max_iter=1 reduces to
-  // pure restart-based multirate (state carried by checkpoint, no in-window iteration).
+  // Coupling mode. 0 = deferred single pass (one continuous BDF sim; correction time-lagged one
+  //   window). 1 = per-window WR (each window a separate restarted sim; voff iterated to the
+  //   fixpoint by re-running the window -- demonstrates convergence + rewind; floors above 0 due
+  //   to per-window order-1 NOOP restart). 2 = GLOBAL waveform iteration (pure WR: one continuous
+  //   BDF sim over the WHOLE horizon per sweep, black-box FEM once per sweep, voff(t) relaxed to
+  //   the fixpoint over the whole axis -- keeps BDF history -> beats mode 1's floor; restart trivial
+  //   since each sweep starts at t=0).
   int    iterate = 0;
   int    max_iter = 20;                          // cap on per-window WR iterations
   double tol = 1.0e-4;                           // WR converged when ||dvoff|| < tol*||voff|| (fixpoint)
@@ -416,6 +420,105 @@ int main(int argc, char ** argv)
   printf("Config: f=%.1f amp=%.3g Rs=%.3g Ls=%.3g R_FEM=%.3g L_FEM=%.3g sat=%d Isat=%.1f blackbox=%d\n",
          cfg.frequency, cfg.amplitude, cfg.R_series, cfg.L_series, R_FEM, L_FEM, (int)saturating, Isat, (int)blackbox);
 
+  using Clock = std::chrono::steady_clock;
+  auto secs = [](Clock::time_point a, Clock::time_point b){
+    return std::chrono::duration<double>(b - a).count(); };
+
+  // =========================================================================================
+  // (B) GLOBAL WAVEFORM ITERATION -- pure WR over the WHOLE horizon (the thesis-aligned mode).
+  // Each sweep: ONE continuous Xyce run [0,t_final] (full adaptive BDF -> keeps history, no per-
+  // window order-1 restart) with the current correction voff(t); black-box FEM ONCE over the whole
+  // V_p(t) (multirate preserved); relax voff(t) += theta*(r - voff) over the whole axis; re-run from
+  // t=0. Iteration-lagged (sweep), not time-lagged. Restart trivial (every sweep starts at t=0 ->
+  // the YGENEXT internal-var restart problem never arises). The implicit ROM (Rrom,Lrom in the
+  // device Jacobian) is the Robin preconditioner that gives WR its contraction (no strong-Ls wall).
+  // =========================================================================================
+  if (cfg.iterate == 2) {
+    const auto t0wall = Clock::now();
+    const double w_src = 2.0 * M_PI * freq;
+    const int    Ntot  = std::max(2, cfg.N_periods * cfg.N_field_steps * n_sub); // capture pts / horizon
+    const double dtp   = t_final / (double)Ntot;
+    printf("GLOBAL-WR mode: max_sweeps=%d tol=%.1e theta=%.3g  (continuous BDF, %d capture pts)\n",
+           cfg.max_iter, cfg.tol, cfg.theta, Ntot);
+
+    // Black-box: one whole-horizon linearization, refreshed each sweep (cold start from a pre-probe).
+    double curR = 1e-3, curL = 1e-6, curC = 0.0;
+    if (blackbox) {
+      std::vector<double> pts(n_sub+1), pvp(n_sub+1);
+      for (int j=0;j<=n_sub;++j){ pts[j]=dt_window*(double)j/n_sub; pvp[j]=amp*w_src*pts[j]; }
+      std::vector<double> plam;
+      const std::vector<double> pI = femEvaluate(pts,pvp,R_FEM,L_FEM,0.0,saturating,Isat,&plam);
+      double Rd,Ls0,cv; probeJacobian(pts,pvp,pI,plam,Rd,Ls0,cv);
+      curR=Rd; curL=Ls0; curC=cv;
+      printf("pre-probe: R_diff=%.3e L_diff(0)=%.3e curv=%.3e\n",curR,curL,curC);
+    }
+
+    std::vector<double> voffT, voffV;           // whole-horizon correction (empty -> 0)
+    std::vector<double> Ifem, lam, r;
+    double maxerr = 0.0, lastSS = 0.0; long femEvals = 0; int s = 0;
+    double tXyce = 0.0, tFem = 0.0;
+    printf("\n  sweep   max|i-I_FEM|   steady-state    ||dvoff||(rel)\n");
+    for (s = 0; s < cfg.max_iter; ++s) {
+      DevCfg dev;
+      dev.Rrom = Rrom; dev.Lrom = Lrom; dev.sat = saturating; dev.Isat = Isat;
+      dev.voffT = voffT; dev.voffV = voffV;
+      if (blackbox) { dev.probed=true; dev.pR=curR; dev.pL=curL; dev.pCurv=curC; dev.pI0=0.0; dev.pLam0=0.0; }
+
+      const auto ta = Clock::now();
+      WinCap cap = runWindow(netlist, cfg, 0.0, t_final, dtp, Ntot, /*resume=*/false,
+                             /*Vp_start=*/0.0, /*I_seed=*/0.0, dev, /*iBranchSeed=*/0.0);
+      tXyce += secs(ta, Clock::now());
+      if (!cap.ok) { fprintf(stderr, "GLOBAL-WR: Xyce run failed (sweep %d)\n", s); return 1; }
+
+      const auto tb = Clock::now();
+      Ifem = femEvaluate(cap.ts, cap.vp, R_FEM, L_FEM, 0.0, saturating, Isat, &lam); ++femEvals;
+      tFem += secs(tb, Clock::now());
+
+      // Two error metrics: global max (dominated by the t=0 cold start, same point in every mode)
+      // and steady-state (worst point over the LAST source period -- the fair comparison number).
+      maxerr = 0.0; double ssErr = 0.0; const double tSS = 0.75 * t_final; // last quarter = "steady"
+      for (size_t j=0;j<cap.ts.size();++j) {
+        const double e = std::fabs(cap.ic[j]-Ifem[j]);
+        maxerr = std::max(maxerr, e);
+        if (cap.ts[j] >= tSS) ssErr = std::max(ssErr, e);
+      }
+      lastSS = ssErr;
+
+      double Rsur = Rrom, Lsur = Lrom;
+      if (blackbox) { double Rd,Ls0,cv; probeJacobian(cap.ts,cap.vp,Ifem,lam,Rd,Ls0,cv);
+                      Rsur=Rd; Lsur=Ls0; curR=Rd; curL=Ls0; curC=cv; }
+
+      const size_t Nc = cap.ts.size();
+      r.assign(Nc, 0.0);
+      for (size_t j=0;j<Nc;++j) {
+        // Order-2 (central) derivative of I_FEM, to MATCH Xyce's BDF2 in the device. Order-1
+        // backward FD here leaves a (Lrom/Rrom)*(FD-BDF) transmission floor; central cancels it.
+        double dIdt;
+        if (j==0)            dIdt = (Ifem[1]-Ifem[0])/(cap.ts[1]-cap.ts[0]);
+        else if (j==Nc-1)    dIdt = (Ifem[j]-Ifem[j-1])/(cap.ts[j]-cap.ts[j-1]);
+        else                 dIdt = (Ifem[j+1]-Ifem[j-1])/(cap.ts[j+1]-cap.ts[j-1]);
+        r[j] = cap.vp[j] - (Rsur*Ifem[j] + Lsur*dIdt);
+      }
+      std::vector<double> voffNew(Nc);
+      double dvoff = 0.0, vscale = 1e-30;
+      for (size_t j=0;j<Nc;++j) {
+        const double vcur = interp1(cap.ts[j], dev.voffT, dev.voffV);
+        voffNew[j] = vcur + cfg.theta*(r[j]-vcur);
+        dvoff = std::max(dvoff, std::fabs(voffNew[j]-vcur));
+        vscale = std::max(vscale, std::fabs(voffNew[j]));
+      }
+      voffT = cap.ts; voffV = voffNew;
+      printf("  %4d    %12.4e    %12.4e    %10.3e\n", s, maxerr, ssErr, dvoff/vscale);
+      if (dvoff < cfg.tol * vscale) break;
+    }
+    const double tWall = secs(t0wall, Clock::now());
+    printf("\nGLOBAL-WR finished: %ld sweeps, max|i-I_FEM|=%.4e (global), %.4e (steady-state)\n",
+           femEvals, maxerr, lastSS);
+    printf("TIMING: wall=%.3f s  (Xyce=%.3f s, FEM=%.3f s, rest=%.3f s)\n",
+           tWall, tXyce, tFem, tWall - tXyce - tFem);
+    return 0;
+  }
+
   // =========================================================================================
   // (A) L1 ITERATIVE WR via per-window CHECKPOINT/RESTART (rewind).
   // Each window [t0,t1] is a self-contained Xyce run (runWindow). Within a window the correction
@@ -433,7 +536,8 @@ int main(int argc, char ** argv)
   // restart by reconstructing it in a fresh run via NOOP + Ls IC + .IC on the field internal node
   // (see writeGxNetlist). max_iter=1 reduces to pure restart-based multirate (no in-window iter).
   // =========================================================================================
-  if (cfg.iterate) {
+  if (cfg.iterate == 1) {
+    const auto t0wall = Clock::now();
     const double w_src = 2.0 * M_PI * freq;
     printf("ITERATE mode: max_iter=%d tol=%.1e theta=%.3g  (driver-managed checkpoint/restart, NOOP+.IC)\n",
            cfg.max_iter, cfg.tol, cfg.theta);
@@ -514,12 +618,12 @@ int main(int argc, char ** argv)
         if (getenv("GENEXT_DEBUG") && win == (getenv("GENEXT_DBGWIN")?atoi(getenv("GENEXT_DBGWIN")):2))
           fprintf(stderr, "   [w%d it%d] transm.maxerr=%.4e  ||dvoff||=%.3e (rel %.2e)  voff[end]=%.4e\n",
                   win, k, maxerr, dvoff, dvoff/vscale, voffNew.back());
-        ++k;
         if (dvoff < cfg.tol * vscale) break;            // WR fixpoint reached (voff stopped moving)
       }
 
+      const int niter = (k < cfg.max_iter) ? k+1 : cfg.max_iter;  // iterations actually run
       printf("  %6.4f  %9.3e   %5d   %12.4e   %9.3f  %9.3f\n",
-             t1, cap.ts.back(), k, maxerr, cap.ic.back(), Ifem.back());
+             t1, cap.ts.back(), niter, maxerr, cap.ic.back(), Ifem.back());
 
       // Predictor warm start for the NEXT window from the converged residual (end value + slope).
       const size_t Nc = r.size();
@@ -538,11 +642,13 @@ int main(int argc, char ** argv)
       iBranch_start = cap.ic.back();   // circuit branch current -> .IC seed for next window's restart
     }
     printf("\nGenExt ITERATE finished. (backward-jump retries handled: %ld)\n", totBack);
+    printf("TIMING: wall=%.3f s\n", secs(t0wall, Clock::now()));
     return 0;
   }
 
   // ----------------------------- deferred single-pass mode (default) -----------------------
   // Generate the netlist from config (source, Rs, Ls, the YGENEXT field, .tran).
+  const auto t0wall = Clock::now();
   writeGxNetlist(netlist, cfg, t_final, dt_window / n_sub);
 
   Xyce::Circuit::GenCouplingSimulator xyce;
@@ -645,6 +751,10 @@ int main(int argc, char ** argv)
     // the FEM trajectory:  r(t) = V_p - [Rsur*I_FEM + Lsur*dI_FEM/dt]  (dI_FEM/dt by FD).
     // Known-param (Lsur=L_FEM): reduces to (R_FEM-Rrom)*I_FEM. Black-box: residual of the probe.
     // Extrapolate r across the NEXT window from this window's exit (end value + end slope).
+    // Backward FD here (NOT central): deferred is one window time-lagged and not at the WR
+    // fixpoint, so its accuracy relies on the backward-FD/lag alignment -- central diff (BDF2-
+    // consistent) actually worsens it. Central diff belongs in the GLOBAL mode, which reaches
+    // the true fixpoint where matching Xyce's BDF2 cancels the (Lrom/Rrom)*(FD-BDF) floor.
     const size_t Nc = ts.size();
     std::vector<double> r(Nc);
     for (size_t j = 0; j < Nc; ++j) {
@@ -676,5 +786,6 @@ int main(int argc, char ** argv)
   xyce.finalize();
   printf("\nGenExt driver finished. (device backward-jump retries handled: %ld)\n",
          vci.backwardJumps());
+  printf("TIMING: wall=%.3f s\n", secs(t0wall, Clock::now()));
   return 0;
 }

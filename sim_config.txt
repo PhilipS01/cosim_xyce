@@ -17,9 +17,12 @@ WRmaxSteps = 20
 WR_tolerance = 0.001
 wr_convergence_method = 1
 wr_genext_blackbox = 0
-# GenExt iterative WR via per-window checkpoint/restart (driver-managed NOOP+.IC rewind).
-# iterate=0 -> deferred single pass (most accurate: one continuous BDF run).
-# iterate=1 -> per-window WR iteration (demonstrates convergence + enables rewind/resumability).
+# GenExt coupling mode:
+#   0 -> deferred single pass (one continuous BDF run; correction time-lagged one window).
+#   1 -> per-window WR via driver-managed checkpoint/restart (NOOP+.IC rewind); demonstrates
+#        convergence + resumability, but floors above 0 (per-window order-1 restart).
+#   2 -> GLOBAL waveform iteration: pure WR over the whole horizon, black-box FEM once per sweep.
+#        Best accuracy + fewest FEM solves; the thesis-aligned mode.
 wr_genext_iterate = 0
 wr_genext_max_iter = 20
 wr_genext_tol = 1e-4
