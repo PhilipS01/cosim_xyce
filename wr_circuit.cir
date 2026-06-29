@@ -1,19 +1,16 @@
 Toy Problem aus RL glied mit Xyce loesen
 .INCLUDE sim_params.inc
 
-* === REAL-Ls RETRY (branch feat/wr-secant-real-ls) ===
-* Series coupling impedance Rs/Ls are now REAL Xyce devices (BDF inductor Ls_d carries its
-* restart state NATIVELY across windows — a plain L round-trips through .OPTIONS RESTART),
-* instead of being folded into the behavioral matched-secant source Bsrc.
-* The field ROM Biface stays the window-anchored matched secant. The notes flagged this
-* combo (continuous BDF Ls vs resetting secant ROM) as incompatible — but the real killer
-* was the IF(...<=eps_t, I0, ...) hard-switch in Biface: it forced an IDEAL current source
-* (admittance 0) at the window-start point, degenerate in series with the real BDF Ls_d ->
-* "Time step too small" on LS_D_branch once dI/dt grows (window ~28). The FIX is the SMOOTH
-* secant below (no IF): admittance stays tiny-but-finite -> stable. The MAX(...,t_floor) is
-* only a 1/0 guard at the exact restart eval point; a floor sweep (0..20*h) is neutral.
+* === REAL-Ls RETRY, THEVENIN variant (branch feat/wr-secant-real-ls-thevenin) ===
+* Series coupling impedance Rs/Ls are REAL Xyce devices (BDF inductor Ls_d carries its restart
+* state NATIVELY across windows — a plain L round-trips through .OPTIONS RESTART).
+* The field ROM is the window-anchored matched secant, here in THEVENIN form: a behavioral
+* VOLTAGE source Bfield (the dual of the Norton current source Biface on feat/wr-secant-real-ls).
+* Motivation: a voltage source in series with a real inductor is the WELL-POSED pairing (no
+* degenerate current-source-in-series-with-L). Dual caveat: Z_rom -> inf at the window start
+* (t_acc->0, open circuit) -> the MAX(.,t_floor) floor is LOAD-BEARING here (neutral for Norton).
 *
-* Topology (single series loop):  s --Rs_d--> m --Ls_d--> p --Vmeas--> nx --Biface--> 0
+* Topology (single series loop):  s --Rs_d--> m --Ls_d--> p --Vmeas--> nx --Bfield--> 0
 * Bemf = pure EMF (no series drop folded in). V(p) now develops across the real Rs_d/Ls_d.
 
 Bemf s 0 V = { amp_src*sin(2*pi*f_src*time) }
@@ -28,10 +25,13 @@ VIprev iprev    0 PWL FILE "i_prev_k.pwl"
 * Nullvoltquelle zur Strommessung des aktuellen Interface-Stroms
 Vmeas p nx 0
 
-* Akkumulierte Interface-Bedingung (Strom-Quelle, voltage-driven FEM) — unveraendert.
-* I(Vmeas) = I_field_prev + (V(p) - V(vfprev)) / (Rrom + Lrom/t_acc)
-Biface nx 0 I = {
-+ V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/MAX(time - t_abs_start, t_floor))
+* Interface-Bedingung — THEVENIN (Spannungsquelle, dual zur Norton-Stromquelle Biface).
+* Nach V(p) aufgeloest:  V(p) = V(vfprev) + Z_rom*(I(Vmeas) - I_field_prev),  Z_rom = Rrom+Lrom/t_acc.
+* Strukturell wohlgestellt mit echtem Reihen-Ls_d (Spannungsquelle in Reihe mit Induktor, KEIN
+* entartetes Stromquellen-in-Reihe-mit-L). Aber duale Singularitaet: Z_rom -> inf bei t_acc->0
+* (Leerlauf) -> der MAX(.,t_floor)-Boden ist hier LASTTRAGEND (anders als Norton, wo neutral).
+Bfield nx 0 V = {
++ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))
 + }
 
 * .OPTIONS RESTART und .tran werden pro Zeitfenster vom C++-Master generiert
