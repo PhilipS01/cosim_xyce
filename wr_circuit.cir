@@ -5,9 +5,13 @@ Toy Problem aus RL glied mit Xyce loesen
 * Series coupling impedance Rs/Ls are now REAL Xyce devices (BDF inductor Ls_d carries its
 * restart state NATIVELY across windows — a plain L round-trips through .OPTIONS RESTART),
 * instead of being folded into the behavioral matched-secant source Bsrc.
-* The field ROM Biface stays the window-anchored matched secant. This is exactly the
-* combo the notes flagged as incompatible (continuous BDF Ls vs resetting secant ROM);
-* retrying with the carried dIdt0 seed (i_prev_k.pwl ramp slope) to bridge the boundary.
+* The field ROM Biface stays the window-anchored matched secant. The notes flagged this
+* combo (continuous BDF Ls vs resetting secant ROM) as incompatible — but the real killer
+* was the IF(...<=eps_t, I0, ...) hard-switch in Biface: it forced an IDEAL current source
+* (admittance 0) at the window-start point, degenerate in series with the real BDF Ls_d ->
+* "Time step too small" on LS_D_branch once dI/dt grows (window ~28). The FIX is the SMOOTH
+* secant below (no IF): admittance stays tiny-but-finite -> stable. The MAX(...,t_floor) is
+* only a 1/0 guard at the exact restart eval point; a floor sweep (0..20*h) is neutral.
 *
 * Topology (single series loop):  s --Rs_d--> m --Ls_d--> p --Vmeas--> nx --Biface--> 0
 * Bemf = pure EMF (no series drop folded in). V(p) now develops across the real Rs_d/Ls_d.

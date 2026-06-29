@@ -745,10 +745,14 @@ void WriteSimParams(
     // Zum vermeiden von Singularitäten in den Ableitungen
     const double eps_t = 1.0e-15;
 
-    // Bridge fuer den REAL-Ls-Versuch: Boden auf die akkumulierte Sekantenzeit t_acc, damit
-    // die ROM-Admittanz 1/(Rrom+Lrom/t_acc) am Fensterstart NICHT auf 0 zurueckspringt
-    // (=ideale Stromquelle in Reihe mit dem realen BDF-Ls_d → steif). Boden = erster
-    // Kopplungsschritt h_coupling → endliche Admittanz 1/(Rrom+Lrom/h_coupling) am Rand.
+    // Boden auf die akkumulierte Sekantenzeit t_acc = h_coupling. NUR eine 1/0-Absicherung
+    // am exakten Fensterstart-Eval-Punkt (time == t_abs_start): Lrom/MAX(t_acc, t_floor)
+    // statt Lrom/t_acc. Der eigentliche Stabilitaets-Fix fuer das echte Ls_d ist NICHT
+    // dieser Boden, sondern dass Biface eine GLATTE Sekante nutzt (kein IF(...)-Hartschalter
+    // mehr auf den konstanten I0): der IF-Zweig erzwang am Fensterstart eine ideale
+    // Stromquelle (Admittanz 0) in Reihe mit dem realen BDF-Ls_d → entartet/steif → Crash.
+    // Die glatte Sekante haelt die Admittanz endlich (winzig, aber >0). Boden-Sweep
+    // (Faktor 0..20) bestaetigt: der Boden-Wert ist accuracy/stability-neutral.
     const double t_floor = h_coupling;
 
     // Zeit ist absolut/kontinuierlich (Checkpoint/Restart): tran-Stoppzeit ist der
