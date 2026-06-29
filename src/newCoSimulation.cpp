@@ -745,6 +745,12 @@ void WriteSimParams(
     // Zum vermeiden von Singularitäten in den Ableitungen
     const double eps_t = 1.0e-15;
 
+    // Bridge fuer den REAL-Ls-Versuch: Boden auf die akkumulierte Sekantenzeit t_acc, damit
+    // die ROM-Admittanz 1/(Rrom+Lrom/t_acc) am Fensterstart NICHT auf 0 zurueckspringt
+    // (=ideale Stromquelle in Reihe mit dem realen BDF-Ls_d → steif). Boden = erster
+    // Kopplungsschritt h_coupling → endliche Admittanz 1/(Rrom+Lrom/h_coupling) am Rand.
+    const double t_floor = h_coupling;
+
     // Zeit ist absolut/kontinuierlich (Checkpoint/Restart): tran-Stoppzeit ist der
     // ABSOLUTE Fensterende-Zeitpunkt, nicht die Fensterlaenge.
     const double t_stop_abs = t_abs_start + t_window;
@@ -764,6 +770,7 @@ void WriteSimParams(
     out << ".PARAM dIdt0        = " << dIdt0        << "\n";
     out << ".PARAM Rs           = " << r_series     << "\n";
     out << ".PARAM Ls           = " << l_series     << "\n";
+    out << ".PARAM t_floor      = " << t_floor      << "\n";
 }
 
 // Schreibt restart.inc: die fenster-spezifische .OPTIONS RESTART und .tran Zeile.

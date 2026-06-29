@@ -1,24 +1,21 @@
 Toy Problem aus RL glied mit Xyce loesen
 .INCLUDE sim_params.inc
 
-* Zeit ist jetzt ABSOLUT und kontinuierlich (Checkpoint/Restart über Zeitfenster), nicht
-* mehr 0..dt_field pro Fenster. Daher:
-*   - Quellenphase nutzt `time` direkt (kein +t_abs_start mehr).
-*   - Fenster-LOKALE (akkumulierte) Zeit für die Sekanten-Terme = (time - t_abs_start).
+* === REAL-Ls RETRY (branch feat/wr-secant-real-ls) ===
+* Series coupling impedance Rs/Ls are now REAL Xyce devices (BDF inductor Ls_d carries its
+* restart state NATIVELY across windows — a plain L round-trips through .OPTIONS RESTART),
+* instead of being folded into the behavioral matched-secant source Bsrc.
+* The field ROM Biface stays the window-anchored matched secant. This is exactly the
+* combo the notes flagged as incompatible (continuous BDF Ls vs resetting secant ROM);
+* retrying with the carried dIdt0 seed (i_prev_k.pwl ramp slope) to bridge the boundary.
+*
+* Topology (single series loop):  s --Rs_d--> m --Ls_d--> p --Vmeas--> nx --Biface--> 0
+* Bemf = pure EMF (no series drop folded in). V(p) now develops across the real Rs_d/Ls_d.
 
-* Port node p gegen ground. Behavioral source = EMF minus serieller Kopplungsdrop Rs/Ls.
-* Amplitude/Frequenz aus sim_params.inc (amp_src, f_src) → single source of truth in C++.
-* V(p) = Vsrc - Rs*I(Vmeas) - Ls*dI/dt   (Two-way coupling: V(p) reagiert auf Interface-Strom.)
-* Rs = Ls = 0 → V(p) = Vsrc (one-way, alter trivialer Fall).
-* Ls-Term nutzt dieselbe akkumulierte Sekante wie Biface/FEM (konsistente Diskretisierung).
-* HINWEIS: Versuch, Ls als echtes L-Device zu modellieren scheiterte — eine BDF-Induktivitaet in
-* Reihe mit dem near-ideal-current-source Feld-ROM (Biface) ist steif und inkonsistent mit der
-* per-Fenster-Sekante; der Zeitschritt kollabiert. Die behaviorale Matched-Sekante bleibt korrekt.
-Bsrc p 0 V = {
-+ amp_src*sin(2*pi*f_src*time)
-+ - Rs*I(Vmeas)
-+ - IF((time - t_abs_start) <= eps_t, Ls*dIdt0, Ls*(I(Vmeas)-I0)/(time - t_abs_start))
-+ }
+Bemf s 0 V = { amp_src*sin(2*pi*f_src*time) }
+
+Rs_d  s m  {Rs}
+Ls_d  m p  {Ls} IC=0
 
 * Alte Feld-/Interface-Waveforms aus WR-Iteration k
 VFprev vfprev   0 PWL FILE "vf_prev_k.pwl"
@@ -27,14 +24,10 @@ VIprev iprev    0 PWL FILE "i_prev_k.pwl"
 * Nullvoltquelle zur Strommessung des aktuellen Interface-Stroms
 Vmeas p nx 0
 
-* Akkumulierte Interface-Bedingung (Strom-Quelle, voltage-driven FEM)
-* I(Vmeas) = I_field_prev + (V(p) - V(vfprev)) / (Rrom + Lrom/time)
-* Hergeleitet aus INTERFACE_condition in CoSimulation_WR.cpp mit akkumulierter Sekante.
+* Akkumulierte Interface-Bedingung (Strom-Quelle, voltage-driven FEM) — unveraendert.
+* I(Vmeas) = I_field_prev + (V(p) - V(vfprev)) / (Rrom + Lrom/t_acc)
 Biface nx 0 I = {
-+ IF((time - t_abs_start) <= eps_t,
-+   I0,
-+   V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/(time - t_abs_start))
-+ )
++ V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/MAX(time - t_abs_start, t_floor))
 + }
 
 * .OPTIONS RESTART und .tran werden pro Zeitfenster vom C++-Master generiert
