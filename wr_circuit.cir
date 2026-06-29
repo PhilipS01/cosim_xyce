@@ -25,13 +25,18 @@ VIprev iprev    0 PWL FILE "i_prev_k.pwl"
 * Nullvoltquelle zur Strommessung des aktuellen Interface-Stroms
 Vmeas p nx 0
 
-* Interface-Bedingung — THEVENIN (Spannungsquelle, dual zur Norton-Stromquelle Biface).
-* Nach V(p) aufgeloest:  V(p) = V(vfprev) + Z_rom*(I(Vmeas) - I_field_prev),  Z_rom = Rrom+Lrom/t_acc.
-* Strukturell wohlgestellt mit echtem Reihen-Ls_d (Spannungsquelle in Reihe mit Induktor, KEIN
-* entartetes Stromquellen-in-Reihe-mit-L). Aber duale Singularitaet: Z_rom -> inf bei t_acc->0
-* (Leerlauf) -> der MAX(.,t_floor)-Boden ist hier LASTTRAGEND (anders als Norton, wo neutral).
+* Interface-Bedingung — THEVENIN, EXPLIZITE Transmissionsbedingung (Spannungsquelle).
+* Wortwoertlich die Transmission V_C^{k+1} = R*I_C^{k+1} + L*(I_C^{k+1}-I_C^{k+1}(t0))/tau
+*                                  + V_F^k - ( R*I_F^k + L*(I_F^k-I_F^k(t0))/tau ),  tau = t-t0.
+* I_C^{k+1}(t)=I(Vmeas) (absoluter Schaltungsstrom dieser Iteration), I_F^k(t)=V(iprev) (gelaggter
+* Feldstrom), V_F^k=V(vfprev). Fenster-Start-Anker I_C(t0)=I_F(t0)=I0 (Restart/Vorfenster-Ende).
+* WICHTIG: R*I(Vmeas) ist der ABSOLUTE resistive Drop (kein Strom-Differenz-Term); die Sekanten
+* sind an I0 verankert. Algebraisch faellt I0 zur kompakten Form (R+L/tau)(I_C-I_F) zusammen
+* (da beide Anker = I0), aber explizit ist es die dokumentierte Bedingung und robust, falls die
+* Fenster-Start-Stroeme je Seite je auseinanderlaufen.
 Bfield nx 0 V = {
-+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))
++ Rrom*I(Vmeas) + Lrom*(I(Vmeas) - I0)/MAX(time - t_abs_start, t_floor)
++ + V(vfprev) - ( Rrom*V(iprev) + Lrom*(V(iprev) - I0)/MAX(time - t_abs_start, t_floor) )
 + }
 
 * .OPTIONS RESTART und .tran werden pro Zeitfenster vom C++-Master generiert
