@@ -3,16 +3,19 @@
 Thesis figure: WHY restart is needed -- the negative control, through the ACTUAL co-sim.
 
 Same matched-secant co-sim (Bemf/Rs_d/Ls_d + ROM Bfield + FEM + WR), integrated in 50
-windows, but with checkpoint/restart DISABLED (sim_config break_restart=1): each window runs
-cold in window-local time, inductor IC=0, only the source phase carried. Without the state
-handoff the interface current resets each window -> sawtooth that does NOT track the true
-(monolithic) solution. Overlaid with the WORKING restarted co-sim (which reproduces the
-monolithic run), this shows restart is both necessary and correct.
+windows, but with checkpoint/restart DISABLED: each window runs cold in window-local time,
+inductor IC=0, only the source phase carried. Without the state handoff the interface current
+resets each window -> sawtooth that does NOT track the true (monolithic) solution. Overlaid
+with the WORKING restarted co-sim (which reproduces the monolithic run), this shows restart is
+both necessary and correct.
 
-Data (snapshots in ./data/, regenerate as noted):
+Data are committed snapshots in ./data/ (the figure regenerates from them directly):
   ref_monolithic.cir.prn   monolithic reference          Index TIME I(LF) V(P)
-  Circuit_solution.prn      co-sim WITH restart           Index TIME V(P) V(NX) I(VMEAS)   (./main, break_restart=0)
-  broken_cosim.prn          co-sim WITHOUT restart        Index TIME V(P) V(NX) I(VMEAS)   (./main, break_restart=1, WRmaxSteps>=120)
+  Circuit_solution.prn      co-sim WITH restart           Index TIME V(P) V(NX) I(VMEAS)
+  broken_cosim.prn          co-sim WITHOUT restart        Index TIME V(P) V(NX) I(VMEAS)
+NOTE: broken_cosim.prn was produced by a temporary 'break_restart' build (window-local cold
+start, WRmaxSteps>=120) that has since been removed from the co-sim -- it is kept here as a
+data snapshot only. See git history (branch feat/wr-secant-thevenin-restart) to reconstruct.
 """
 import numpy as np, matplotlib.pyplot as plt, os
 

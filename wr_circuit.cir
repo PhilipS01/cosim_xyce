@@ -10,10 +10,9 @@ Toy Problem aus RL glied mit Xyce loesen
 * d(Bfield)/dI(Vmeas)=Rrom to Xyce's Newton (see feat/wr-secant-real-rrom / the notes).
 *
 * Topology (single series loop):  s --Rs_d--> m --Ls_d--> p --Vmeas--> nx --Bfield--> 0
-* Bemf = pure EMF; source phase carried via t_phase (=0 normally; =window start in the
-* break_restart negative control, where `time` runs window-local).
+* Bemf = pure EMF (no series drop folded in). V(p) develops across the real Rs_d/Ls_d.
 
-Bemf s 0 V = { amp_src*sin(2*pi*f_src*(time + t_phase)) }
+Bemf s 0 V = { amp_src*sin(2*pi*f_src*time) }
 
 Rs_d  s m  {Rs}
 Ls_d  m p  {Ls} IC=0

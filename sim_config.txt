@@ -16,4 +16,3 @@ N_xyce_coupling_intervals = 100
 WRmaxSteps = 20
 WR_tolerance = 1e-3
 wr_convergence_method = 1
-break_restart = 0

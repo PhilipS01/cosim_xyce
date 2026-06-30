@@ -57,7 +57,6 @@ bool LoadConfig(const string& filename)
         else if (key == "WRmaxSteps")                       g_cfg.WRmaxSteps = (unsigned)val;
         else if (key == "WR_tolerance")                     g_cfg.WR_tolerance = val;
         else if (key == "wr_convergence_method")            g_cfg.wr_convergence_method = (unsigned)val;
-        else if (key == "break_restart")                    g_cfg.break_restart = (val != 0.0);
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
     }
     return true;
@@ -301,34 +300,18 @@ void MasterProcess()
         const double t_start = (step_field - 1) * dt_field; // brauchen wir vor allem hier (in cpp), Xyce simuliert immer von 0 bis Stopzeitpunkt wenn man es aufruft. In xyce nutzen wir es nur für die Phase der restlichen Schaltung (z.B. Vsrc wenn Schaltung nur Spannungsquelle ist)
         const double t_stop = step_field * dt_field;
 
-        // break_restart (Negativ-Kontrolle): KEIN Checkpoint/Restart. Jedes Fenster läuft KALT in
-        // fenster-LOKALER Zeit [0, dt_field] (Induktor IC=0, kein getragener Zustand); nur die
-        // Quellenphase wird über t_phase weitergereicht (sonst springt die EMK pro Fenster).
-        // Zeigt: ohne Restart wird der Zustand nicht über die Fenster getragen (Sägezahn).
-        double sp_abs = t_start, sp_phase = 0.0, pwl_t0 = t_start, pwl_t1 = t_stop, app_off = 0.0;
-        bool first_win = (step_field == 1);
-        if (g_cfg.break_restart) {
-            I0 = 0.0; V0 = 0.0; dIdt_0 = 0.0;             // kalter Fensterstart, kein Zustands-Carry
-            dVdt_0 = V_src_amplitude * 2.0 * M_PI * Frequency
-                     * cos(2.0 * M_PI * Frequency * t_start);
-            sp_abs = 0.0; sp_phase = t_start;             // lokaler Sekanten-Anker + Quellenphase = Fensterstart
-            pwl_t0 = 0.0; pwl_t1 = dt_field;
-            app_off = t_start;                            // lokales Fenster-Output → absolute Zeit beim Anhängen
-            first_win = true;                             // nie restarten (UIC pro Fenster)
-        }
-
-        WriteSimParams("sim_params.inc", 0.0, dt_field, sp_abs, I0, R_ROM, L_ROM, Frequency, V_src_amplitude, dIdt_0, g_cfg.R_series, g_cfg.L_series, N_xyce_coupling_intervals, sp_phase);
+        WriteSimParams("sim_params.inc", 0.0, dt_field, t_start, I0, R_ROM, L_ROM, Frequency, V_src_amplitude, dIdt_0, g_cfg.R_series, g_cfg.L_series, N_xyce_coupling_intervals);
 
         // Fenster-spezifische Restart/.tran-Direktiven generieren (von wr_circuit.cir inkludiert).
         // Fenster 1: frischer UIC-Transient ab 0; Fenster k>1: Restart aus "restart_state".
-        // break_restart: first_win=true erzwingt überall UIC (kein Restart).
-        WriteRestartDirectives("restart.inc", first_win, dt_field, "ckpt_out", "restart_state");
+        WriteRestartDirectives("restart.inc", step_field == 1, dt_field, "ckpt_out", "restart_state");
 
-        // initialisiere mit zuletzt akzeptierten Werten. Zeitstempel ABSOLUT ([t_start, t_stop]) im
-        // Normalfall (Restart startet bei t_start); LOKAL ([0, dt_field]) im break_restart-Modus.
-        WriteInitialPwl("vf_prev_k.pwl", pwl_t0, pwl_t1, V0, dVdt_0);
+        // initialisiere mit zuletzt akzeptierten Werten. Zeitstempel sind ABSOLUT ([t_start, t_stop]),
+        // da Xyce die PWL-FILE-Quellen an der absoluten Simulationszeit auswertet (Restart startet
+        // bei t_start, nicht bei 0).
+        WriteInitialPwl("vf_prev_k.pwl", t_start, t_stop, V0, dVdt_0);
         // i_prev_k.pwl: lineare Rampe mit Steigung dIdt_0, passend zur akkumulierten Sekante im FEM.
-        WriteInitialPwl("i_prev_k.pwl",   pwl_t0, pwl_t1, I0, dIdt_0);
+        WriteInitialPwl("i_prev_k.pwl",   t_start, t_stop, I0, dIdt_0);
 
         // Veraltete Checkpoint-Kandidaten dieses Prefixes entfernen, damit CommitCheckpoint
         // nach der WR-Schleife garantiert den frisch erzeugten Kandidaten dieses Fensters waehlt.
@@ -349,7 +332,7 @@ void MasterProcess()
             // Circuit Solver aufrufen: Biface liefert I(Vmeas) = INTERFACE_condition(V(p), V(vfprev), V(iprev)).
             // ReadXyceResults schreibt V(p)-Waveform nach vf_prev_k.pwl für FEM-Eingang.
             RunXyce("wr_circuit.cir");
-            ReadXyceResults("wr_circuit.cir.prn", circuit_sol, pwl_t0, pwl_t1, N_xyce_coupling_intervals);
+            ReadXyceResults("wr_circuit.cir.prn", circuit_sol, t_start, t_stop, N_xyce_coupling_intervals);
 
             // FEM Solver aufrufen (dummy, voltage-driven):
             // liest vf_prev_k.pwl (Portspannung V(p) von Xyce)
@@ -420,11 +403,10 @@ void MasterProcess()
             // neueste ist der konvergierte.)
             CommitCheckpoint("ckpt_out", "restart_state");
 
-            // die Xycelösung des Zeitfensters an die vorigen anhängen. Normal: Waveforms bereits
-            // absolut → Offset 0.0. break_restart: lokal → mit app_off=Fensterstart verschieben;
-            // ersten Punkt NICHT überspringen, damit der Sägezahn-Sprung am Rand sichtbar bleibt.
-            const bool skip_first_point = (step_field > 1) && !g_cfg.break_restart;
-            appendCircuitWaveformXyceStyle(file_Circuit, circuit_sol, app_off, global_circuit_index, skip_first_point);
+            // die Xycelösung des Zeitfensters an die vorigen anhängen.
+            // Waveforms tragen jetzt ABSOLUTE Zeit → Offset 0.0 (kein erneutes Verschieben).
+            const bool skip_first_point = (step_field > 1);
+            appendCircuitWaveformXyceStyle(file_Circuit, circuit_sol, 0.0, global_circuit_index, skip_first_point);
 
             // auch die Feld-WAVEFORMS (also nicht nur Endpunkte) speichern wir im Xyce Format ab
             // dafür lesen wir die konvergierten Waveforms ein (letzte Iteration)
@@ -435,15 +417,14 @@ void MasterProcess()
             // damit appendFieldWaveformXyceStyle übereinstimmende Zeitstempel sieht.
             // (vf_conv hat N_xyce_coupling_intervals+1 Knoten, i_conv hat N_field_eval_intervals+1)
             Waveform vf_endpoints = resampleWaveformUniform(
-                vf_conv, pwl_t0, pwl_t1, N_field_eval_intervals
+                vf_conv, t_start, t_stop, N_field_eval_intervals
             );
             Waveform i_endpoints = resampleWaveformUniform(
-                i_conv, pwl_t0, pwl_t1, N_field_eval_intervals
+                i_conv, t_start, t_stop, N_field_eval_intervals
             );
 
-            // und hängen sie an die bisherigen Zeitfenster an (Normal: absolut, Offset 0.0;
-            // break_restart: lokal → mit app_off verschieben)
-            appendFieldWaveformXyceStyle(file_Field_waveform, vf_endpoints, i_endpoints, app_off, global_field_waveform_index, skip_first_point);
+            // und hängen sie an die bisherigen Zeitfenster an (Waveforms bereits absolut → Offset 0.0)
+            appendFieldWaveformXyceStyle(file_Field_waveform, vf_endpoints, i_endpoints, 0.0, global_field_waveform_index, skip_first_point);
 
             // Festhalten der Endwerte für die Anfangswerte des nächsten Zeitfensters
             V0 = vf_conv.y.back(); // Portspannung am Fensterende (= V(p) bei t=dt_field)
@@ -743,9 +724,7 @@ void WriteSimParams(
     double dIdt0,   // Anfangs-dI/dt (für Ls-Sekanten-Guard bei time<=eps_t)
     double r_series, // serielle Kopplungsimpedanz Quelle→Port (two-way coupling)
     double l_series,
-    const unsigned N_coupling_intervals,
-    double t_phase   // Quellen-Phasen-Offset: Quelle = sin(2*pi*f*(time + t_phase)). Normal 0
-                     // (time absolut); im break_restart-Modus = Fensterstart, da time lokal läuft.
+    const unsigned N_coupling_intervals
 )
 {
     if (t_window <= 0.0) {
@@ -793,7 +772,6 @@ void WriteSimParams(
     out << ".PARAM Rs           = " << r_series     << "\n";
     out << ".PARAM Ls           = " << l_series     << "\n";
     out << ".PARAM t_floor      = " << t_floor      << "\n";
-    out << ".PARAM t_phase      = " << t_phase      << "\n";
 }
 
 // Schreibt restart.inc: die fenster-spezifische .OPTIONS RESTART und .tran Zeile.
