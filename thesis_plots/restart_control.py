@@ -41,7 +41,7 @@ plt.rcParams.update({"font.size": 11, "axes.grid": True, "grid.alpha": 0.3, "fig
 fig = plt.figure(figsize=(9, 6.6), constrained_layout=True)
 gs = fig.add_gridspec(2, 1, height_ratios=[3, 2.3])
 
-z0, z1 = 3.0e-3, 6.0e-3   # zoom near the peak: broken sawtooth vs smooth restarted curve
+z0, z1 = 9.2e-3, 11.2e-3   # zoom at the zero-crossing (steepest dI/dt), matching restart_demo
 
 axA = fig.add_subplot(gs[0])
 axA.plot(tr*1e3, ir, color="0.55", lw=3.4, label="monolithic Xyce (truth)")

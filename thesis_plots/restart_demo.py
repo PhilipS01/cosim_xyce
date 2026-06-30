@@ -53,7 +53,8 @@ peak = np.max(np.abs(ir))
 # zoom window: around the current zero-crossing (steepest dI/dt -> hardest continuity test)
 z0, z1 = 9.2e-3, 11.2e-3
 
-sync_rms = 100*np.sqrt(np.mean((np.interp(ts, tr, ir)-isy)**2))/peak
+dense_rms = 100*np.sqrt(np.mean(err**2))/peak     # RMS of the plotted (dense) error
+dense_max = 100*np.max(np.abs(err))/peak           # max of the plotted (dense) error
 
 plt.rcParams.update({"font.size": 11, "axes.grid": True, "grid.alpha": 0.3,
                      "figure.dpi": 120})
@@ -104,8 +105,8 @@ axC.yaxis.set_major_formatter(mtick.FormatStrFormatter("%.1f"))
 axC.annotate("window-1 cold start", xy=(0.14, 1.31), xytext=(2.2, 1.15),
              fontsize=8, va="center",
              arrowprops=dict(arrowstyle="->", color="0.4", lw=0.9))
-axC.set_title(f"(c) co-sim $-$ monolithic   —   RMS at restart points = {sync_rms:.3f} % of peak",
-              fontsize=9.5, loc="left")
+axC.set_title(f"(c) co-sim $-$ monolithic interface current:  RMS {dense_rms:.2f} %,  max {dense_max:.2f} % of peak (at the window-1 cold start)",
+              fontsize=9.3, loc="left")
 
 fig.savefig(os.path.join(HERE, "restart_demo.png"), bbox_inches="tight", dpi=300)
 fig.savefig(os.path.join(HERE, "restart_demo.pdf"), bbox_inches="tight")
