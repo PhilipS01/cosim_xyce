@@ -1,17 +1,17 @@
 Toy Problem aus RL glied mit Xyce loesen
 .INCLUDE sim_params.inc
 
-* === REAL-Ls RETRY, THEVENIN + R-SPLIT (branch feat/wr-secant-real-rrom) ===
+* === REAL-Ls, THEVENIN coupling (lumped behavioral matched secant) ===
 * Series coupling Rs/Ls are REAL Xyce devices (BDF inductor Ls_d carries its restart state
-* natively across windows). Field ROM = window-anchored matched secant in THEVENIN form.
-* R-SPLIT: the ROM resistance Rrom is pulled out as a REAL series resistor Rrom_d (absolute
-* drop Rrom*I_C, implicit in Xyce), leaving Bfield to carry only the inductive secant + the
-* deferred field correction. RESULT: bit-identical WR iteration count to the lumped behavioral
-* Bfield (Ls 1.6e-7: 205 total/max 11; Ls 1e-6: max 18) -- because the behavioral Bfield
-* ALREADY exposes d(Bfield)/dI(Vmeas)=Rrom to Xyce's Newton, so a real Rrom_d adds nothing.
+* natively across windows). Field ROM = window-anchored matched secant in THEVENIN form:
+* a behavioral VOLTAGE source Bfield.
+* NOTE: the real-Rrom-DEVICE split (Rrom_d + reduced Bfield) was tried and reverted -- it gave
+* bit-identical WR iteration counts, because the behavioral Bfield ALREADY exposes
+* d(Bfield)/dI(Vmeas)=Rrom to Xyce's Newton (see feat/wr-secant-real-rrom / the notes).
 *
-* Topology (single series loop): s --Rs_d--> m --Ls_d--> p --Vmeas--> nx --Rrom_d--> g --Bfield--> 0
-* Bemf = pure EMF (no series drop folded in). V(p) now develops across the real Rs_d/Ls_d.
+* Topology (single series loop):  s --Rs_d--> m --Ls_d--> p --Vmeas--> nx --Bfield--> 0
+* Bemf = pure EMF; source phase carried via t_phase (=0 normally; =window start in the
+* break_restart negative control, where `time` runs window-local).
 
 Bemf s 0 V = { amp_src*sin(2*pi*f_src*(time + t_phase)) }
 
@@ -25,16 +25,10 @@ VIprev iprev    0 PWL FILE "i_prev_k.pwl"
 * Nullvoltquelle zur Strommessung des aktuellen Interface-Stroms
 Vmeas p nx 0
 
-* R-SPLIT (Branch feat/wr-secant-real-rrom): Rrom als ECHTES Reihen-Widerstandsdevice
-* (absoluter Drop Rrom*I_C, NICHT gelaggt). Bfield traegt nur noch den induktiven
-* Sekanten-Anteil + die deferred Feld-Korrektur. Aus der expliziten Transmission
-*   V_p = Rrom*I_C + Lrom*(I_C-I0)/tau + V_F - Rrom*I_F - Lrom*(I_F-I0)/tau
-* wird Rrom*I_C zum Device Rrom_d; der Rest (Bfield) kollabiert (I0 hebt sich) zu
-*   Bfield = V_F - Rrom*I_F + Lrom/tau*(I_C - I_F).
-* Test: senkt der reale (implizite) R-Drop die WR-Iterationszahl ggue. der gelumpten Form?
-Rrom_d nx g {Rrom}
-Bfield g 0 V = {
-+ V(vfprev) - Rrom*V(iprev) + Lrom/MAX(time - t_abs_start, t_floor) * (I(Vmeas) - V(iprev))
+* Interface-Bedingung (THEVENIN, gelumpte behaviorale Spannungsquelle): die matched-secant
+* Beziehung nach V(p) aufgeloest -> V(p) = V(vfprev) + (Rrom + Lrom/t_acc)*(I(Vmeas) - I_field_prev).
+Bfield nx 0 V = {
++ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))
 + }
 
 * .OPTIONS RESTART und .tran werden pro Zeitfenster vom C++-Master generiert
