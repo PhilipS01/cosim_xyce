@@ -51,6 +51,8 @@ axA.axvspan(z0*1e3, z1*1e3, color="C1", alpha=0.13)
 axA.set_ylabel("interface current  $I$  [A]")
 axA.legend(loc="lower left", fontsize=9, framealpha=0.95)
 axA.set_xlim(0, T_END*1e3); axA.set_title("(a) full 20 ms horizon", fontsize=10, loc="left")
+axA.text(0.5*(z0+z1)*1e3, axA.get_ylim()[1]*0.86, "zoom\n(b)", ha="center",
+         va="top", fontsize=8, color="C1")
 
 axB = fig.add_subplot(gs[1])
 first = True
