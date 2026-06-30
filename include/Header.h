@@ -53,6 +53,11 @@ struct SimConfig
     // WR convergence metric: 0 = waveform L1 of the field-current (this codebase),
     //                        1 = terminal-scalar metric of the reference CoSimulation_WR.cpp
     unsigned wr_convergence_method = 0;
+    // Negative control: when true, DISABLE checkpoint/restart. Each window is run cold in
+    // window-LOCAL time (inductor IC=0, no state carry), with only the source phase carried
+    // via t_phase. Demonstrates that without restart the co-sim state is not carried across
+    // windows (sawtooth). Default off -> normal restarted path.
+    bool break_restart = false;
 };
 
 extern SimConfig g_cfg;
@@ -101,7 +106,7 @@ void appendFieldWaveformXyceStyle(FILE* file, const Waveform& vf, const Waveform
 
 void RunXyce(const string& filename);
 
-void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double dIdt0, double r_series, double l_series, const unsigned N_coupling_intervals);
+void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double dIdt0, double r_series, double l_series, const unsigned N_coupling_intervals, double t_phase = 0.0);
 
 // Generiert restart.inc (von wr_circuit.cir inkludiert): die fenster-spezifische
 // .OPTIONS RESTART und .tran Zeile. Fenster 1 (first_window=true): frischer UIC-Transient

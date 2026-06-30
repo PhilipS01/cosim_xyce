@@ -13,7 +13,7 @@ Toy Problem aus RL glied mit Xyce loesen
 * Topology (single series loop): s --Rs_d--> m --Ls_d--> p --Vmeas--> nx --Rrom_d--> g --Bfield--> 0
 * Bemf = pure EMF (no series drop folded in). V(p) now develops across the real Rs_d/Ls_d.
 
-Bemf s 0 V = { amp_src*sin(2*pi*f_src*time) }
+Bemf s 0 V = { amp_src*sin(2*pi*f_src*(time + t_phase)) }
 
 Rs_d  s m  {Rs}
 Ls_d  m p  {Ls} IC=0

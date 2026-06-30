@@ -59,8 +59,6 @@ plt.rcParams.update({"font.size": 11, "axes.grid": True, "grid.alpha": 0.3,
                      "figure.dpi": 120})
 fig = plt.figure(figsize=(9, 7.6), constrained_layout=True)
 gs = fig.add_gridspec(3, 1, height_ratios=[3, 2.4, 1.2])
-fig.suptitle("Checkpoint/restart in a Xyce co-simulation: 50 restarted windows reproduce the monolithic run",
-             fontsize=12, fontweight="bold")
 
 # ---- (a) full horizon: restarted co-sim vs monolithic --------------------------
 axA = fig.add_subplot(gs[0])
@@ -93,8 +91,7 @@ axB.set_ylabel("interface current  $I$  [A]")
 axB.set_xlabel("time  [ms]")
 axB.legend(loc="upper right", fontsize=8.5, framealpha=0.95, ncol=2)
 axB.set_xlim(z0*1e3, z1*1e3)
-axB.set_title("(b) zoom at the zero-crossing (steepest $dI/dt$ — the hardest place to hide a discontinuity): "
-              "state is continuous across every restart", fontsize=9.5, loc="left")
+axB.set_title("(b) zoom at the zero-crossing (steepest $dI/dt$)", fontsize=9.5, loc="left")
 
 # ---- (c) error vs monolithic ----------------------------------------------------
 axC = fig.add_subplot(gs[2])
