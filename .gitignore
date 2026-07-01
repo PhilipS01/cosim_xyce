@@ -18,3 +18,12 @@ WR_error.txt
 # scratch
 _cfg_*.txt
 *.log
+
+# scratch from other branches / builds
+genext_driver
+wr_genext.cir
+wr_genext.cir.prn
+Field_flux.txt
+Field_waveform_solution.prn
+Circuit_solution.prn
+__pycache__/
