@@ -2,7 +2,7 @@
 frequency = 50
 amplitude = 1
 R_series = 0.006
-L_series = 1e-07
+L_series = 1.6e-07
 L_ROM = 1.44e-07
 R_ROM = 0.000459
 L_FEM = 1.6e-07
@@ -14,6 +14,5 @@ N_field_steps_per_source_period = 50
 N_field_eval_intervals = 1
 N_xyce_coupling_intervals = 100
 WRmaxSteps = 20
-WR_tolerance = 0.001
+WR_tolerance = 1e-3
 wr_convergence_method = 1
-bfield_deriv = 0

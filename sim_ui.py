@@ -55,8 +55,6 @@ PARAMS = [
     ("WR_tolerance",                    "WR tolerance",                 1.0e-3,   "float", None),
     ("wr_convergence_method",           "WR convergence metric",        1,        "choice",
         {0: "waveform L1 (this code)", 1: "terminal scalar (reference)"}),
-    ("bfield_deriv",                    "Bfield inductive term",        0,        "choice",
-        {0: "accumulated secant (/t_acc)", 1: "fixed FD (/h_coupling)"}),
 ]
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
 KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}
