@@ -38,8 +38,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PARAMS = [
     ("frequency",                       "Source frequency f (Hz)",      50.0,     "float", (1, 200, 1)),
     ("amplitude",                       "Source amplitude (V)",         1.0,      "float", (0.1, 10, 0.1)),
-    ("R_series",                        "R_series src->port (Ohm)",     0.0,      "float", None),
-    ("L_series",                        "L_series src->port (H)",       0.0,      "float", None),
+    ("R_series",                        "R_series src->port (Ohm)",     6.0e-3,   "float", None),
+    ("L_series",                        "L_series src->port (H)",       1.6e-7,   "float", None),
     ("L_ROM",                           "L_ROM (H)",                    1.44e-7,  "float", None),
     ("R_ROM",                           "R_ROM (Ohm)",                  4.59e-4,  "float", None),
     ("L_FEM",                           "L_FEM (H, 'true' field)",      1.6e-7,   "float", None),
@@ -53,7 +53,7 @@ PARAMS = [
     ("N_xyce_coupling_intervals",       "Xyce coupling intervals",      100,      "int",   (2, 400, 1)),
     ("WRmaxSteps",                      "WR max iterations",            20,       "int",   (1, 100, 1)),
     ("WR_tolerance",                    "WR tolerance",                 1.0e-3,   "float", None),
-    ("wr_convergence_method",           "WR convergence metric",        0,        "choice",
+    ("wr_convergence_method",           "WR convergence metric",        1,        "choice",
         {0: "waveform L1 (this code)", 1: "terminal scalar (reference)"}),
 ]
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
@@ -77,6 +77,30 @@ def write_config(params):
             else:
                 f.write(f"{k} = {float(v):.10g}\n")
     return path
+
+
+def read_config():
+    """Load the existing sim_config.txt into a {key: value} dict (only keys the UI knows),
+    so the studio opens on the actual saved configuration instead of the factory defaults.
+    Unknown keys are ignored; missing file -> empty dict (fall back to DEFAULTS)."""
+    path = os.path.join(HERE, "sim_config.txt")
+    cfg = {}
+    if not os.path.exists(path):
+        return cfg
+    with open(path) as f:
+        for line in f:
+            s = line.split("#", 1)[0].strip()
+            if "=" not in s:
+                continue
+            k, v = (x.strip() for x in s.split("=", 1))
+            if k not in DEFAULTS:
+                continue
+            try:
+                cfg[k] = (int(round(float(v))) if KINDS[k] in ("int", "choice")
+                          else float(v))
+            except ValueError:
+                pass
+    return cfg
 
 
 def ensure_built():
@@ -808,8 +832,12 @@ class Handler(BaseHTTPRequestHandler):
 # Frontend
 # ---------------------------------------------------------------------------
 def _controls_html():
+    # Seed the form from the actual saved sim_config.txt (fall back to factory defaults),
+    # so the studio opens on the current working setup, not a blank/trivial config.
+    initial = {**DEFAULTS, **read_config()}
     rows = []
     for k, label, default, kind, slider in PARAMS:
+        default = initial.get(k, default)
         if kind == "choice":
             opts = "".join(
                 f'<option value="{val}"{" selected" if val == default else ""}>{text}</option>'
