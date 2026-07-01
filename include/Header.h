@@ -53,6 +53,13 @@ struct SimConfig
     // WR convergence metric: 0 = waveform L1 of the field-current (this codebase),
     //                        1 = terminal-scalar metric of the reference CoSimulation_WR.cpp
     unsigned wr_convergence_method = 0;
+    // Bfield inductive term (convergence-rate experiment): the denominator of the ROM's
+    // inductive admittance Lrom/denom * (I - I_prev).
+    //   0 = accumulated secant: denom = MAX(t_acc, t_floor)  -> admittance DECAYS through the
+    //       window (Lrom/t_floor at start -> Lrom/dt_field at end). The default matched form.
+    //   1 = fixed FD:           denom = t_floor (= h_coupling) -> admittance CONSTANT.
+    // Same WR fixpoint (the correction -> 0 at I=I_prev); only the convergence rate differs.
+    unsigned bfield_deriv = 0;
 };
 
 extern SimConfig g_cfg;

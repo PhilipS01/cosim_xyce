@@ -25,9 +25,13 @@ VIprev iprev    0 PWL FILE "i_prev_k.pwl"
 Vmeas p nx 0
 
 * Interface-Bedingung (THEVENIN, gelumpte behaviorale Spannungsquelle): die matched-secant
-* Beziehung nach V(p) aufgeloest -> V(p) = V(vfprev) + (Rrom + Lrom/t_acc)*(I(Vmeas) - I_field_prev).
+* Beziehung nach V(p) aufgeloest -> V(p) = V(vfprev) + (Rrom + Lrom/denom)*(I(Vmeas) - I_field_prev).
+* denom-Umschalter (Konvergenzraten-Experiment, use_fd aus sim_config bfield_deriv):
+*   use_fd=0: denom = MAX(t_acc, t_floor)  -> akkumulierte Sekante (Admittanz faellt im Fenster).
+*   use_fd=1: denom = t_floor              -> fixe FD (Admittanz konstant = Fensterstart-Wert).
+* Beide IF-Zweige sind DDT-frei (ein echtes DDT der Zweigstroms crasht) -> sicher.
 Bfield nx 0 V = {
-+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))
++ V(vfprev) + (Rrom + Lrom/IF(use_fd > 0.5, t_floor, MAX(time - t_abs_start, t_floor))) * (I(Vmeas) - V(iprev))
 + }
 
 * .OPTIONS RESTART und .tran werden pro Zeitfenster vom C++-Master generiert

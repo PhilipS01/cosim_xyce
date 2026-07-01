@@ -57,6 +57,7 @@ bool LoadConfig(const string& filename)
         else if (key == "WRmaxSteps")                       g_cfg.WRmaxSteps = (unsigned)val;
         else if (key == "WR_tolerance")                     g_cfg.WR_tolerance = val;
         else if (key == "wr_convergence_method")            g_cfg.wr_convergence_method = (unsigned)val;
+        else if (key == "bfield_deriv")                     g_cfg.bfield_deriv = (unsigned)val;
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
     }
     return true;
@@ -772,6 +773,8 @@ void WriteSimParams(
     out << ".PARAM Rs           = " << r_series     << "\n";
     out << ".PARAM Ls           = " << l_series     << "\n";
     out << ".PARAM t_floor      = " << t_floor      << "\n";
+    // Bfield inductive-term denominator selector (0 = accumulated secant /t_acc, 1 = fixed FD /t_floor).
+    out << ".PARAM use_fd       = " << g_cfg.bfield_deriv << "\n";
 }
 
 // Schreibt restart.inc: die fenster-spezifische .OPTIONS RESTART und .tran Zeile.
