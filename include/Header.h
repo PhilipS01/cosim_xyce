@@ -34,13 +34,24 @@ struct SimConfig
     // field/ROM model mismatch that the WR iteration must resolve.
     unsigned nonlin_model = 0;
     double I_sat = 100.0;
-    // Circuit voltage source Bsrc
+    // Circuit source on the hot node `s`. Selects the device WriteCircuitNetlist emits:
+    //   0 = sinusoidal VOLTAGE source  (Bemf s 0 V={amp*sin(2*pi*f*t)})  -- default / legacy
+    //   1 = sinusoidal CURRENT source  (Bemf 0 s I={amp*sin(2*pi*f*t)})
+    //   2 = step/ramp VOLTAGE source   (Vemf s 0 PULSE(v_init v_final delay rise ...))
+    unsigned source_kind = 0;
+    // Sinusoidal source (kinds 0,1): amplitude is Volts (kind 0) or Amps (kind 1).
     double frequency = 50.0;
     double amplitude = 1.0;
-    // Series coupling impedance between source EMF and the port (two-way coupling).
+    // Step/ramp voltage source (kind 2): initial/final level, onset delay, and ramp (rise) time.
+    double step_v_initial = 0.0;
+    double step_v_final   = 1.0;
+    double step_delay     = 0.0;
+    double step_rise      = 1.0e-4;
+    // Series R/L/C on the source->port path (only nonzero elements are emitted; all-zero => s==p).
     // Rs = Ls = 0 reproduces the one-way toy (port voltage == source voltage).
     double R_series = 0.0;
     double L_series = 0.0;
+    double C_series = 0.0;
     // Time stepping
     unsigned N_periods = 1;
     unsigned N_field_steps_per_source_period = 50;
@@ -100,6 +111,13 @@ void appendCircuitWaveformXyceStyle(FILE* file, const CircuitWaveform& wf, doubl
 void appendFieldWaveformXyceStyle(FILE* file, const Waveform& vf, const Waveform& i, double t_abs_start, unsigned long& global_index, bool skip_first_point);
 
 void RunXyce(const string& filename);
+
+// Generiert die vollstaendige Schaltungs-Netzliste (wr_circuit.cir) aus g_cfg: Quelle (source_kind)
+// + serielle R/L/C-Kette Quelle->Port p + feste WR-Schnittstelle (Vmeas, Bfield) + Includes. Wird
+// EINMAL vor der Fensterschleife (und im emit-Modus) aufgerufen; Topologie ist fensterinvariant.
+// Die pro-Fenster variablen Groessen bleiben in sim_params.inc/restart.inc. Inline (kein .INCLUDE
+// der Elemente), damit der UI-Netzlisten-Parser (folgt keinen .INCLUDEs) die Schaltung zeichnen kann.
+void WriteCircuitNetlist(const string& filename);
 
 void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double dIdt0, double r_series, double l_series, const unsigned N_coupling_intervals);
 

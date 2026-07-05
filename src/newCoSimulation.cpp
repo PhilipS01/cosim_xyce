@@ -46,10 +46,16 @@ bool LoadConfig(const string& filename)
         else if (key == "R_FEM")                            g_cfg.R_FEM = val;
         else if (key == "nonlin_model")                     g_cfg.nonlin_model = (unsigned)val;
         else if (key == "I_sat")                            g_cfg.I_sat = val;
+        else if (key == "source_kind")                      g_cfg.source_kind = (unsigned)val;
         else if (key == "frequency")                        g_cfg.frequency = val;
         else if (key == "amplitude")                        g_cfg.amplitude = val;
+        else if (key == "step_v_initial")                   g_cfg.step_v_initial = val;
+        else if (key == "step_v_final")                     g_cfg.step_v_final = val;
+        else if (key == "step_delay")                       g_cfg.step_delay = val;
+        else if (key == "step_rise")                        g_cfg.step_rise = val;
         else if (key == "R_series")                         g_cfg.R_series = val;
         else if (key == "L_series")                         g_cfg.L_series = val;
+        else if (key == "C_series")                         g_cfg.C_series = val;
         else if (key == "N_periods")                        g_cfg.N_periods = (unsigned)val;
         else if (key == "N_field_steps_per_source_period")  g_cfg.N_field_steps_per_source_period = (unsigned)val;
         else if (key == "N_field_eval_intervals")           g_cfg.N_field_eval_intervals = (unsigned)val;
@@ -227,6 +233,11 @@ void MasterProcess()
 {
 	cout << "Master process started" << endl;
 
+    // Schaltungs-Netzliste aus g_cfg generieren (Topologie fensterinvariant -> einmal hier).
+    // Ueberschreibt wr_circuit.cir mit Quelle (source_kind) + serieller R/L/C-Kette + fixer
+    // WR-Schnittstelle. Pro-Fenster variable Parameter kommen weiter aus sim_params.inc.
+    WriteCircuitNetlist("wr_circuit.cir");
+
     // Datei für Feldlösung an Synchronisationszeitpunkten (entspricht hier Feldschritten)
     FILE* file_Field = fopen("Field_solution.prn", "w");
     fprintf(file_Field, "Index       TIME              V(FIELD)          I(FIELD)\n");
@@ -285,8 +296,20 @@ void MasterProcess()
     double dIdt_0 = 0.0;
     // dV/dt der Portspannung am Fensteranfang (Seed-Slope für vf_prev_k.pwl). Wird am Fensterende
     // aus der konvergierten V(p)-Waveform getragen (topologie-agnostisch, korrekt auch mit Rs/Ls).
-    // Fenster 1: Quellen-Steigung (bei I0=0,dIdt0=0 ist V(p)≈Vsrc).
-    double dVdt_0 = V_src_amplitude * 2.0 * M_PI * Frequency * cos(2.0 * M_PI * Frequency * 0.0);
+    // Fenster 1: quellen-abhaengige Anfangssteigung (bei I0=0,dIdt0=0 ist V(p)≈Vsrc). Die sinus-
+    // Formel gilt NUR fuer source_kind 0; fuer Strom-/Step-Quellen ist sie falsch und verlangsamt die
+    // WR-Konvergenz des ersten Fensters (die restlichen Fenster tragen die Steigung aus der Loesung).
+    double dVdt_0;
+    switch (g_cfg.source_kind) {
+        case 0: // sinusoidale SPANNUNGsquelle (Legacy): Quellensteigung amplitude*2*pi*f (Regressions-Anker).
+            dVdt_0 = V_src_amplitude * 2.0 * M_PI * Frequency * cos(2.0 * M_PI * Frequency * 0.0);
+            break;
+        default: // Strom-/Step-Quellen: neutraler Seed 0. V(p) startet ~0 (Ls blockiert den Anfangsstrom,
+                 // beim Step faellt die volle Quellspannung zunaechst ueber Ls ab -> dV(p)/dt(0)≈0). Ein
+                 // Steigungs-Seed aus der reinen Rampensteigung ueberschiesst und KOSTET WR-Iterationen.
+            dVdt_0 = 0.0;
+            break;
+    }
 
     //fprintf(file_Field, "%-10lu %-17.8e %-17.8e %-17.8e\n", global_field_index++, 0.0, V_field, I_field);
 
@@ -709,6 +732,82 @@ void RunXyce(const string& filename) {
             ". Check xyce_stdout.log and xyce_stderr.log."
         );
     }
+}
+
+// Generiert die vollstaendige Schaltungs-Netzliste (wr_circuit.cir) aus g_cfg. Topologie ist
+// fensterinvariant -> EINMAL vor der WR-Schleife (und im emit-Modus) aufgerufen. Elemente werden
+// INLINE geschrieben (kein .INCLUDE der Devices), damit der UI-Netzlisten-Parser (folgt keinen
+// .INCLUDEs) die Schaltung zeichnen kann. Pro-Fenster variable Groessen (amp_src/f_src/Rs/Ls/...)
+// bleiben als {param}-Referenzen in sim_params.inc; C_series und Step-Parameter werden als Literale
+// geschrieben (konfig-konstant). Die WR-Schnittstelle (Vmeas/Bfield) ist fix und unveraendert.
+void WriteCircuitNetlist(const string& filename)
+{
+    ofstream out(filename);
+    if (!out) {
+        throw runtime_error("WriteCircuitNetlist: could not open " + filename);
+    }
+    out << scientific << setprecision(10);
+
+    out << "Generated circuit netlist (WriteCircuitNetlist from sim_config.txt) -- DO NOT EDIT BY HAND\n";
+    out << ".INCLUDE sim_params.inc\n\n";
+
+    // Aktive serielle Elemente auf dem Pfad Quelle->Port (nur nonzero). Reihenfolge R,L,C.
+    vector<char> series;
+    if (g_cfg.R_series != 0.0) series.push_back('R');
+    if (g_cfg.L_series != 0.0) series.push_back('L');
+    if (g_cfg.C_series != 0.0) series.push_back('C');
+    // Ohne serielle Elemente sitzt die Quelle direkt auf dem Port p (Einweg-Toy: V(p)==Vsrc).
+    const string hot = series.empty() ? string("p") : string("s");
+
+    out << "* === CIRCUIT SIDE (source_kind=" << g_cfg.source_kind << ") ===\n";
+    switch (g_cfg.source_kind) {
+        case 1: // sinusoidale STROMquelle: treibt den Schleifenstrom direkt in den Port (Vorzeichen
+                // via I(Vmeas) pruefen). HINWEIS: serielle R/L/C sind bei einer Stromquelle physikalisch
+                // sinnlos (der Strom ist erzwungen; serielle Elemente floaten nur den Quellknoten) UND
+                // eine ideale Stromquelle in Reihe mit L ist entartet (Nulldurchgang -> singulaere
+                // Jacobi -> dt-Kollaps). Daher: bare Quelle direkt auf p (Preset P2 setzt R/L/C=0).
+            out << "Bemf 0 " << hot << " I = { amp_src*sin(2*pi*f_src*time) }\n";
+            break;
+        case 2: // Step/Rampen-SPANNUNGsquelle: einzelne steigende Flanke (tf=0, pw/per gross)
+            out << "Vemf " << hot << " 0 PULSE("
+                << g_cfg.step_v_initial << " " << g_cfg.step_v_final << " "
+                << g_cfg.step_delay << " " << g_cfg.step_rise << " 0 1e30 1e30)\n";
+            break;
+        case 0: // sinusoidale SPANNUNGsquelle (Legacy-Default / Regressions-Anker)
+        default:
+            out << "Bemf " << hot << " 0 V = { amp_src*sin(2*pi*f_src*time) }\n";
+            break;
+    }
+    out << "\n";
+
+    if (!series.empty()) {
+        out << "* series R/L/C  source->port\n";
+        string node = "s";
+        for (size_t i = 0; i < series.size(); ++i) {
+            const string next = (i + 1 == series.size()) ? string("p") : ("cm" + to_string(i));
+            switch (series[i]) {
+                case 'R': out << "Rs_d " << node << " " << next << " {Rs}\n";       break;
+                case 'L': out << "Ls_d " << node << " " << next << " {Ls} IC=0\n";   break;
+                case 'C': out << "Cs_d " << node << " " << next << " "
+                              << g_cfg.C_series << " IC=0\n";                        break;
+            }
+            node = next;
+        }
+        out << "\n";
+    }
+
+    // Feste WR-Schnittstelle (THEVENIN matched-secant Feld-ROM) -- identisch zur Handnetzliste.
+    out << "* === WR INTERFACE (fixed): prev waveforms, ammeter, matched-secant Bfield ===\n";
+    out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
+    out << "VIprev iprev  0 PWL FILE \"i_prev_k.pwl\"\n";
+    out << "Vmeas p nx 0\n";
+    out << "Bfield nx 0 V = {\n";
+    out << "+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))\n";
+    out << "+ }\n\n";
+
+    out << ".INCLUDE restart.inc\n";
+    out << ".print tran V(p) V(nx) I(Vmeas)\n";
+    out << ".end\n";
 }
 
 void WriteSimParams(

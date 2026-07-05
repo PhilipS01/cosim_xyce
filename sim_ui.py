@@ -36,10 +36,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # --- Parameter spec: (key, label, default, kind, slider min/max/step or None) ---
 # kind: "float" or "int". slider tuple => render a range slider alongside the box.
 PARAMS = [
+    ("source_kind",                     "Circuit source",               0,        "choice",
+        {0: "sinusoidal voltage", 1: "sinusoidal current", 2: "step/ramp voltage"}),
     ("frequency",                       "Source frequency f (Hz)",      50.0,     "float", (1, 200, 1)),
-    ("amplitude",                       "Source amplitude (V)",         1.0,      "float", (0.1, 10, 0.1)),
+    ("amplitude",                       "Source amplitude (V or A)",    1.0,      "float", (0.1, 10, 0.1)),
+    ("step_v_initial",                  "Step: initial level",          0.0,      "float", None),
+    ("step_v_final",                    "Step: final level",            1.0,      "float", None),
+    ("step_delay",                      "Step: onset delay (s)",        0.0,      "float", None),
+    ("step_rise",                       "Step: ramp/rise time (s)",     1.0e-4,   "float", None),
     ("R_series",                        "R_series src->port (Ohm)",     6.0e-3,   "float", None),
     ("L_series",                        "L_series src->port (H)",       1.6e-7,   "float", None),
+    ("C_series",                        "C_series src->port (F, 0=off)",0.0,      "float", None),
     ("L_ROM",                           "L_ROM (H)",                    1.44e-7,  "float", None),
     ("R_ROM",                           "R_ROM (Ohm)",                  4.59e-4,  "float", None),
     ("L_FEM",                           "L_FEM (H, 'true' field)",      1.6e-7,   "float", None),
@@ -61,6 +68,23 @@ KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}
 LABELS = {k: l for (k, l, _d, _kind, _s) in PARAMS}
 # Numeric params are sweepable (a "choice" metric switch is not a continuum).
 SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
+
+# Circuit-side presets (hybrid model): a preset seeds the editable primitive fields; the user
+# may then tweak any field. Increment 1 covers the three source kinds + series R/L; presets 4-6
+# (switches) arrive in increment 2. Keys map to the flat config the C++ generator consumes.
+PRESETS = {
+    "P1: Sine V + RL": {"source_kind": 0, "amplitude": 1.0, "frequency": 50.0,
+                        "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0},
+    # Bare current source directly on the port: series R/L/C are meaningless for a current drive
+    # (the current is forced regardless) and an ideal I-source in series with L is degenerate.
+    "P2: Sine I (bare)": {"source_kind": 1, "amplitude": 1.0, "frequency": 50.0,
+                          "R_series": 0.0, "L_series": 0.0, "C_series": 0.0},
+    "P3: Step/ramp V + RL": {"source_kind": 2, "step_v_initial": 0.0, "step_v_final": 1.0,
+                             "step_delay": 0.0, "step_rise": 1.0e-4,
+                             "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0,
+                             # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters
+                             "WRmaxSteps": 40},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +141,14 @@ def run_solver():
                           capture_output=True, text=True, timeout=600)
     elapsed = time.perf_counter() - t0
     return proc.returncode, proc.stdout, proc.stderr, elapsed
+
+
+def emit_netlist():
+    """Regenerate wr_circuit.cir from the current sim_config.txt without solving
+    ('main emit'), so the rendered schematic reflects the current config."""
+    ensure_built()
+    subprocess.run([os.path.join(HERE, "main"), "emit"], cwd=HERE,
+                   capture_output=True, text=True, timeout=60)
 
 
 # ---------------------------------------------------------------------------
@@ -741,8 +773,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "not found", "text/plain")
 
-    def _handle_netlist(self):
+    def _handle_netlist(self, params=None):
         try:
+            # Regenerate wr_circuit.cir so the drawn schematic matches the current config.
+            # POST carries the live form params (write them first); GET uses the saved config.
+            if params is not None:
+                write_config(params)
+            emit_netlist()
             parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
             self._send(200, json.dumps({
                 "ok": True,
@@ -760,13 +797,16 @@ class Handler(BaseHTTPRequestHandler):
             }))
 
     def do_POST(self):
-        if self.path not in ("/run", "/sweep"):
+        if self.path not in ("/run", "/sweep", "/netlist"):
             self._send(404, json.dumps({"error": "unknown endpoint"}))
             return
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
         if self.path == "/sweep":
             self._handle_sweep(body)
+            return
+        if self.path == "/netlist":
+            self._handle_netlist(body)
             return
         try:
             params = body
@@ -835,7 +875,17 @@ def _controls_html():
     # Seed the form from the actual saved sim_config.txt (fall back to factory defaults),
     # so the studio opens on the current working setup, not a blank/trivial config.
     initial = {**DEFAULTS, **read_config()}
-    rows = []
+    # Preset selector (hybrid model): seeds the fields below, then the user may edit them.
+    preset_opts = '<option value="">— custom —</option>' + "".join(
+        f'<option value="{name}">{name}</option>' for name in PRESETS
+    )
+    rows = [f"""
+        <div class="ctl">
+          <label for="presetSel">Circuit preset</label>
+          <div class="inputs">
+            <select id="presetSel" class="choice" onchange="applyPreset()">{preset_opts}</select>
+          </div>
+        </div>"""]
     for k, label, default, kind, slider in PARAMS:
         default = initial.get(k, default)
         if kind == "choice":
@@ -1012,6 +1062,19 @@ INDEX_HTML = """<!doctype html>
 </div>
 <script>
 const DEFAULTS = __DEFAULTS__;
+const PRESETS = __PRESETS__;
+
+function applyPreset(){
+  const name = document.getElementById('presetSel').value;
+  const p = PRESETS[name];
+  if (!p) return;
+  for (const k in p){
+    const b = document.getElementById('f_'+k);
+    if (b){ b.value = p[k]; if (b.tagName !== 'SELECT') syncFromBox(b); }
+  }
+  setStatus('Preset applied: '+name, '');
+  loadCircuit();
+}
 
 function syncFromSlider(el){
   const box = document.getElementById('f_'+el.dataset.key);
@@ -1071,6 +1134,7 @@ async function run(){
       setPlot('p_voltage', j.plots.voltage);
       setPlot('p_current', j.plots.current);
       setPlot('p_wr', j.plots.wr);
+      loadCircuit();  // the solver regenerated the netlist; refresh the schematic
     }
   } catch(e){ setStatus('Request failed: '+e, 'err'); }
   finally { btn.disabled = false; }
@@ -1148,7 +1212,10 @@ function toggleCircuit(){
 }
 async function loadCircuit(){
   try {
-    const res = await fetch('/netlist');
+    // POST the live form so the drawn schematic reflects unsaved edits (server writes
+    // config + regenerates wr_circuit.cir via 'main emit' before parsing).
+    const res = await fetch('/netlist', {method:'POST', headers:{'Content-Type':'application/json'},
+                                         body: JSON.stringify(collect())});
     const j = await res.json();
     if (j.ok){
       setPlot('p_circuit', j.plots ? j.plots.circuit : null);
@@ -1164,7 +1231,8 @@ window.addEventListener('load', loadCircuit);
 INDEX_HTML = (INDEX_HTML
               .replace("__CONTROLS__", _controls_html())
               .replace("__SWEEP_OPTS__", _sweep_options_html())
-              .replace("__DEFAULTS__", json.dumps(DEFAULTS)))
+              .replace("__DEFAULTS__", json.dumps(DEFAULTS))
+              .replace("__PRESETS__", json.dumps(PRESETS)))
 
 
 def _png_to_file(data_uri, path):

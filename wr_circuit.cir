@@ -1,37 +1,21 @@
-Toy Problem aus RL glied mit Xyce loesen
+Generated circuit netlist (WriteCircuitNetlist from sim_config.txt) -- DO NOT EDIT BY HAND
 .INCLUDE sim_params.inc
 
-* === REAL-Ls, THEVENIN coupling (lumped behavioral matched secant) ===
-* Series coupling Rs/Ls are REAL Xyce devices (BDF inductor Ls_d carries its restart state
-* natively across windows). Field ROM = window-anchored matched secant in THEVENIN form:
-* a behavioral VOLTAGE source Bfield.
-* NOTE: the real-Rrom-DEVICE split (Rrom_d + reduced Bfield) was tried and reverted -- it gave
-* bit-identical WR iteration counts, because the behavioral Bfield ALREADY exposes
-* d(Bfield)/dI(Vmeas)=Rrom to Xyce's Newton (see feat/wr-secant-real-rrom / the notes).
-*
-* Topology (single series loop):  s --Rs_d--> m --Ls_d--> p --Vmeas--> nx --Bfield--> 0
-* Bemf = pure EMF (no series drop folded in). V(p) develops across the real Rs_d/Ls_d.
-
+* === CIRCUIT SIDE (source_kind=0) ===
 Bemf s 0 V = { amp_src*sin(2*pi*f_src*time) }
 
-Rs_d  s m  {Rs}
-Ls_d  m p  {Ls} IC=0
+* series R/L/C  source->port
+Rs_d s cm0 {Rs}
+Ls_d cm0 p {Ls} IC=0
 
-* Alte Feld-/Interface-Waveforms aus WR-Iteration k
-VFprev vfprev   0 PWL FILE "vf_prev_k.pwl"
-VIprev iprev    0 PWL FILE "i_prev_k.pwl"
-
-* Nullvoltquelle zur Strommessung des aktuellen Interface-Stroms
+* === WR INTERFACE (fixed): prev waveforms, ammeter, matched-secant Bfield ===
+VFprev vfprev 0 PWL FILE "vf_prev_k.pwl"
+VIprev iprev  0 PWL FILE "i_prev_k.pwl"
 Vmeas p nx 0
-
-* Interface-Bedingung (THEVENIN, gelumpte behaviorale Spannungsquelle): die matched-secant
-* Beziehung nach V(p) aufgeloest -> V(p) = V(vfprev) + (Rrom + Lrom/t_acc)*(I(Vmeas) - I_field_prev).
 Bfield nx 0 V = {
 + V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))
 + }
 
-* .OPTIONS RESTART und .tran werden pro Zeitfenster vom C++-Master generiert
-* (Fenster 1: UIC-Transient ab 0; Fenster k>1: Restart ab Checkpoint). Siehe WriteRestartDirectives.
 .INCLUDE restart.inc
 .print tran V(p) V(nx) I(Vmeas)
 .end
