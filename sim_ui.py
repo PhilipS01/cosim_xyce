@@ -47,6 +47,17 @@ PARAMS = [
     ("R_series",                        "R_series src->port (Ohm)",     6.0e-3,   "float", None),
     ("L_series",                        "L_series src->port (H)",       1.6e-7,   "float", None),
     ("C_series",                        "C_series src->port (F, 0=off)",0.0,      "float", None),
+    ("circuit_kind",                    "Circuit topology",             0,        "choice",
+        {0: "simple source", 1: "#4 3-way (sine U,C)", 2: "#5 2-way (DC U,C)", 3: "#6 2-way (AC vs R)"}),
+    ("switch_backend",                  "Switch backend",               0,        "choice",
+        {0: "behavioral R", 1: "native S"}),
+    ("switch_t1",                       "Switch t1 (s)",                6.0e-3,   "float", None),
+    ("switch_t2",                       "Switch t2 (s, 3-way)",         1.3e-2,   "float", None),
+    ("switch_C",                        "Switch cap C (F)",             1.0e-6,   "float", None),
+    ("switch_R",                        "Switch R (Ohm, #6)",           1.0e4,    "float", None),
+    ("switch_Ron",                      "Switch Ron closed (Ohm)",      1.0e-3,   "float", None),
+    ("switch_Roff",                     "Switch Roff open (Ohm)",       1.0e9,    "float", None),
+    ("switch_trise",                    "Switch transition (s)",        1.0e-5,   "float", None),
     ("L_ROM",                           "L_ROM (H)",                    1.44e-7,  "float", None),
     ("R_ROM",                           "R_ROM (Ohm)",                  4.59e-4,  "float", None),
     ("L_FEM",                           "L_FEM (H, 'true' field)",      1.6e-7,   "float", None),
@@ -73,17 +84,30 @@ SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
 # may then tweak any field. Increment 1 covers the three source kinds + series R/L; presets 4-6
 # (switches) arrive in increment 2. Keys map to the flat config the C++ generator consumes.
 PRESETS = {
-    "P1: Sine V + RL": {"source_kind": 0, "amplitude": 1.0, "frequency": 50.0,
+    "P1: Sine V + RL": {"circuit_kind": 0, "source_kind": 0, "amplitude": 1.0, "frequency": 50.0,
                         "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0},
     # Bare current source directly on the port: series R/L/C are meaningless for a current drive
     # (the current is forced regardless) and an ideal I-source in series with L is degenerate.
-    "P2: Sine I (bare)": {"source_kind": 1, "amplitude": 1.0, "frequency": 50.0,
+    "P2: Sine I (bare)": {"circuit_kind": 0, "source_kind": 1, "amplitude": 1.0, "frequency": 50.0,
                           "R_series": 0.0, "L_series": 0.0, "C_series": 0.0},
-    "P3: Step/ramp V + RL": {"source_kind": 2, "step_v_initial": 0.0, "step_v_final": 1.0,
-                             "step_delay": 0.0, "step_rise": 1.0e-4,
+    "P3: Step/ramp V + RL": {"circuit_kind": 0, "source_kind": 2, "step_v_initial": 0.0,
+                             "step_v_final": 1.0, "step_delay": 0.0, "step_rise": 1.0e-4,
                              "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0,
                              # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters
                              "WRmaxSteps": 40},
+    # --- Increment 2: switch topologies. NOTE the passive values are numerical-survival defaults,
+    # not physically tuned to the field scale -- see the notes: C must stay small enough for WR to
+    # contract, and the cap<->coil freewheel (P4/P5) needs a damped closed switch (Ron~10) or its
+    # ~undamped LC ring dt-collapses. Tune C / Ron / times to your field for a meaningful excitation.
+    "P4: 3-way switch (sine U, C)": {"circuit_kind": 1, "switch_backend": 0, "amplitude": 1.0,
+                                     "frequency": 50.0, "switch_C": 1.0e-6, "switch_Ron": 10.0,
+                                     "switch_t1": 6.0e-3, "switch_t2": 1.3e-2, "WRmaxSteps": 40},
+    "P5: 2-way switch (DC U, C)": {"circuit_kind": 2, "switch_backend": 0, "amplitude": 1.0,
+                                   "switch_C": 1.0e-6, "switch_Ron": 10.0,
+                                   "switch_t1": 6.0e-3, "WRmaxSteps": 40},
+    "P6: 2-way switch (AC vs R)": {"circuit_kind": 3, "switch_backend": 0, "amplitude": 1.0,
+                                   "frequency": 50.0, "switch_R": 1.0e4, "switch_Ron": 1.0e-3,
+                                   "switch_t1": 6.0e-3, "WRmaxSteps": 40},
 }
 
 
