@@ -1,12 +1,9 @@
-Monolithic RL reference (true coupled physics: no co-sim, no ROM, no secant, no windows)
-* One series loop: Vsrc -> Rs -> Ls -> [field Rf -> Lf] -> gnd.
-* R/L = the TRUE physical params from sim_config (R_series/L_series + R_FEM/L_FEM).
-* Fine fixed-cap .tran = the reference the floored matched-secant co-sim must reproduce.
+Monolithic RL reference
 Vsrc s 0 SIN(0 1 50)
-Rs   s m 6e-3
-Ls   m p 1.6e-7
-Rf   p n 5.1e-4
-Lf   n 0 1.6e-7
+Rs s m 0.006
+Ls m p 1.6e-07
+Rf p n 0.00051
+Lf n 0 1.6e-07
 .tran 1e-7 0.02
-.print tran I(Lf) V(p) I(Vsrc)
+.print tran I(Lf) V(p)
 .end
