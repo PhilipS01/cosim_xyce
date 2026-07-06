@@ -162,6 +162,35 @@ VISIBLE_WHEN = {
 }
 
 
+# Hover help: key -> HTML shown in a tooltip next to the control's label (a "?" icon).
+HELP = {
+    "reconstruct_mode": (
+        "<div class='hh'>Field reconstruction (current-driven)</div>"
+        "<table>"
+        "<tr><th>mode</th><th>reconstruction</th><th>solves/win</th><th>note</th></tr>"
+        "<tr><td>pointwise (secant)</td><td>V at each field point, accumulated secant</td>"
+        "<td>N_field_eval</td><td>curve-following; interior uses the dummy's finite difference</td></tr>"
+        "<tr><td>linear ramp</td><td>straight line carried-start &rarr; window-end</td>"
+        "<td><b>1</b></td><td>cheapest; pure coupling reconstruction</td></tr>"
+        "<tr><td>average</td><td>line, start = &frac12;(carried + end)</td>"
+        "<td><b>1</b></td><td>linear + window-start damping (colleague)</td></tr>"
+        "<tr><td>pointwise (central)</td><td>V at each point, central difference</td>"
+        "<td>N_field_eval</td><td>lowest raw RMS, but the derivative is a dummy artifact</td></tr>"
+        "</table>"
+        "<div class='hn'>All modes carry the seam (C0-continuous). Accuracy is within ~1&ndash;2% "
+        "across modes; the extra solves buy little. Recommend <b>linear</b> / <b>average</b> "
+        "(1 field solve per window).</div>"
+    ),
+    "coupling_mode": (
+        "<div class='hh'>Coupling direction</div>"
+        "<div class='hn'>voltage-driven (Dirichlet): circuit sets V(p), field returns current; "
+        "matched-secant Bfield.<br>current-driven (Neumann): circuit sets I(Vmeas), field returns "
+        "V_field; plain voltage source &mdash; removes the high-frequency window-start V(p) spike on "
+        "current-source circuits.</div>"
+    ),
+}
+
+
 def write_config(params):
     path = os.path.join(HERE, "sim_config.txt")
     with open(path, "w") as f:
@@ -994,6 +1023,7 @@ def _controls_html():
         </div>"""]
     for k, label, default, kind, slider in PARAMS:
         default = initial.get(k, default)
+        help_icon = f'<span class="help" data-help="{k}">?</span>' if k in HELP else ''
         if kind == "choice":
             opts = "".join(
                 f'<option value="{val}"{" selected" if val == default else ""}>{text}</option>'
@@ -1001,7 +1031,7 @@ def _controls_html():
             )
             rows.append(f"""
         <div class="ctl" id="ctl_{k}">
-          <label for="f_{k}">{label}</label>
+          <label for="f_{k}">{label}{help_icon}</label>
           <div class="inputs">
             <select id="f_{k}" data-key="{k}" class="choice">{opts}</select>
           </div>
@@ -1018,7 +1048,7 @@ def _controls_html():
             )
         rows.append(f"""
         <div class="ctl" id="ctl_{k}">
-          <label for="f_{k}">{label}</label>
+          <label for="f_{k}">{label}{help_icon}</label>
           <div class="inputs">
             <input type="number" id="f_{k}" step="{step}" value="{default}"
                    data-key="{k}" oninput="syncFromBox(this)">
@@ -1131,6 +1161,18 @@ INDEX_HTML = """<!doctype html>
   .ce-props label { color:var(--muted); font-size:11px; display:flex; flex-direction:column; gap:3px; }
   .ce-props input, .ce-props select { background:#0d0f14; color:#e6e6e6; border:1px solid #2c333f;
        border-radius:5px; padding:4px 6px; font-family:ui-monospace,monospace; font-size:11.5px; width:112px; }
+  /* --- hover help tooltip --- */
+  .help { display:inline-block; margin-left:6px; width:14px; height:14px; border-radius:50%;
+          background:#2c333f; color:var(--muted); font-size:10px; line-height:14px; text-align:center;
+          cursor:help; user-select:none; }
+  #helpTip { display:none; position:fixed; z-index:100; width:540px; max-width:72vw;
+             background:#0d0f14; border:1px solid #3a4351; border-radius:8px; padding:10px 12px;
+             box-shadow:0 8px 24px rgba(0,0,0,.55); color:var(--fg); font-size:11.5px; line-height:1.45; }
+  #helpTip .hh { font-weight:600; margin-bottom:6px; color:var(--accent); }
+  #helpTip .hn { color:var(--muted); margin-top:6px; }
+  #helpTip table { border-collapse:collapse; width:100%; }
+  #helpTip th, #helpTip td { border:1px solid #2c333f; padding:3px 7px; text-align:left; vertical-align:top; }
+  #helpTip th { color:var(--muted); background:#12151b; font-weight:600; }
 </style></head>
 <body>
 <header>
@@ -1220,10 +1262,21 @@ INDEX_HTML = """<!doctype html>
     <details><summary>Solver log</summary><pre id="log"></pre></details>
   </div>
 </div>
+<div id="helpTip"></div>
 <script>
 const DEFAULTS = __DEFAULTS__;
 const PRESETS = __PRESETS__;
 const VISIBLE_WHEN = __VISIBILITY__;
+const HELP = __HELP__;
+
+// hover help: position:fixed tooltip so it escapes the controls panel's overflow clipping.
+function helpShow(t){ const key=t.getAttribute('data-help'); if(!HELP[key])return;
+  const tip=document.getElementById('helpTip'); tip.innerHTML=HELP[key]; tip.style.display='block';
+  const r=t.getBoundingClientRect(); const w=tip.offsetWidth, h=tip.offsetHeight;
+  let x=r.right+8; if(x+w>window.innerWidth-8) x=Math.max(8, r.left-w-8);
+  let y=r.top;    if(y+h>window.innerHeight-8) y=Math.max(8, window.innerHeight-h-8);
+  tip.style.left=x+'px'; tip.style.top=y+'px'; }
+function helpHide(){ document.getElementById('helpTip').style.display='none'; }
 
 // --- conditional visibility: hide options made irrelevant by another selection ---
 function ctlVal(k){ const el=document.getElementById('f_'+k); return el?Math.round(parseFloat(el.value)):NaN; }
@@ -1531,7 +1584,9 @@ const CE = (function(){
 
 window.addEventListener('load', ()=>{
   const ctrls=document.getElementById('controls');
-  if(ctrls){ ctrls.addEventListener('input', applyVisibility); ctrls.addEventListener('change', applyVisibility); }
+  if(ctrls){ ctrls.addEventListener('input', applyVisibility); ctrls.addEventListener('change', applyVisibility);
+    ctrls.addEventListener('mouseover', e=>{ if(e.target.classList.contains('help')) helpShow(e.target); });
+    ctrls.addEventListener('mouseout',  e=>{ if(e.target.classList.contains('help')) helpHide(); }); }
   const ck=document.getElementById('f_circuit_kind'); if(ck) ck.addEventListener('change', onTopoChange);
   const sk=document.getElementById('f_source_kind'); if(sk) sk.addEventListener('change', onTopoChange);
   applyVisibility(); loadCircuit(); CE.init();
@@ -1545,7 +1600,8 @@ INDEX_HTML = (INDEX_HTML
               .replace("__SWEEP_OPTS__", _sweep_options_html())
               .replace("__DEFAULTS__", json.dumps(DEFAULTS))
               .replace("__PRESETS__", json.dumps(PRESETS))
-              .replace("__VISIBILITY__", json.dumps(VISIBLE_WHEN)))
+              .replace("__VISIBILITY__", json.dumps(VISIBLE_WHEN))
+              .replace("__HELP__", json.dumps(HELP)))
 
 
 def _png_to_file(data_uri, path):
