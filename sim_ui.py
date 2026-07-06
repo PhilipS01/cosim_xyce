@@ -1063,6 +1063,21 @@ INDEX_HTML = """<!doctype html>
   table.netlist th, table.netlist td { border:1px solid #2c333f; padding:4px 8px; text-align:left; }
   table.netlist th { color:var(--muted); font-weight:600; background:#0d0f14; }
   table.netlist td.nm { color:var(--accent); }
+  /* --- custom circuit editor (SVG drag-drop) --- */
+  .cewrap { border:1px solid #2c333f; border-radius:8px; margin-bottom:12px; background:#0d0f14; }
+  .cebar { display:flex; flex-wrap:wrap; gap:6px; padding:8px; border-bottom:1px solid #2c333f; align-items:center; }
+  .cebar button { padding:5px 9px; font-size:12px; }
+  .cebar .pal { background:#22305a; color:#cfe0ff; }
+  .cebar .sep { flex:1; }
+  #ceSvg { width:100%; height:360px; display:block; background:#12151b; border-radius:0 0 8px 8px; touch-action:none; }
+  .ce-comp { cursor:grab; }
+  .ce-term { fill:#0d0f14; stroke:var(--accent); stroke-width:1.5; cursor:crosshair; }
+  .ce-term.pend { fill:var(--ok); stroke:var(--ok); }
+  .ce-sel rect, .ce-sel circle.body, .ce-sel line.plate { stroke:var(--ok) !important; }
+  .ce-wire { stroke:#8b94a3; stroke-width:2; }
+  .ce-pin { fill:var(--err); }
+  .ce-lbl { fill:#e6e6e6; font:10px ui-monospace,monospace; pointer-events:none; }
+  .ce-hint { color:var(--muted); font-size:11px; padding:6px 8px; line-height:1.5; }
 </style></head>
 <body>
 <header>
@@ -1119,6 +1134,24 @@ INDEX_HTML = """<!doctype html>
         </div>
       </div>
       <div id="circuitContent">
+        <div class="cewrap" id="ceWrap">
+          <div class="cebar">
+            <button class="pal" onclick="CE.add('V')">+V</button>
+            <button class="pal" onclick="CE.add('I')">+I</button>
+            <button class="pal" onclick="CE.add('R')">+R</button>
+            <button class="pal" onclick="CE.add('L')">+L</button>
+            <button class="pal" onclick="CE.add('C')">+C</button>
+            <span class="sep"></span>
+            <button class="secondary small" onclick="CE.del()">Delete sel</button>
+            <button class="secondary small" onclick="CE.clear()">Clear</button>
+            <button class="small" onclick="CE.apply()">&rarr; Use as circuit</button>
+          </div>
+          <svg id="ceSvg"></svg>
+          <div class="ce-hint">Palette adds a component &middot; drag bodies to move &middot; click a
+            terminal then another to wire &middot; double-click a component to edit values &middot;
+            select + "Delete sel" removes. Red pins <b>p</b>=port, <b>0</b>=ground.
+            "Use as circuit" writes the spec &amp; sets topology = custom.</div>
+        </div>
         <img class="plot" id="p_circuit" hidden>
         <div id="netlistTable"></div>
         <details><summary>Raw netlist + directives</summary><pre id="netlistRaw"></pre></details>
@@ -1298,7 +1331,86 @@ async function loadCircuit(){
     }
   } catch(e){ /* leave circuit box empty on failure */ }
 }
-window.addEventListener('load', loadCircuit);
+// ---- Custom circuit editor (increment 3b): hand-rolled SVG drag-drop -> circuit_spec ----
+const CE = (function(){
+  const NS='http://www.w3.org/2000/svg', GRID=20, HW=30, TR=6;
+  const defP={V:{amp:1,freq:50},I:{amp:1,freq:50},R:{val:10000},L:{val:1.6e-7},C:{val:1e-6}};
+  let comps=[], wires=[], seq={V:0,I:0,R:0,L:0,C:0}, sel=null, pend=null, drag=null;
+  const PIN={'PIN:p':{x:90,y:250,label:'p'},'PIN:0':{x:90,y:315,label:'0'}};
+  const S=()=>document.getElementById('ceSvg');
+  function E(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
+  const snap=v=>Math.round(v/GRID)*GRID;
+  const termXY=(c,i)=>({x:c.x+(i?HW:-HW),y:c.y});
+  function tpos(id){ if(id in PIN)return PIN[id]; const p=id.split('#'); const c=comps.find(x=>x.id===p[0]); return c?termXY(c,+p[1]):{x:0,y:0}; }
+  function add(type){ seq[type]++; comps.push({id:'k'+Math.random().toString(36).slice(2,7),type,name:type.toLowerCase()+seq[type],x:snap(320),y:snap(70+(comps.length%6)*45),p:Object.assign({},defP[type])}); sel=comps[comps.length-1].id; render(); }
+  function del(){ if(!sel)return; comps=comps.filter(c=>c.id!==sel); wires=wires.filter(w=>w.a.split('#')[0]!==sel&&w.b.split('#')[0]!==sel); sel=null; pend=null; render(); }
+  function clr(){ comps=[]; wires=[]; sel=null; pend=null; render(); }
+  function label(c){ return (c.type==='V'||c.type==='I') ? (c.name+' '+c.p.amp+'/'+c.p.freq+'Hz') : (c.name+' '+c.p.val); }
+  function render(){
+    const s=S(); if(!s)return; while(s.firstChild)s.removeChild(s.firstChild);
+    wires.forEach(w=>{const A=tpos(w.a),B=tpos(w.b); s.appendChild(E('line',{class:'ce-wire',x1:A.x,y1:A.y,x2:B.x,y2:B.y}));});
+    for(const id in PIN){const p=PIN[id];
+      s.appendChild(E('circle',{class:'ce-term'+(pend===id?' pend':''),cx:p.x,cy:p.y,r:TR,'data-term':id}));
+      s.appendChild(E('circle',{class:'ce-pin',cx:p.x,cy:p.y,r:3}));
+      const t=E('text',{class:'ce-lbl',x:p.x-20,y:p.y+4}); t.textContent=p.label; s.appendChild(t);}
+    comps.forEach(c=>{
+      const g=E('g',{class:'ce-comp'+(sel===c.id?' ce-sel':''),'data-comp':c.id});
+      g.appendChild(E('line',{x1:c.x-HW,y1:c.y,x2:c.x-16,y2:c.y,stroke:'#8b94a3','stroke-width':2}));
+      g.appendChild(E('line',{x1:c.x+16,y1:c.y,x2:c.x+HW,y2:c.y,stroke:'#8b94a3','stroke-width':2}));
+      if(c.type==='V'||c.type==='I') g.appendChild(E('circle',{class:'body',cx:c.x,cy:c.y,r:16,fill:'#0f1115',stroke:'var(--accent)','stroke-width':1.8}));
+      else if(c.type==='C'){ g.appendChild(E('line',{class:'plate',x1:c.x-4,y1:c.y-13,x2:c.x-4,y2:c.y+13,stroke:'var(--accent)','stroke-width':2})); g.appendChild(E('line',{class:'plate',x1:c.x+4,y1:c.y-13,x2:c.x+4,y2:c.y+13,stroke:'var(--accent)','stroke-width':2})); }
+      else g.appendChild(E('rect',{x:c.x-16,y:c.y-10,width:32,height:20,rx:3,fill:'#0f1115',stroke:'var(--accent)','stroke-width':1.8}));
+      const gl=E('text',{class:'ce-lbl',x:c.x,y:c.y+4,'text-anchor':'middle'}); gl.textContent=(c.type==='V'?'~':c.type==='I'?'↑':c.type==='C'?'':c.type); g.appendChild(gl);
+      [0,1].forEach(i=>{const tp=termXY(c,i); g.appendChild(E('circle',{class:'ce-term'+(pend===c.id+'#'+i?' pend':''),cx:tp.x,cy:tp.y,r:TR,'data-term':c.id+'#'+i}));});
+      const nl=E('text',{class:'ce-lbl',x:c.x,y:c.y-15,'text-anchor':'middle'}); nl.textContent=label(c); g.appendChild(nl);
+      s.appendChild(g);
+    });
+  }
+  function xy(e){const r=S().getBoundingClientRect(); const t=e.touches&&e.touches[0]; return {x:(t?t.clientX:e.clientX)-r.left,y:(t?t.clientY:e.clientY)-r.top};}
+  function onDown(e){
+    const term=e.target.getAttribute&&e.target.getAttribute('data-term');
+    if(term){ if(pend===null)pend=term; else{ if(pend!==term)wires.push({a:pend,b:term}); pend=null; } render(); e.preventDefault(); return; }
+    const g=e.target.closest&&e.target.closest('[data-comp]');
+    if(g){ const id=g.getAttribute('data-comp'); sel=id; const c=comps.find(x=>x.id===id); const p=xy(e); drag={id,dx:c.x-p.x,dy:c.y-p.y}; render(); e.preventDefault(); return; }
+    sel=null; pend=null; render();
+  }
+  function onMove(e){ if(!drag)return; const c=comps.find(x=>x.id===drag.id); if(!c)return; const p=xy(e); c.x=snap(p.x+drag.dx); c.y=snap(p.y+drag.dy); render(); e.preventDefault(); }
+  function onUp(){ drag=null; }
+  function onDbl(e){ const g=e.target.closest&&e.target.closest('[data-comp]'); if(!g)return; const c=comps.find(x=>x.id===g.getAttribute('data-comp')); if(!c)return;
+    if(c.type==='V'||c.type==='I'){ const a=prompt(c.name+' amplitude',c.p.amp); if(a!==null)c.p.amp=a.trim(); const f=prompt(c.name+' frequency (Hz)',c.p.freq); if(f!==null)c.p.freq=f.trim(); }
+    else { const v=prompt(c.name+' value',c.p.val); if(v!==null)c.p.val=v.trim(); }
+    render();
+  }
+  function serialize(){
+    const par={}, find=x=>{par[x]=par[x]||x; return par[x]===x?x:(par[x]=find(par[x]));}, uni=(a,b)=>{par[find(a)]=find(b);};
+    find('PIN:p'); find('PIN:0'); comps.forEach(c=>{find(c.id+'#0');find(c.id+'#1');});
+    wires.forEach(w=>uni(w.a,w.b));
+    const rn={}; rn[find('PIN:p')]='p'; rn[find('PIN:0')]='0'; let n=1;
+    const nf=id=>{const r=find(id); if(!(r in rn))rn[r]='n'+(n++); return rn[r];};
+    return comps.map(c=>{const a=nf(c.id+'#0'),b=nf(c.id+'#1');
+      if(c.type==='V')return 'VSIN '+c.name+' '+a+' '+b+' '+c.p.amp+' '+c.p.freq;
+      if(c.type==='I')return 'ISIN '+c.name+' '+a+' '+b+' '+c.p.amp+' '+c.p.freq;
+      return c.type+' '+c.name+' '+a+' '+b+' '+c.p.val;
+    }).join('\\n');
+  }
+  function apply(){
+    if(!comps.length){ setStatus('Editor empty — add components first.','err'); return; }
+    const ta=document.getElementById('f_circuit_spec');
+    if(ta) ta.value='# generated by circuit editor\\n'+serialize()+'\\n';
+    const ks=document.getElementById('f_circuit_kind'); if(ks) ks.value='4';
+    setStatus('Circuit applied to spec (topology = custom).','');
+    loadCircuit();
+  }
+  function init(){ const s=S(); if(!s)return;
+    s.addEventListener('mousedown',onDown); s.addEventListener('mousemove',onMove); window.addEventListener('mouseup',onUp);
+    s.addEventListener('dblclick',onDbl);
+    s.addEventListener('touchstart',onDown,{passive:false}); s.addEventListener('touchmove',onMove,{passive:false}); window.addEventListener('touchend',onUp);
+    render();
+  }
+  return {add,del,clear:clr,apply,init};
+})();
+
+window.addEventListener('load', ()=>{ loadCircuit(); CE.init(); });
 </script>
 </body></html>
 """
