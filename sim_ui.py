@@ -1078,6 +1078,11 @@ INDEX_HTML = """<!doctype html>
   .ce-pin { fill:var(--err); }
   .ce-lbl { fill:#e6e6e6; font:10px ui-monospace,monospace; pointer-events:none; }
   .ce-hint { color:var(--muted); font-size:11px; padding:6px 8px; line-height:1.5; }
+  .ce-props { padding:8px 10px; border-top:1px solid #2c333f; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:flex-end; }
+  .ce-props .cprow { flex-basis:100%; color:var(--muted); font-size:12px; }
+  .ce-props label { color:var(--muted); font-size:11px; display:flex; flex-direction:column; gap:3px; }
+  .ce-props input, .ce-props select { background:#0d0f14; color:#e6e6e6; border:1px solid #2c333f;
+       border-radius:5px; padding:4px 6px; font-family:ui-monospace,monospace; font-size:11.5px; width:112px; }
 </style></head>
 <body>
 <header>
@@ -1147,9 +1152,10 @@ INDEX_HTML = """<!doctype html>
             <button class="small" onclick="CE.apply()">&rarr; Use as circuit</button>
           </div>
           <svg id="ceSvg"></svg>
+          <div class="ce-props" id="ceProps"></div>
           <div class="ce-hint">Palette adds a component &middot; drag bodies to move &middot; click a
-            terminal then another to wire &middot; double-click a component to edit values &middot;
-            select + "Delete sel" removes. Red pins <b>p</b>=port, <b>0</b>=ground.
+            terminal then another to wire &middot; select a component to edit its type/values below
+            &middot; select + "Delete sel" removes. Red pins <b>p</b>=port, <b>0</b>=ground.
             "Use as circuit" writes the spec &amp; sets topology = custom.</div>
         </div>
         <img class="plot" id="p_circuit" hidden>
@@ -1342,10 +1348,14 @@ const CE = (function(){
   const snap=v=>Math.round(v/GRID)*GRID;
   const termXY=(c,i)=>({x:c.x+(i?HW:-HW),y:c.y});
   function tpos(id){ if(id in PIN)return PIN[id]; const p=id.split('#'); const c=comps.find(x=>x.id===p[0]); return c?termXY(c,+p[1]):{x:0,y:0}; }
-  function add(type){ seq[type]++; comps.push({id:'k'+Math.random().toString(36).slice(2,7),type,name:type.toLowerCase()+seq[type],x:snap(320),y:snap(70+(comps.length%6)*45),p:Object.assign({},defP[type])}); sel=comps[comps.length-1].id; render(); }
-  function del(){ if(!sel)return; comps=comps.filter(c=>c.id!==sel); wires=wires.filter(w=>w.a.split('#')[0]!==sel&&w.b.split('#')[0]!==sel); sel=null; pend=null; render(); }
-  function clr(){ comps=[]; wires=[]; sel=null; pend=null; render(); }
-  function label(c){ return (c.type==='V'||c.type==='I') ? (c.name+' '+c.p.amp+'/'+c.p.freq+'Hz') : (c.name+' '+c.p.val); }
+  function add(type){ seq[type]++; const c={id:'k'+Math.random().toString(36).slice(2,7),type,name:type.toLowerCase()+seq[type],x:snap(320),y:snap(70+(comps.length%6)*45),sub:(type==='V'?'SIN':null),p:Object.assign({},defP[type])}; comps.push(c); sel=c.id; render(); renderProps(); }
+  function del(){ if(!sel)return; comps=comps.filter(c=>c.id!==sel); wires=wires.filter(w=>w.a.split('#')[0]!==sel&&w.b.split('#')[0]!==sel); sel=null; pend=null; render(); renderProps(); }
+  function clr(){ comps=[]; wires=[]; sel=null; pend=null; render(); renderProps(); }
+  function label(c){
+    if(c.type==='V'){ if(c.sub==='DC')return c.name+' DC '+c.p.val; if(c.sub==='PULSE')return c.name+' pulse'; return c.name+' '+c.p.amp+'/'+c.p.freq+'Hz'; }
+    if(c.type==='I') return c.name+' '+c.p.amp+'/'+c.p.freq+'Hz';
+    return c.name+' '+c.p.val;
+  }
   function render(){
     const s=S(); if(!s)return; while(s.firstChild)s.removeChild(s.firstChild);
     wires.forEach(w=>{const A=tpos(w.a),B=tpos(w.b); s.appendChild(E('line',{class:'ce-wire',x1:A.x,y1:A.y,x2:B.x,y2:B.y}));});
@@ -1371,15 +1381,44 @@ const CE = (function(){
     const term=e.target.getAttribute&&e.target.getAttribute('data-term');
     if(term){ if(pend===null)pend=term; else{ if(pend!==term)wires.push({a:pend,b:term}); pend=null; } render(); e.preventDefault(); return; }
     const g=e.target.closest&&e.target.closest('[data-comp]');
-    if(g){ const id=g.getAttribute('data-comp'); sel=id; const c=comps.find(x=>x.id===id); const p=xy(e); drag={id,dx:c.x-p.x,dy:c.y-p.y}; render(); e.preventDefault(); return; }
-    sel=null; pend=null; render();
+    if(g){ const id=g.getAttribute('data-comp'); sel=id; const c=comps.find(x=>x.id===id); const p=xy(e); drag={id,dx:c.x-p.x,dy:c.y-p.y}; render(); renderProps(); e.preventDefault(); return; }
+    sel=null; pend=null; render(); renderProps();
   }
   function onMove(e){ if(!drag)return; const c=comps.find(x=>x.id===drag.id); if(!c)return; const p=xy(e); c.x=snap(p.x+drag.dx); c.y=snap(p.y+drag.dy); render(); e.preventDefault(); }
   function onUp(){ drag=null; }
-  function onDbl(e){ const g=e.target.closest&&e.target.closest('[data-comp]'); if(!g)return; const c=comps.find(x=>x.id===g.getAttribute('data-comp')); if(!c)return;
-    if(c.type==='V'||c.type==='I'){ const a=prompt(c.name+' amplitude',c.p.amp); if(a!==null)c.p.amp=a.trim(); const f=prompt(c.name+' frequency (Hz)',c.p.freq); if(f!==null)c.p.freq=f.trim(); }
-    else { const v=prompt(c.name+' value',c.p.val); if(v!==null)c.p.val=v.trim(); }
-    render();
+  // --- properties panel: edit the selected component's type + type-dependent attributes ---
+  const subDef={SIN:{amp:1,freq:50},DC:{val:1},PULSE:{v1:0,v2:1,td:0,tr:1e-4}};
+  const subName={SIN:'sinusoidal',DC:'DC',PULSE:'pulse'};
+  function fld(lbl,inner){ return '<label>'+lbl+inner+'</label>'; }
+  function inp(key,val){ return '<input data-cp="'+key+'" value="'+val+'">'; }
+  function renderProps(){
+    const host=document.getElementById('ceProps'); if(!host)return;
+    const c=comps.find(x=>x.id===sel);
+    if(!c){ host.innerHTML='<span class="ce-hint" style="padding:0">Select a component to edit its type &amp; values.</span>'; return; }
+    let h='<div class="cprow"><b>'+c.name+'</b> — '+c.type+'</div>';
+    if(c.type==='V'){
+      h+='<label>Type<select data-cp="sub">'
+        +['SIN','DC','PULSE'].map(s=>'<option value="'+s+'"'+(c.sub===s?' selected':'')+'>'+subName[s]+'</option>').join('')
+        +'</select></label>';
+      if(c.sub==='SIN')       h+=fld('Amplitude',inp('amp',c.p.amp))+fld('Frequency (Hz)',inp('freq',c.p.freq));
+      else if(c.sub==='DC')   h+=fld('Value (V)',inp('val',c.p.val));
+      else                    h+=fld('V1',inp('v1',c.p.v1))+fld('V2',inp('v2',c.p.v2))
+                                +fld('Delay td (s)',inp('td',c.p.td))+fld('Rise tr (s)',inp('tr',c.p.tr));
+    } else if(c.type==='I'){
+      h+=fld('Amplitude',inp('amp',c.p.amp))+fld('Frequency (Hz)',inp('freq',c.p.freq));
+    } else {
+      h+=fld(c.type+' value',inp('val',c.p.val));
+    }
+    host.innerHTML=h;
+    host.querySelectorAll('[data-cp]').forEach(el2=>{
+      el2.addEventListener(el2.tagName==='SELECT'?'change':'input',()=>onProp(el2));
+    });
+  }
+  function onProp(el2){
+    const c=comps.find(x=>x.id===sel); if(!c)return;
+    const key=el2.getAttribute('data-cp'), v=el2.value;
+    if(key==='sub'){ c.sub=v; c.p=Object.assign({},subDef[v]); renderProps(); render(); return; }
+    c.p[key]=v.trim(); render();   // live-update the on-canvas label
   }
   function serialize(){
     const par={}, find=x=>{par[x]=par[x]||x; return par[x]===x?x:(par[x]=find(par[x]));}, uni=(a,b)=>{par[find(a)]=find(b);};
@@ -1388,7 +1427,11 @@ const CE = (function(){
     const rn={}; rn[find('PIN:p')]='p'; rn[find('PIN:0')]='0'; let n=1;
     const nf=id=>{const r=find(id); if(!(r in rn))rn[r]='n'+(n++); return rn[r];};
     return comps.map(c=>{const a=nf(c.id+'#0'),b=nf(c.id+'#1');
-      if(c.type==='V')return 'VSIN '+c.name+' '+a+' '+b+' '+c.p.amp+' '+c.p.freq;
+      if(c.type==='V'){
+        if(c.sub==='DC')    return 'VDC '+c.name+' '+a+' '+b+' '+c.p.val;
+        if(c.sub==='PULSE') return 'VPULSE '+c.name+' '+a+' '+b+' '+c.p.v1+' '+c.p.v2+' '+c.p.td+' '+c.p.tr;
+        return 'VSIN '+c.name+' '+a+' '+b+' '+c.p.amp+' '+c.p.freq;
+      }
       if(c.type==='I')return 'ISIN '+c.name+' '+a+' '+b+' '+c.p.amp+' '+c.p.freq;
       return c.type+' '+c.name+' '+a+' '+b+' '+c.p.val;
     }).join('\\n');
@@ -1403,9 +1446,8 @@ const CE = (function(){
   }
   function init(){ const s=S(); if(!s)return;
     s.addEventListener('mousedown',onDown); s.addEventListener('mousemove',onMove); window.addEventListener('mouseup',onUp);
-    s.addEventListener('dblclick',onDbl);
     s.addEventListener('touchstart',onDown,{passive:false}); s.addEventListener('touchmove',onMove,{passive:false}); window.addEventListener('touchend',onUp);
-    render();
+    render(); renderProps();
   }
   return {add,del,clear:clr,apply,init};
 })();
