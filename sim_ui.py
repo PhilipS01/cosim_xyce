@@ -66,6 +66,10 @@ PARAMS = [
     ("nonlin_model",                    "FEM nonlinearity",             0,        "choice",
         {0: "linear", 1: "magnetic saturation"}),
     ("I_sat",                           "I_sat saturation current (A)", 100.0,    "float", None),
+    ("time_mode",                       "Run duration",                 0,        "choice",
+        {0: "source periods", 1: "absolute end time"}),
+    ("t_end",                           "End time t_end (s)",           2.0e-2,   "float", None),
+    ("N_field_windows",                 "Field windows (total)",        50,       "int",   (1, 400, 1)),
     ("N_periods",                       "Number of source periods",     1,        "int",   (1, 10, 1)),
     ("N_field_steps_per_source_period", "Field steps / source period",  50,       "int",   (2, 200, 1)),
     ("N_field_eval_intervals",          "FEM eval intervals / window",  1,        "int",   (1, 64, 1)),
@@ -86,14 +90,15 @@ SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
 # (switches) arrive in increment 2. Keys map to the flat config the C++ generator consumes.
 PRESETS = {
     "P1: Sine V + RL": {"circuit_kind": 0, "source_kind": 0, "amplitude": 1.0, "frequency": 50.0,
-                        "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0},
+                        "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0, "time_mode": 0},
     # Bare current source directly on the port: series R/L/C are meaningless for a current drive
     # (the current is forced regardless) and an ideal I-source in series with L is degenerate.
     "P2: Sine I (bare)": {"circuit_kind": 0, "source_kind": 1, "amplitude": 1.0, "frequency": 50.0,
-                          "R_series": 0.0, "L_series": 0.0, "C_series": 0.0},
+                          "R_series": 0.0, "L_series": 0.0, "C_series": 0.0, "time_mode": 0},
     "P3: Step/ramp V + RL": {"circuit_kind": 0, "source_kind": 2, "step_v_initial": 0.0,
                              "step_v_final": 1.0, "step_delay": 0.0, "step_rise": 1.0e-4,
                              "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0,
+                             "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
                              # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters
                              "WRmaxSteps": 40},
     # --- Increment 2: switch topologies. NOTE the passive values are numerical-survival defaults,
@@ -102,19 +107,53 @@ PRESETS = {
     # ~undamped LC ring dt-collapses. Tune C / Ron / times to your field for a meaningful excitation.
     "P4: 3-way switch (sine U, C)": {"circuit_kind": 1, "switch_backend": 0, "amplitude": 1.0,
                                      "frequency": 50.0, "switch_C": 1.0e-6, "switch_Ron": 10.0,
-                                     "switch_t1": 6.0e-3, "switch_t2": 1.3e-2, "WRmaxSteps": 40},
+                                     "switch_t1": 6.0e-3, "switch_t2": 1.3e-2, "WRmaxSteps": 40,
+                                     "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50},
     "P5: 2-way switch (DC U, C)": {"circuit_kind": 2, "switch_backend": 0, "amplitude": 1.0,
                                    "switch_C": 1.0e-6, "switch_Ron": 10.0,
-                                   "switch_t1": 6.0e-3, "WRmaxSteps": 40},
+                                   "switch_t1": 6.0e-3, "WRmaxSteps": 40,
+                                   "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50},
     "P6: 2-way switch (AC vs R)": {"circuit_kind": 3, "switch_backend": 0, "amplitude": 1.0,
                                    "frequency": 50.0, "switch_R": 1.0e4, "switch_Ron": 1.0e-3,
-                                   "switch_t1": 6.0e-3, "WRmaxSteps": 40},
+                                   "switch_t1": 6.0e-3, "WRmaxSteps": 40,
+                                   "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50},
 }
 
 
 # ---------------------------------------------------------------------------
 # Running the solver
 # ---------------------------------------------------------------------------
+# Conditional visibility: key -> list of AND-condition dicts; a control is shown iff ANY dict fully
+# matches the current control values (OR-of-ANDs). Keys absent here are always visible. The custom
+# spec box + SVG editor are handled separately in JS (visible only when circuit_kind == 4).
+VISIBLE_WHEN = {
+    "source_kind": [{"circuit_kind": [0]}],
+    "R_series":    [{"circuit_kind": [0]}],
+    "L_series":    [{"circuit_kind": [0]}],
+    "C_series":    [{"circuit_kind": [0]}],
+    "step_v_initial": [{"circuit_kind": [0], "source_kind": [2]}],
+    "step_v_final":   [{"circuit_kind": [0], "source_kind": [2]}],
+    "step_delay":     [{"circuit_kind": [0], "source_kind": [2]}],
+    "step_rise":      [{"circuit_kind": [0], "source_kind": [2]}],
+    "amplitude":   [{"circuit_kind": [0, 1, 2, 3]}],
+    "frequency":   [{"time_mode": [0]}, {"circuit_kind": [0], "source_kind": [0, 1]},
+                    {"circuit_kind": [1, 3]}],
+    "switch_backend": [{"circuit_kind": [1, 2, 3]}],
+    "switch_t1":      [{"circuit_kind": [1, 2, 3]}],
+    "switch_Ron":     [{"circuit_kind": [1, 2, 3]}],
+    "switch_Roff":    [{"circuit_kind": [1, 2, 3]}],
+    "switch_trise":   [{"circuit_kind": [1, 2, 3]}],
+    "switch_t2":      [{"circuit_kind": [1]}],
+    "switch_C":       [{"circuit_kind": [1, 2]}],
+    "switch_R":       [{"circuit_kind": [3]}],
+    "N_periods":                       [{"time_mode": [0]}],
+    "N_field_steps_per_source_period": [{"time_mode": [0]}],
+    "t_end":            [{"time_mode": [1]}],
+    "N_field_windows":  [{"time_mode": [1]}],
+    "I_sat": [{"nonlin_model": [1]}],
+}
+
+
 def write_config(params):
     path = os.path.join(HERE, "sim_config.txt")
     with open(path, "w") as f:
@@ -953,7 +992,7 @@ def _controls_html():
                 for val, text in slider.items()  # for "choice", 5th field is the options dict
             )
             rows.append(f"""
-        <div class="ctl">
+        <div class="ctl" id="ctl_{k}">
           <label for="f_{k}">{label}</label>
           <div class="inputs">
             <select id="f_{k}" data-key="{k}" class="choice">{opts}</select>
@@ -970,7 +1009,7 @@ def _controls_html():
                 f'oninput="syncFromSlider(this)">'
             )
         rows.append(f"""
-        <div class="ctl">
+        <div class="ctl" id="ctl_{k}">
           <label for="f_{k}">{label}</label>
           <div class="inputs">
             <input type="number" id="f_{k}" step="{step}" value="{default}"
@@ -1176,6 +1215,21 @@ INDEX_HTML = """<!doctype html>
 <script>
 const DEFAULTS = __DEFAULTS__;
 const PRESETS = __PRESETS__;
+const VISIBLE_WHEN = __VISIBILITY__;
+
+// --- conditional visibility: hide options made irrelevant by another selection ---
+function ctlVal(k){ const el=document.getElementById('f_'+k); return el?Math.round(parseFloat(el.value)):NaN; }
+function condMatch(cond){ return cond.some(d => Object.keys(d).every(k => d[k].includes(ctlVal(k)))); }
+function applyVisibility(){
+  for(const k in VISIBLE_WHEN){ const box=document.getElementById('ctl_'+k);
+    if(box) box.style.display = condMatch(VISIBLE_WHEN[k]) ? '' : 'none'; }
+  const custom = ctlVal('circuit_kind')===4;
+  const sb=document.getElementById('specBox'); if(sb) sb.style.display = custom?'':'none';
+  const ce=document.getElementById('ceWrap'); if(ce) ce.style.display = custom?'':'none';
+}
+// smart default: sine simple source -> periods; step/switch/custom -> absolute end time
+function suggestTimeMode(){ const ck=ctlVal('circuit_kind'), sk=ctlVal('source_kind'); return (ck===0 && (sk===0||sk===1))?0:1; }
+function onTopoChange(){ const tm=document.getElementById('f_time_mode'); if(tm) tm.value=String(suggestTimeMode()); applyVisibility(); }
 
 function applyPreset(){
   const name = document.getElementById('presetSel').value;
@@ -1186,6 +1240,7 @@ function applyPreset(){
     if (b){ b.value = p[k]; if (b.tagName !== 'SELECT') syncFromBox(b); }
   }
   setStatus('Preset applied: '+name, '');
+  applyVisibility();
   loadCircuit();
 }
 
@@ -1215,6 +1270,7 @@ function resetDefaults(){
     if (b){ b.value = DEFAULTS[k]; if (b.tagName !== 'SELECT') syncFromBox(b); }
   }
   setStatus('Reset to defaults.', '');
+  applyVisibility();
 }
 function setStatus(msg, cls){
   const s = document.getElementById('status'); s.textContent = msg; s.className = cls;
@@ -1459,7 +1515,13 @@ const CE = (function(){
   return {add,del,clear:clr,apply,init};
 })();
 
-window.addEventListener('load', ()=>{ loadCircuit(); CE.init(); });
+window.addEventListener('load', ()=>{
+  const ctrls=document.getElementById('controls');
+  if(ctrls){ ctrls.addEventListener('input', applyVisibility); ctrls.addEventListener('change', applyVisibility); }
+  const ck=document.getElementById('f_circuit_kind'); if(ck) ck.addEventListener('change', onTopoChange);
+  const sk=document.getElementById('f_source_kind'); if(sk) sk.addEventListener('change', onTopoChange);
+  applyVisibility(); loadCircuit(); CE.init();
+});
 </script>
 </body></html>
 """
@@ -1468,7 +1530,8 @@ INDEX_HTML = (INDEX_HTML
               .replace("__CONTROLS__", _controls_html())
               .replace("__SWEEP_OPTS__", _sweep_options_html())
               .replace("__DEFAULTS__", json.dumps(DEFAULTS))
-              .replace("__PRESETS__", json.dumps(PRESETS)))
+              .replace("__PRESETS__", json.dumps(PRESETS))
+              .replace("__VISIBILITY__", json.dumps(VISIBLE_WHEN)))
 
 
 def _png_to_file(data_uri, path):

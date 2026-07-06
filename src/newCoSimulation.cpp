@@ -65,6 +65,9 @@ bool LoadConfig(const string& filename)
         else if (key == "switch_Ron")                       g_cfg.switch_Ron = val;
         else if (key == "switch_Roff")                      g_cfg.switch_Roff = val;
         else if (key == "switch_trise")                     g_cfg.switch_trise = val;
+        else if (key == "time_mode")                        g_cfg.time_mode = (unsigned)val;
+        else if (key == "t_end")                            g_cfg.t_end = val;
+        else if (key == "N_field_windows")                  g_cfg.N_field_windows = (unsigned)val;
         else if (key == "N_periods")                        g_cfg.N_periods = (unsigned)val;
         else if (key == "N_field_steps_per_source_period")  g_cfg.N_field_steps_per_source_period = (unsigned)val;
         else if (key == "N_field_eval_intervals")           g_cfg.N_field_eval_intervals = (unsigned)val;
@@ -280,11 +283,21 @@ void MasterProcess()
     const double V_src_amplitude = g_cfg.amplitude;
     const double Frequency = g_cfg.frequency;
 
-    // Time stepping (the circuit side is handled dynamically by Xyce)
+    // Time stepping (the circuit side is handled dynamically by Xyce). Duration per time_mode:
+    //   0 (source periods):  T = N_periods/f,  N_steps_field = N_fsp*N_periods (sinusoidal sources).
+    //   1 (absolute end):    T = t_end,        N_steps_field = N_field_windows (step/switch/custom).
     const unsigned N_periods = g_cfg.N_periods;
     const unsigned N_field_steps_per_source_period = g_cfg.N_field_steps_per_source_period;
-    const unsigned N_steps_field = N_field_steps_per_source_period * N_periods;
-    const double dt_field = (1 / Frequency) / N_field_steps_per_source_period;
+    unsigned N_steps_field;
+    double dt_field;
+    if (g_cfg.time_mode == 1) {
+        N_steps_field = (g_cfg.N_field_windows >= 1) ? g_cfg.N_field_windows : 1u;
+        if (g_cfg.t_end <= 0.0) throw runtime_error("MasterProcess: t_end must be > 0 in absolute time_mode.");
+        dt_field = g_cfg.t_end / N_steps_field;
+    } else {
+        N_steps_field = N_field_steps_per_source_period * N_periods;
+        dt_field = (1.0 / Frequency) / N_field_steps_per_source_period;
+    }
 
     // WR parameters
     const unsigned WRmaxSteps = g_cfg.WRmaxSteps;
@@ -752,6 +765,14 @@ static string fmtg(double x)
     return os.str();
 }
 
+// Absolute end time of the whole run (matches MasterProcess): absolute mode -> t_end,
+// periods mode -> N_periods/frequency. Used by the switch-control PWL end time.
+static double simEndTime()
+{
+    if (g_cfg.time_mode == 1) return (g_cfg.t_end > 0.0) ? g_cfg.t_end : 1.0;
+    return (g_cfg.frequency > 0.0) ? (double)g_cfg.N_periods / g_cfg.frequency : 1.0;
+}
+
 // --- Switch-throw emitter (increment 2) -------------------------------------------------------
 // Emits a two-terminal connection between n1 and n2 that is CLOSED (low R) during [ta, tb) and
 // OPEN (high R) otherwise. Backend per g_cfg.switch_backend:
@@ -796,8 +817,7 @@ static void emitThrow(ofstream& out, const string& tag, const string& n1, const 
 // The field/interface (Vmeas, Bfield) stays common and is emitted by WriteCircuitNetlist.
 static void emitSwitchTopology(ofstream& out)
 {
-    const double tEnd = (g_cfg.frequency > 0.0)
-                        ? (double)g_cfg.N_periods / g_cfg.frequency : 1.0;
+    const double tEnd = simEndTime();
     const double t1 = g_cfg.switch_t1;
     const double t2 = g_cfg.switch_t2;
 

@@ -75,7 +75,14 @@ struct SimConfig
     // an abrupt throw disconnects an ideal branch carrying inductive field current -> voltage kick
     // -> Xyce dt-collapse at the switch instant. The gate ramps over switch_trise at each edge.
     double switch_trise = 1.0e-5;
-    // Time stepping
+    // Time stepping / run duration.
+    //   time_mode = 0 (source periods): duration = N_periods / frequency, N_steps_field =
+    //               N_field_steps_per_source_period * N_periods  (meaningful for sinusoidal sources).
+    //   time_mode = 1 (absolute end time): duration = t_end, N_steps_field = N_field_windows
+    //               (for step/switch/custom sources that have no "period").
+    unsigned time_mode = 0;
+    double   t_end = 2.0e-2;
+    unsigned N_field_windows = 50;
     unsigned N_periods = 1;
     unsigned N_field_steps_per_source_period = 50;
     // Coupling-grid resolutions
