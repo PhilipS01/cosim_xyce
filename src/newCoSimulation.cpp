@@ -888,6 +888,18 @@ static void emitCustomTopology(ofstream& out)
             if ((tok.size() - 4) % 2 != 0)
                 throw runtime_error("emitCustomTopology: circuit_spec.txt line " + to_string(lineno)
                                     + " (" + type + ") needs an even number of (time value) points.");
+            // Validate each point is a number -> a clear error instead of Xyce's opaque "Cannot convert
+            // 'X' to double" (e.g. a '2-3' typo for '2e-3'). SPICE magnitude suffixes (k/m/u/n/p/f/g/t)
+            // are allowed as a trailing letter.
+            for (size_t i = 4; i < tok.size(); ++i) {
+                char* e = nullptr; std::strtod(tok[i].c_str(), &e);
+                bool ok = (e != tok[i].c_str());
+                if (ok && *e != '\0') { char c = *e; if (c >= 'a' && c <= 'z') c -= 32;
+                    ok = (c=='T'||c=='G'||c=='K'||c=='M'||c=='U'||c=='N'||c=='P'||c=='F'); }
+                if (!ok)
+                    throw runtime_error("emitCustomTopology: circuit_spec.txt line " + to_string(lineno)
+                        + " (" + type + "): PWL point '" + tok[i] + "' is not a number (use e.g. 2e-3, not 2-3).");
+            }
             const char dev = (type == "VPWL") ? 'V' : 'I';
             out << dev << tok[1] << " " << tok[2] << " " << tok[3] << " PWL(";
             for (size_t i = 4; i < tok.size(); ++i) out << tok[i] << (i + 1 < tok.size() ? " " : "");
