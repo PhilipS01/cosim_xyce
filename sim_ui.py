@@ -81,7 +81,8 @@ PARAMS = [
     ("coupling_mode",                   "Coupling direction",           0,        "choice",
         {0: "voltage-driven", 1: "current-driven"}),
     ("reconstruct_mode",                "Field reconstruction",         0,        "choice",
-        {0: "pointwise", 1: "linear ramp", 2: "average (linear+const)"}),
+        {0: "pointwise (secant)", 1: "linear ramp", 2: "average (linear+const)",
+         3: "pointwise (central diff)"}),
 ]
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
 KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}

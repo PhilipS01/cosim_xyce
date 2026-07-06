@@ -104,6 +104,8 @@ struct SimConfig
     //       voltage-driven solver, needs only I0; follows the current's curve).
     //   1 = linear: straight ramp from the previous-window field voltage to this window's end value.
     //   2 = average: 0.5*(linear + const) -- window-start raised to the midpoint (colleague's blend).
+    //   3 = central-diff pointwise (most accurate): local central difference for dI/dt (no window-start
+    //       lag, O(h^2) interior); benefits from N_field_eval > 1.
     unsigned reconstruct_mode = 0;
 };
 

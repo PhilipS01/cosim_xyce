@@ -634,20 +634,31 @@ void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_
     const double   t_win_start = I_eval.t.front();
     const double   t_end       = I_eval.t.back();
 
-    // Pointwise field voltage V(t) = R_FEM*I + dlambda/dt (needs only I0). dlambda/dt via the
-    // accumulated secant from the window start; at the first point (t_acc=0 -> 0/0) use a forward
-    // difference over the first interval (the same 0/0 guard the voltage-driven solver / t_floor use).
+    // Pointwise field voltage V(t) = R_FEM*I + dlambda/dt (needs only I0). dlambda/dt per point:
+    //   reconstruct_mode 3 (central-diff, most accurate): local difference
+    //     (lambda(I_{j+1})-lambda(I_{j-1}))/(t_{j+1}-t_{j-1}) -- forward at the first point, backward at
+    //     the last -- O(h^2) interior, no window-start lag. Current-driven has no Bfield secant to match,
+    //     so it is free to use the accurate local derivative.
+    //   otherwise: accumulated secant from the window start (same form as the voltage-driven solver),
+    //     with a forward-difference guard for the j=0 0/0.
+    const bool use_central = (g_cfg.reconstruct_mode == 3);
     Waveform vfield;
     for (size_t j = 0; j < N; ++j) {
-        const double t = I_eval.t[j];
         double dl_dt;
-        if (j == 0) {
+        if (use_central) {
+            if (j == 0)
+                dl_dt = dlam(I_eval.y[1], I_eval.y[0]) / (I_eval.t[1] - I_eval.t[0]);
+            else if (j + 1 == N)
+                dl_dt = dlam(I_eval.y[j], I_eval.y[j - 1]) / (I_eval.t[j] - I_eval.t[j - 1]);
+            else
+                dl_dt = dlam(I_eval.y[j + 1], I_eval.y[j - 1]) / (I_eval.t[j + 1] - I_eval.t[j - 1]);
+        } else if (j == 0) {
             const double dt01 = I_eval.t[1] - t_win_start;
             dl_dt = (dt01 > 0.0) ? dlam(I_eval.y[1], I_win_start) / dt01 : 0.0;
         } else {
-            dl_dt = dlam(I_eval.y[j], I_win_start) / (t - t_win_start);
+            dl_dt = dlam(I_eval.y[j], I_win_start) / (I_eval.t[j] - t_win_start);
         }
-        vfield.push(t, R_FEM * I_eval.y[j] + dl_dt);
+        vfield.push(I_eval.t[j], R_FEM * I_eval.y[j] + dl_dt);
     }
     const double V_field_end = vfield.y.back();
 
