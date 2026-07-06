@@ -48,7 +48,8 @@ PARAMS = [
     ("L_series",                        "L_series src->port (H)",       1.6e-7,   "float", None),
     ("C_series",                        "C_series src->port (F, 0=off)",0.0,      "float", None),
     ("circuit_kind",                    "Circuit topology",             0,        "choice",
-        {0: "simple source", 1: "#4 3-way (sine U,C)", 2: "#5 2-way (DC U,C)", 3: "#6 2-way (AC vs R)"}),
+        {0: "simple source", 1: "#4 3-way (sine U,C)", 2: "#5 2-way (DC U,C)", 3: "#6 2-way (AC vs R)",
+         4: "custom (node-graph spec)"}),
     ("switch_backend",                  "Switch backend",               0,        "choice",
         {0: "behavioral R", 1: "native S"}),
     ("switch_t1",                       "Switch t1 (s)",                6.0e-3,   "float", None),
@@ -173,6 +174,38 @@ def emit_netlist():
     ensure_built()
     subprocess.run([os.path.join(HERE, "main"), "emit"], cwd=HERE,
                    capture_output=True, text=True, timeout=60)
+
+
+# Example custom node-graph spec (circuit_kind=4). Reserved nodes: p (port), 0 (ground).
+DEFAULT_SPEC = """\
+# Custom node-graph circuit. Reserved nodes: p = port (field attaches here), 0 = ground.
+# <TYPE> <name> <nodeA> <nodeB> <params...>
+#   R/L/C name a b val | VSIN/ISIN name a b amp freq | VDC name a b val
+#   VPULSE name a b v1 v2 td tr
+# Example: source+C  ||  R+L   (two parallel branches p->0)
+VSIN src p a 1 50
+C    c1  a 0 1e-6
+R    r1  p b 10
+L    l1  b 0 1.6e-7
+"""
+
+
+def read_spec():
+    """Seed the spec editor from circuit_spec.txt if present, else the default example."""
+    path = os.path.join(HERE, "circuit_spec.txt")
+    if os.path.exists(path):
+        with open(path) as f:
+            return f.read()
+    return DEFAULT_SPEC
+
+
+def write_spec(params):
+    """Write the custom node-graph spec to circuit_spec.txt (only when non-empty), so the C++
+    generator reads it for circuit_kind=4. Ignored by the built-in kinds."""
+    spec = params.get("circuit_spec")
+    if spec:
+        with open(os.path.join(HERE, "circuit_spec.txt"), "w") as f:
+            f.write(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +836,7 @@ class Handler(BaseHTTPRequestHandler):
             # POST carries the live form params (write them first); GET uses the saved config.
             if params is not None:
                 write_config(params)
+                write_spec(params)
             emit_netlist()
             parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
             self._send(200, json.dumps({
@@ -835,6 +869,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             params = body
             write_config(params)
+            write_spec(params)
             rc, stdout, stderr, elapsed = run_solver()
             log_tail = "\n".join((stdout or "").splitlines()[-25:])
             if rc != 0:
@@ -942,6 +977,20 @@ def _controls_html():
                    data-key="{k}" oninput="syncFromBox(this)">
             {slider_html}
           </div>
+        </div>""")
+    # Custom node-graph spec editor (used when circuit_kind = custom). "Refresh circuit" re-renders it.
+    import html as _html
+    spec_seed = _html.escape(read_spec())
+    rows.append(f"""
+        <div class="ctl" id="specBox">
+          <label for="f_circuit_spec">Custom circuit spec (circuit topology = custom)</label>
+          <textarea id="f_circuit_spec" rows="9" spellcheck="false"
+                    style="width:100%;background:#0d0f14;color:#e6e6e6;border:1px solid #2c333f;
+                           border-radius:6px;padding:8px;font-family:ui-monospace,monospace;font-size:11.5px;"
+          >{spec_seed}</textarea>
+          <div class="note">Nodes: <code>p</code>=port, <code>0</code>=gnd. One element/line:
+            <code>R/L/C name a b val</code>, <code>VSIN/ISIN name a b amp f</code>,
+            <code>VDC name a b val</code>. Click "Refresh circuit" to render.</div>
         </div>""")
     return "\n".join(rows)
 
@@ -1116,6 +1165,8 @@ function collect(){
   document.querySelectorAll('select[data-key]').forEach(s => {
     p[s.dataset.key] = parseFloat(s.value);
   });
+  const ta = document.getElementById('f_circuit_spec');
+  if (ta) p['circuit_spec'] = ta.value;   // custom node-graph spec (circuit_kind=custom)
   return p;
 }
 function resetDefaults(){

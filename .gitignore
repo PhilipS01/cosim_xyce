@@ -27,3 +27,6 @@ Field_flux.txt
 Field_waveform_solution.prn
 Circuit_solution.prn
 __pycache__/
+
+# custom node-graph spec (user/run state; example seeded from DEFAULT_SPEC in sim_ui.py)
+circuit_spec.txt

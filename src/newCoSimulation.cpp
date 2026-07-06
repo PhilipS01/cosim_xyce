@@ -831,6 +831,65 @@ static void emitSwitchTopology(ofstream& out)
     }
 }
 
+// Emits a user-authored node-graph circuit (circuit_kind==4) from circuit_spec.txt. Reserved nodes:
+// p (port, field attaches here) and 0 (ground); any other token is a user node. The fixed WR
+// interface is appended by WriteCircuitNetlist -- the spec must not touch node nx. Well-posedness is
+// the user's responsibility (full generality). Line format, '#'/'*' comment, blanks skipped:
+//   <TYPE> <name> <nodeA> <nodeB> <params...>
+//   R/L/C name a b val | VSIN/ISIN name a b amp f | VDC name a b val | VPULSE name a b v1 v2 td tr
+// Emitted device name = type-letter + user name (valid Xyce device).
+static void emitCustomTopology(ofstream& out)
+{
+    ifstream in("circuit_spec.txt");
+    if (!in) {
+        throw runtime_error("emitCustomTopology: circuit_kind=4 (custom) but circuit_spec.txt not found.");
+    }
+    int emitted = 0, lineno = 0;
+    string line;
+    while (std::getline(in, line)) {
+        ++lineno;
+        // strip inline comment (# or *)
+        for (char c : {'#', '*'}) { const auto pos = line.find(c); if (pos != string::npos) line.erase(pos); }
+        std::istringstream iss(line);
+        vector<string> tok; string t;
+        while (iss >> t) tok.push_back(t);
+        if (tok.empty()) continue;
+        string type = tok[0];
+        for (char& ch : type) if (ch >= 'a' && ch <= 'z') ch -= 32;   // uppercase
+        auto need = [&](size_t n) {
+            if (tok.size() < n)
+                throw runtime_error("emitCustomTopology: circuit_spec.txt line " + to_string(lineno)
+                                    + " (TYPE '" + type + "') needs " + to_string(n - 1) + " fields.");
+        };
+        if (type == "R" || type == "L" || type == "C") {
+            need(5);
+            const string& nm = tok[1]; const string& a = tok[2]; const string& b = tok[3];
+            const string& val = tok[4];
+            if      (type == "R") out << "R" << nm << " " << a << " " << b << " " << val << "\n";
+            else if (type == "L") out << "L" << nm << " " << a << " " << b << " " << val << " IC=0\n";
+            else                  out << "C" << nm << " " << a << " " << b << " " << val << " IC=0\n";
+        } else if (type == "VSIN" || type == "ISIN") {
+            need(6);
+            const char q = (type == "VSIN") ? 'V' : 'I';
+            out << "B" << tok[1] << " " << tok[2] << " " << tok[3] << " " << q
+                << " = { " << tok[4] << "*sin(2*pi*" << tok[5] << "*time) }\n";
+        } else if (type == "VDC") {
+            need(5);
+            out << "V" << tok[1] << " " << tok[2] << " " << tok[3] << " " << tok[4] << "\n";
+        } else if (type == "VPULSE") {
+            need(8);
+            out << "V" << tok[1] << " " << tok[2] << " " << tok[3] << " PULSE("
+                << tok[4] << " " << tok[5] << " " << tok[6] << " " << tok[7] << " 0 1e30 1e30)\n";
+        } else {
+            throw runtime_error("emitCustomTopology: circuit_spec.txt line " + to_string(lineno)
+                                + " unknown TYPE '" + type + "'.");
+        }
+        ++emitted;
+    }
+    if (emitted == 0)
+        throw runtime_error("emitCustomTopology: circuit_spec.txt has no elements.");
+}
+
 // Generiert die vollstaendige Schaltungs-Netzliste (wr_circuit.cir) aus g_cfg. Topologie ist
 // fensterinvariant -> EINMAL vor der WR-Schleife (und im emit-Modus) aufgerufen. Elemente werden
 // INLINE geschrieben (kein .INCLUDE der Devices), damit der UI-Netzlisten-Parser (folgt keinen
@@ -848,7 +907,12 @@ void WriteCircuitNetlist(const string& filename)
     out << "Generated circuit netlist (WriteCircuitNetlist from sim_config.txt) -- DO NOT EDIT BY HAND\n";
     out << ".INCLUDE sim_params.inc\n\n";
 
-    if (g_cfg.circuit_kind != 0) {
+    if (g_cfg.circuit_kind == 4) {
+        // --- Custom node-graph (increment 3a): user-authored circuit from circuit_spec.txt. ---
+        out << "* === CIRCUIT SIDE (custom node-graph from circuit_spec.txt) ===\n";
+        emitCustomTopology(out);
+        out << "\n";
+    } else if (g_cfg.circuit_kind != 0) {
         // --- Switch topology (increment 2): #4/#5/#6 attach their own network at port p. ---
         out << "* === CIRCUIT SIDE (switch topology circuit_kind=" << g_cfg.circuit_kind
             << ", backend=" << (g_cfg.switch_backend ? "native-S" : "behavioral") << ") ===\n";
