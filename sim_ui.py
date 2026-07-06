@@ -188,6 +188,61 @@ HELP = {
         "V_field; plain voltage source &mdash; removes the high-frequency window-start V(p) spike on "
         "current-source circuits.</div>"
     ),
+    "circuit_kind": (
+        "<div class='hh'>Circuit topology</div>"
+        "<table>"
+        "<tr><th>kind</th><th>circuit (coil always sits between port p and gnd)</th></tr>"
+        "<tr><td>simple source</td><td>one source (sine V / sine I / step) + series R/L/C to the port</td></tr>"
+        "<tr><td>#4 3-way (sine U,C)</td><td>sine U + cap C. drive [0,t1): U charges C &amp; drives the "
+        "coil &rarr; freewheel [t1,t2): C &#8741; coil, U off &rarr; open [t2,&infin;)</td></tr>"
+        "<tr><td>#5 2-way (DC U,C)</td><td>DC U + cap C. drive [0,t1) &rarr; freewheel [t1,&infin;)</td></tr>"
+        "<tr><td>#6 2-way (AC vs R)</td><td>V_AC and R both at the port. AC-drive [0,t1): V_AC drives "
+        "the coil &rarr; R-damp [t1,&infin;): R &#8741; coil, source off</td></tr>"
+        "<tr><td>custom</td><td>free node-graph from the spec / drag-drop editor</td></tr>"
+        "</table>"
+    ),
+    "switch_backend": (
+        "<div class='hh'>Switch backend</div>"
+        "<div class='hn'>behavioral R: each throw is a resistor R=Roff+(Ron&minus;Roff)&middot;g(t), the "
+        "gate g a clamped trapezoid &mdash; no .MODEL, robust.<br>native S: Xyce voltage-controlled "
+        "switch S + .MODEL VSWITCH, gated by a PWL control. Same schedule; can be stiffer at throws.</div>"
+    ),
+    "switch_t1": (
+        "<div class='hh'>Switch throw time t1</div>"
+        "<div class='hn'>First throw instant. #4/#5: drive &rarr; freewheel at t1. #6: AC-drive &rarr; "
+        "R-damp at t1. Must fall inside the run (&lt; end time).</div>"
+    ),
+    "switch_t2": (
+        "<div class='hh'>Switch throw time t2 (3-way, #4 only)</div>"
+        "<div class='hn'>Second throw: #4 freewheel &rarr; open at t2. Needs t1 &lt; t2 &lt; end time.</div>"
+    ),
+    "switch_C": (
+        "<div class='hh'>Switch capacitor C (#4/#5)</div>"
+        "<div class='hn'>Cap in the drive/freewheel branch (C &#8741; coil during freewheel). A large C "
+        "stresses WR convergence (reactive coupling) &mdash; keep it small (presets: 1&micro;F).</div>"
+    ),
+    "switch_R": (
+        "<div class='hh'>Switch resistor R (#6)</div>"
+        "<div class='hn'>The damping resistor the switch places in parallel with the coil during the "
+        "R-damp phase (presets: 10k&Omega;).</div>"
+    ),
+    "switch_Ron": (
+        "<div class='hh'>Closed-switch resistance Ron</div>"
+        "<div class='hn'><b>Gotcha:</b> the #4/#5 cap&harr;coil freewheel is a nearly-undamped LC loop; "
+        "with a tiny Ron it rings and the timestep collapses at the freewheel throw. Use Ron &ge; a few "
+        "&Omega; (presets: 10). #6 has no LC loop &rarr; Ron=1m&Omega; is fine.</div>"
+    ),
+    "switch_Roff": (
+        "<div class='hh'>Open-switch resistance Roff</div>"
+        "<div class='hn'>Resistance of an open throw (large, e.g. 1e9). Kept finite (not &infin;) so every "
+        "node retains a well-defined admittance.</div>"
+    ),
+    "switch_trise": (
+        "<div class='hh'>Switch transition time</div>"
+        "<div class='hn'><b>Essential:</b> a finite ramp of each throw. An instantaneous throw "
+        "disconnects an ideal branch carrying inductive coil current &rarr; voltage kick &rarr; "
+        "dt-collapse. The gate ramps over this time at each edge.</div>"
+    ),
 }
 
 
