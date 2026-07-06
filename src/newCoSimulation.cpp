@@ -386,7 +386,7 @@ void MasterProcess()
             //   1 current-driven: liest i_prev_k.pwl (I(Vmeas)), schreibt vf_prev_k.pwl (V_field).
             // schreibt Endwerte in Field.txt
             if (g_cfg.coupling_mode == 1)
-                FEM_solver_current_driven_waveform(I0, V0, N_field_eval_intervals);
+                FEM_solver_current_driven_waveform(I0, V0, N_field_eval_intervals, step_field == 1);
             else
                 FEM_solver_voltage_driven_waveform(I0, N_field_eval_intervals);
             Read_Terminal_results("Field.txt", V_field, I_field);
@@ -610,7 +610,7 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
 //      to this window's end value (the colleague's 2-point reconstruction; uses V0).
 //   2 average: 0.5*(linear + const) -- window-start raised to 0.5*(V_field_last_time + V_end); uses V0.
 void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_time,
-                                        unsigned N_field_eval_intervals)
+                                        unsigned N_field_eval_intervals, bool first_window)
 {
     const Waveform iface = readPWLFile("i_prev_k.pwl");   // interface current I(t) on the coupling grid
     if (iface.t.size() < 2)
@@ -634,45 +634,54 @@ void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_
     const double   t_win_start = I_eval.t.front();
     const double   t_end       = I_eval.t.back();
 
-    // Pointwise field voltage V(t) = R_FEM*I + dlambda/dt (needs only I0). dlambda/dt per point:
-    //   reconstruct_mode 3 (central-diff, most accurate): local difference
-    //     (lambda(I_{j+1})-lambda(I_{j-1}))/(t_{j+1}-t_{j-1}) -- forward at the first point, backward at
-    //     the last -- O(h^2) interior, no window-start lag. Current-driven has no Bfield secant to match,
-    //     so it is free to use the accurate local derivative.
-    //   otherwise: accumulated secant from the window start (same form as the voltage-driven solver),
-    //     with a forward-difference guard for the j=0 0/0.
-    const bool use_central = (g_cfg.reconstruct_mode == 3);
-    Waveform vfield;
-    for (size_t j = 0; j < N; ++j) {
-        double dl_dt;
-        if (use_central) {
-            if (j == 0)
-                dl_dt = dlam(I_eval.y[1], I_eval.y[0]) / (I_eval.t[1] - I_eval.t[0]);
-            else if (j + 1 == N)
-                dl_dt = dlam(I_eval.y[j], I_eval.y[j - 1]) / (I_eval.t[j] - I_eval.t[j - 1]);
-            else
-                dl_dt = dlam(I_eval.y[j + 1], I_eval.y[j - 1]) / (I_eval.t[j + 1] - I_eval.t[j - 1]);
-        } else if (j == 0) {
-            const double dt01 = I_eval.t[1] - t_win_start;
-            dl_dt = (dt01 > 0.0) ? dlam(I_eval.y[1], I_win_start) / dt01 : 0.0;
-        } else {
-            dl_dt = dlam(I_eval.y[j], I_win_start) / (I_eval.t[j] - t_win_start);
-        }
-        vfield.push(I_eval.t[j], R_FEM * I_eval.y[j] + dl_dt);
-    }
-    const double V_field_end = vfield.y.back();
+    // The window START field voltage is the carried previous-window END value (V_field_last_time):
+    // reused -> the seam is C0-continuous by construction AND no solve is spent there. reconstruct_mode:
+    //   1 linear / 2 average: ONE new evaluation (the window end), straight-line interior => 1 solve/window.
+    //   0 secant / 3 central: pointwise interior (N solves), start still carried for seam continuity.
+    // The window-end derivative uses a LOCAL backward difference on the FINE interface current (accurate,
+    // no window-secant drift; the fine current is the circuit's output, costs no FEM solve).
+    const size_t nf = iface.t.size();
+    const double dt_end = iface.t[nf - 1] - iface.t[nf - 2];
+    const double V_end = R_FEM * iface.y[nf - 1]
+                       + (dt_end > 0.0 ? dlam(iface.y[nf - 1], iface.y[nf - 2]) / dt_end : 0.0);
 
-    // Optional colleague reconstruction: replace the interior with a straight line (modes 1/2 use V0).
+    // Window START value: the first window has nothing to carry, so compute it pointwise
+    // (R_FEM*I0 + L_FEM*dI/dt(0) via a forward difference on the fine current). Later windows reuse
+    // the carried previous-window end (seam-continuous, no solve).
+    double V_start_win;
+    if (first_window) {
+        const double dt0 = iface.t[1] - iface.t[0];
+        V_start_win = R_FEM * iface.y[0] + (dt0 > 0.0 ? dlam(iface.y[1], iface.y[0]) / dt0 : 0.0);
+    } else {
+        V_start_win = V_field_last_time;
+    }
+
+    Waveform vfield;
     if (g_cfg.reconstruct_mode == 1 || g_cfg.reconstruct_mode == 2) {
+        // 1 solve/window: carried start (or its average with the end), straight line to the end.
         const double V_start = (g_cfg.reconstruct_mode == 2)
-                               ? 0.5 * (V_field_last_time + V_field_end)
-                               : V_field_last_time;
+                               ? 0.5 * (V_start_win + V_end) : V_start_win;
         const double dt_win = t_end - t_win_start;
         for (size_t j = 0; j < N; ++j) {
             const double frac = (dt_win > 0.0) ? (I_eval.t[j] - t_win_start) / dt_win : 0.0;
-            vfield.y[j] = V_start + frac * (V_field_end - V_start);
+            vfield.push(I_eval.t[j], V_start + frac * (V_end - V_start));
+        }
+    } else {
+        // pointwise (0 secant / 3 central): start carried (reuse the seam), interior/end computed.
+        const bool use_central = (g_cfg.reconstruct_mode == 3);
+        vfield.push(t_win_start, V_start_win);
+        for (size_t j = 1; j < N; ++j) {
+            double dl_dt;
+            if (use_central) {
+                if (j + 1 == N) dl_dt = dlam(I_eval.y[j], I_eval.y[j - 1]) / (I_eval.t[j] - I_eval.t[j - 1]);
+                else            dl_dt = dlam(I_eval.y[j + 1], I_eval.y[j - 1]) / (I_eval.t[j + 1] - I_eval.t[j - 1]);
+            } else {
+                dl_dt = dlam(I_eval.y[j], I_win_start) / (I_eval.t[j] - t_win_start);
+            }
+            vfield.push(I_eval.t[j], R_FEM * I_eval.y[j] + dl_dt);
         }
     }
+    const double V_field_end = vfield.y.back();
     const double I_end = I_eval.y.back();
 
     writePWLFile("vf_prev_k.pwl", vfield);                     // field -> circuit: the field voltage
