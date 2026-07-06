@@ -75,6 +75,8 @@ bool LoadConfig(const string& filename)
         else if (key == "WRmaxSteps")                       g_cfg.WRmaxSteps = (unsigned)val;
         else if (key == "WR_tolerance")                     g_cfg.WR_tolerance = val;
         else if (key == "wr_convergence_method")            g_cfg.wr_convergence_method = (unsigned)val;
+        else if (key == "coupling_mode")                    g_cfg.coupling_mode = (unsigned)val;
+        else if (key == "reconstruct_mode")                 g_cfg.reconstruct_mode = (unsigned)val;
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
     }
     return true;
@@ -379,11 +381,14 @@ void MasterProcess()
             RunXyce("wr_circuit.cir");
             ReadXyceResults("wr_circuit.cir.prn", circuit_sol, t_start, t_stop, N_xyce_coupling_intervals);
 
-            // FEM Solver aufrufen (dummy, voltage-driven):
-            // liest vf_prev_k.pwl (Portspannung V(p) von Xyce)
-            // schreibt i_prev_k.pwl (Feldstrom I_field via akkumulierter Sekante)
+            // FEM Solver aufrufen (dummy). Kopplungsrichtung per coupling_mode:
+            //   0 voltage-driven: liest vf_prev_k.pwl (V(p)), schreibt i_prev_k.pwl (I_field).
+            //   1 current-driven: liest i_prev_k.pwl (I(Vmeas)), schreibt vf_prev_k.pwl (V_field).
             // schreibt Endwerte in Field.txt
-            FEM_solver_voltage_driven_waveform(I0, N_field_eval_intervals);
+            if (g_cfg.coupling_mode == 1)
+                FEM_solver_current_driven_waveform(I0, V0, N_field_eval_intervals);
+            else
+                FEM_solver_voltage_driven_waveform(I0, N_field_eval_intervals);
             Read_Terminal_results("Field.txt", V_field, I_field);
 
             // i_prev = Feldstrom-Waveform dieser Iteration (FEM-Ausgang)
@@ -596,6 +601,60 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     Write_Terminal_results("Field.txt", vport.y.back(), current.y.back());
 }
 
+// Current-driven (Neumann) field solver. Reads the interface current I(t) (i_prev_k.pwl, circuit
+// output), computes the field voltage at the window end V_field_end = R_FEM*I_end + dlambda/dt (via
+// the accumulated secant over the window), and reconstructs V_field over the window as a straight
+// ramp from V_field_last_time (previous window end) to V_field_end. reconstruct_mode=1 raises the
+// window-start value to 0.5*(V_field_last_time + V_field_end) (the colleague's linear+const average),
+// damping the window-start step. Writes vf_prev_k.pwl for the circuit's Bfield voltage source.
+void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_time,
+                                        unsigned N_field_eval_intervals)
+{
+    const Waveform iface = readPWLFile("i_prev_k.pwl");   // interface current I(t) on the coupling grid
+    if (iface.t.size() < 2)
+        throw runtime_error("FEM_solver_current_driven: i_prev_k.pwl needs at least 2 points.");
+    if (N_field_eval_intervals < 1)
+        throw runtime_error("FEM_solver_current_driven: N_field_eval_intervals must be >= 1.");
+
+    const double L_FEM = g_cfg.L_FEM;
+    const double R_FEM = g_cfg.R_FEM;
+    const bool   saturating = (g_cfg.nonlin_model == 1) && (g_cfg.I_sat > 0.0);
+    const double I_sat = g_cfg.I_sat;
+    auto flux = [&](double I) { return L_FEM * I_sat * std::atan(I / I_sat); };  // lambda(I)
+
+    const double t_start = iface.t.front();
+    const double t_end   = iface.t.back();
+    const double dt_win  = t_end - t_start;
+    const double I_end   = iface.y.back();
+
+    // Field voltage at the window end: V = R_FEM*I + dlambda/dt, dlambda/dt via accumulated secant.
+    double V_field_end;
+    if (dt_win > 0.0) {
+        const double dlam = saturating ? (flux(I_end) - flux(I_win_start))
+                                       : (L_FEM * (I_end - I_win_start));
+        V_field_end = R_FEM * I_end + dlam / dt_win;
+    } else {
+        V_field_end = R_FEM * I_end;
+    }
+
+    // Window-start value: linear uses the carried previous-window field voltage (continuous);
+    // average raises it toward the window-end value (linear+const blend -> damps the window-start step).
+    const double V_start = (g_cfg.reconstruct_mode == 1)
+                           ? 0.5 * (V_field_last_time + V_field_end)
+                           : V_field_last_time;
+
+    // Sample the straight-line reconstruction on the field-eval grid (N_field_eval_intervals+1 points).
+    const unsigned N = N_field_eval_intervals;
+    Waveform vfield;
+    for (unsigned j = 0; j <= N; ++j) {
+        const double frac = static_cast<double>(j) / static_cast<double>(N);
+        vfield.push(t_start + frac * dt_win, V_start + frac * (V_field_end - V_start));
+    }
+
+    writePWLFile("vf_prev_k.pwl", vfield);                     // field -> circuit: the field voltage
+    Write_Terminal_results("Field.txt", V_field_end, I_end);  // (V_field_end, I_end)
+}
+
 // WR-Konvergenzkriterium auf Basis der Stromwaveforms benachbarter Iterationen:
 //
 //   ∫|i_m^(k)(t) - i_m^(k-1)(t)| dt   /   ∫|i_m^(k)(t)| dt   ≤   WR_tolerance
@@ -682,7 +741,8 @@ double eval_WR_convergence_terminal(
 // Writes last (V(nx), I(Vmeas)) to Circuit.txt.
 void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, double t_start, double t_stop, unsigned N_xyce_eval_points)
 {
-    Waveform vp_raw;
+    Waveform vp_raw;   // V(p): circuit -> field in voltage-driven mode
+    Waveform i_raw;    // I(Vmeas): circuit -> field in current-driven mode
 
     circuit_raw.t.clear();
     circuit_raw.vp.clear();
@@ -713,6 +773,7 @@ void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, doubl
 		if (sscanf(line, "%lg %lg %lg %lg %lg", &idx, &time, &Vp, &Viface, &I) == 5)
 		{
             pushOrReplaceDuplicateTime(vp_raw, time, Vp);
+            pushOrReplaceDuplicateTime(i_raw, time, I);
             pushOrReplaceDuplicateTime(circuit_raw, time, Vp, Viface, I);
 
             last_V = Viface;
@@ -726,19 +787,22 @@ void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, doubl
 	if (step == 0)
 		throw runtime_error("ReadXyceResults: no data rows read");
 
-    // V(p) auf uniformes Kopplungsraster re-sampeln → vf_prev_k.pwl als FEM-Eingang (Portspannung).
-    Waveform vp_sampled = resampleWaveformUniform(
-        vp_raw,
-        t_start,
-        t_stop,
-        N_xyce_eval_points
-    );
-
     Write_Terminal_results("Circuit.txt", last_V, last_I);
-    writePWLFile("vf_prev_k.pwl", vp_sampled);
-    cout << "Raw Xyce points: " << vp_raw.t.size()
-         << ", coupling PWL points: " << vp_sampled.t.size()
-         << endl;
+
+    // Resample the circuit->field quantity onto the uniform coupling grid.
+    //   voltage-driven: V(p) -> vf_prev_k.pwl (field reads the port voltage).
+    //   current-driven: I(Vmeas) -> i_prev_k.pwl (field reads the interface current).
+    if (g_cfg.coupling_mode == 1) {
+        Waveform i_sampled = resampleWaveformUniform(i_raw, t_start, t_stop, N_xyce_eval_points);
+        writePWLFile("i_prev_k.pwl", i_sampled);
+        cout << "Raw Xyce points: " << i_raw.t.size()
+             << ", coupling PWL points: " << i_sampled.t.size() << " (I->field)" << endl;
+    } else {
+        Waveform vp_sampled = resampleWaveformUniform(vp_raw, t_start, t_stop, N_xyce_eval_points);
+        writePWLFile("vf_prev_k.pwl", vp_sampled);
+        cout << "Raw Xyce points: " << vp_raw.t.size()
+             << ", coupling PWL points: " << vp_sampled.t.size() << " (V->field)" << endl;
+    }
 }
 
 void RunXyce(const string& filename) {
@@ -1010,14 +1074,25 @@ void WriteCircuitNetlist(const string& filename)
     }
     }
 
-    // Feste WR-Schnittstelle (THEVENIN matched-secant Feld-ROM) -- identisch zur Handnetzliste.
-    out << "* === WR INTERFACE (fixed): prev waveforms, ammeter, matched-secant Bfield ===\n";
-    out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
-    out << "VIprev iprev  0 PWL FILE \"i_prev_k.pwl\"\n";
-    out << "Vmeas p nx 0\n";
-    out << "Bfield nx 0 V = {\n";
-    out << "+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))\n";
-    out << "+ }\n\n";
+    // Feste WR-Schnittstelle. Kopplungsrichtung per coupling_mode.
+    if (g_cfg.coupling_mode == 1) {
+        // Current-driven (Neumann): the field returns its voltage V_field (from the FEM, in
+        // vf_prev_k.pwl); the circuit's Bfield is a plain voltage source = V_field (no secant, no
+        // Lrom/t_floor amplifier). The circuit's I(Vmeas) is read by the driver and fed to the FEM.
+        out << "* === WR INTERFACE (current-driven): field voltage source, ammeter ===\n";
+        out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
+        out << "Vmeas p nx 0\n";
+        out << "Bfield nx 0 V = { V(vfprev) }\n\n";
+    } else {
+        // Voltage-driven (Dirichlet): THEVENIN matched-secant field ROM (default).
+        out << "* === WR INTERFACE (voltage-driven): prev waveforms, ammeter, matched-secant Bfield ===\n";
+        out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
+        out << "VIprev iprev  0 PWL FILE \"i_prev_k.pwl\"\n";
+        out << "Vmeas p nx 0\n";
+        out << "Bfield nx 0 V = {\n";
+        out << "+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))\n";
+        out << "+ }\n\n";
+    }
 
     out << ".INCLUDE restart.inc\n";
     out << ".print tran V(p) V(nx) I(Vmeas)\n";

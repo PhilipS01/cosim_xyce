@@ -78,6 +78,10 @@ PARAMS = [
     ("WR_tolerance",                    "WR tolerance",                 1.0e-3,   "float", None),
     ("wr_convergence_method",           "WR convergence metric",        1,        "choice",
         {0: "waveform L1 (this code)", 1: "terminal scalar (reference)"}),
+    ("coupling_mode",                   "Coupling direction",           0,        "choice",
+        {0: "voltage-driven", 1: "current-driven"}),
+    ("reconstruct_mode",                "Field reconstruction",         0,        "choice",
+        {0: "linear", 1: "average (linear+const)"}),
 ]
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
 KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}
@@ -90,15 +94,17 @@ SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
 # (switches) arrive in increment 2. Keys map to the flat config the C++ generator consumes.
 PRESETS = {
     "P1: Sine V + RL": {"circuit_kind": 0, "source_kind": 0, "amplitude": 1.0, "frequency": 50.0,
-                        "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0, "time_mode": 0},
+                        "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0, "time_mode": 0,
+                        "coupling_mode": 0},
     # Bare current source directly on the port: series R/L/C are meaningless for a current drive
     # (the current is forced regardless) and an ideal I-source in series with L is degenerate.
     "P2: Sine I (bare)": {"circuit_kind": 0, "source_kind": 1, "amplitude": 1.0, "frequency": 50.0,
-                          "R_series": 0.0, "L_series": 0.0, "C_series": 0.0, "time_mode": 0},
+                          "R_series": 0.0, "L_series": 0.0, "C_series": 0.0, "time_mode": 0,
+                          "coupling_mode": 1},
     "P3: Step/ramp V + RL": {"circuit_kind": 0, "source_kind": 2, "step_v_initial": 0.0,
                              "step_v_final": 1.0, "step_delay": 0.0, "step_rise": 1.0e-4,
                              "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0,
-                             "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
+                             "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50, "coupling_mode": 0,
                              # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters
                              "WRmaxSteps": 40},
     # --- Increment 2: switch topologies. NOTE the passive values are numerical-survival defaults,
@@ -108,15 +114,15 @@ PRESETS = {
     "P4: 3-way switch (sine U, C)": {"circuit_kind": 1, "switch_backend": 0, "amplitude": 1.0,
                                      "frequency": 50.0, "switch_C": 1.0e-6, "switch_Ron": 10.0,
                                      "switch_t1": 6.0e-3, "switch_t2": 1.3e-2, "WRmaxSteps": 40,
-                                     "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50},
+                                     "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50, "coupling_mode": 0},
     "P5: 2-way switch (DC U, C)": {"circuit_kind": 2, "switch_backend": 0, "amplitude": 1.0,
                                    "switch_C": 1.0e-6, "switch_Ron": 10.0,
                                    "switch_t1": 6.0e-3, "WRmaxSteps": 40,
-                                   "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50},
+                                   "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50, "coupling_mode": 0},
     "P6: 2-way switch (AC vs R)": {"circuit_kind": 3, "switch_backend": 0, "amplitude": 1.0,
                                    "frequency": 50.0, "switch_R": 1.0e4, "switch_Ron": 1.0e-3,
                                    "switch_t1": 6.0e-3, "WRmaxSteps": 40,
-                                   "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50},
+                                   "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50, "coupling_mode": 0},
 }
 
 
@@ -151,6 +157,7 @@ VISIBLE_WHEN = {
     "t_end":            [{"time_mode": [1]}],
     "N_field_windows":  [{"time_mode": [1]}],
     "I_sat": [{"nonlin_model": [1]}],
+    "reconstruct_mode": [{"coupling_mode": [1]}],
 }
 
 
@@ -1229,7 +1236,13 @@ function applyVisibility(){
 }
 // smart default: sine simple source -> periods; step/switch/custom -> absolute end time
 function suggestTimeMode(){ const ck=ctlVal('circuit_kind'), sk=ctlVal('source_kind'); return (ck===0 && (sk===0||sk===1))?0:1; }
-function onTopoChange(){ const tm=document.getElementById('f_time_mode'); if(tm) tm.value=String(suggestTimeMode()); applyVisibility(); }
+// current-source circuit -> current-driven coupling (avoids the window-start V(p) secant spike)
+function suggestCouplingMode(){ const ck=ctlVal('circuit_kind'), sk=ctlVal('source_kind'); return (ck===0 && sk===1)?1:0; }
+function onTopoChange(){
+  const tm=document.getElementById('f_time_mode'); if(tm) tm.value=String(suggestTimeMode());
+  const cm=document.getElementById('f_coupling_mode'); if(cm) cm.value=String(suggestCouplingMode());
+  applyVisibility();
+}
 
 function applyPreset(){
   const name = document.getElementById('presetSel').value;

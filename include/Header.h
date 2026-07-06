@@ -94,6 +94,14 @@ struct SimConfig
     // WR convergence metric: 0 = waveform L1 of the field-current (this codebase),
     //                        1 = terminal-scalar metric of the reference CoSimulation_WR.cpp
     unsigned wr_convergence_method = 0;
+    // Coupling direction (Dirichlet vs Neumann):
+    //   0 = voltage-driven (default): circuit sets V(p), field returns I; Bfield = matched secant.
+    //   1 = current-driven: circuit sets I(Vmeas), field returns V_field; Bfield = plain V source.
+    // Current-driven suits current-source circuits (no Lrom/t_floor secant -> no window-start spike).
+    unsigned coupling_mode = 0;
+    // Field-output reconstruction within a window: 0 = linear (default), 1 = average of linear + const
+    // (raises the window-start value toward the window-end value; damps window-start artefacts).
+    unsigned reconstruct_mode = 0;
 };
 
 extern SimConfig g_cfg;
@@ -106,6 +114,13 @@ bool LoadConfig(const string& filename);
 void MasterProcess();
 
 void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eval_intervals);
+
+// Current-driven (Neumann) field solver: reads the interface current waveform I(t) from i_prev_k.pwl,
+// computes the field voltage V_field(t) = R_FEM*I + L_FEM*dI/dt (+ saturation) on the field-eval grid,
+// optionally blends linear+const (reconstruct_mode), and writes it to vf_prev_k.pwl for the circuit's
+// Bfield voltage source. V_field_last_time = the field voltage carried from the previous window end.
+void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_time,
+                                        unsigned N_field_eval_intervals);
 
 void CIRCUIT_solver(const double dt_circuit, const unsigned N_dt_circuit_per_dt_field, const double time_field);
 
