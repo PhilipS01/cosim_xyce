@@ -99,8 +99,11 @@ struct SimConfig
     //   1 = current-driven: circuit sets I(Vmeas), field returns V_field; Bfield = plain V source.
     // Current-driven suits current-source circuits (no Lrom/t_floor secant -> no window-start spike).
     unsigned coupling_mode = 0;
-    // Field-output reconstruction within a window: 0 = linear (default), 1 = average of linear + const
-    // (raises the window-start value toward the window-end value; damps window-start artefacts).
+    // Field-voltage reconstruction within a window (current-driven mode):
+    //   0 = pointwise (default): V computed at every field-eval point from I(t) (symmetric to the
+    //       voltage-driven solver, needs only I0; follows the current's curve).
+    //   1 = linear: straight ramp from the previous-window field voltage to this window's end value.
+    //   2 = average: 0.5*(linear + const) -- window-start raised to the midpoint (colleague's blend).
     unsigned reconstruct_mode = 0;
 };
 

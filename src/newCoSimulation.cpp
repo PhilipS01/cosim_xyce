@@ -602,11 +602,13 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
 }
 
 // Current-driven (Neumann) field solver. Reads the interface current I(t) (i_prev_k.pwl, circuit
-// output), computes the field voltage at the window end V_field_end = R_FEM*I_end + dlambda/dt (via
-// the accumulated secant over the window), and reconstructs V_field over the window as a straight
-// ramp from V_field_last_time (previous window end) to V_field_end. reconstruct_mode=1 raises the
-// window-start value to 0.5*(V_field_last_time + V_field_end) (the colleague's linear+const average),
-// damping the window-start step. Writes vf_prev_k.pwl for the circuit's Bfield voltage source.
+// output) and returns the field voltage V(t) = R_FEM*I + dlambda/dt in vf_prev_k.pwl for the circuit's
+// Bfield voltage source. reconstruct_mode:
+//   0 pointwise (default): V computed at every field-eval point from I(t) -- symmetric to the
+//      voltage-driven solver, needs only I0 (V_field_last_time unused); follows the current's curve.
+//   1 linear: replace the interior with a straight ramp from V_field_last_time (previous window end)
+//      to this window's end value (the colleague's 2-point reconstruction; uses V0).
+//   2 average: 0.5*(linear + const) -- window-start raised to 0.5*(V_field_last_time + V_end); uses V0.
 void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_time,
                                         unsigned N_field_eval_intervals)
 {
@@ -621,35 +623,46 @@ void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_
     const bool   saturating = (g_cfg.nonlin_model == 1) && (g_cfg.I_sat > 0.0);
     const double I_sat = g_cfg.I_sat;
     auto flux = [&](double I) { return L_FEM * I_sat * std::atan(I / I_sat); };  // lambda(I)
+    auto dlam = [&](double Ib, double Ia) {                                      // lambda(Ib)-lambda(Ia)
+        return saturating ? (flux(Ib) - flux(Ia)) : (L_FEM * (Ib - Ia));
+    };
 
-    const double t_start = iface.t.front();
-    const double t_end   = iface.t.back();
-    const double dt_win  = t_end - t_start;
-    const double I_end   = iface.y.back();
+    // Multi-rate: resample the interface current onto the field-eval grid (N_field_eval+1 points).
+    const Waveform I_eval = resampleWaveformUniform(
+        iface, iface.t.front(), iface.t.back(), N_field_eval_intervals);
+    const size_t   N = I_eval.t.size();               // = N_field_eval_intervals + 1
+    const double   t_win_start = I_eval.t.front();
+    const double   t_end       = I_eval.t.back();
 
-    // Field voltage at the window end: V = R_FEM*I + dlambda/dt, dlambda/dt via accumulated secant.
-    double V_field_end;
-    if (dt_win > 0.0) {
-        const double dlam = saturating ? (flux(I_end) - flux(I_win_start))
-                                       : (L_FEM * (I_end - I_win_start));
-        V_field_end = R_FEM * I_end + dlam / dt_win;
-    } else {
-        V_field_end = R_FEM * I_end;
-    }
-
-    // Window-start value: linear uses the carried previous-window field voltage (continuous);
-    // average raises it toward the window-end value (linear+const blend -> damps the window-start step).
-    const double V_start = (g_cfg.reconstruct_mode == 1)
-                           ? 0.5 * (V_field_last_time + V_field_end)
-                           : V_field_last_time;
-
-    // Sample the straight-line reconstruction on the field-eval grid (N_field_eval_intervals+1 points).
-    const unsigned N = N_field_eval_intervals;
+    // Pointwise field voltage V(t) = R_FEM*I + dlambda/dt (needs only I0). dlambda/dt via the
+    // accumulated secant from the window start; at the first point (t_acc=0 -> 0/0) use a forward
+    // difference over the first interval (the same 0/0 guard the voltage-driven solver / t_floor use).
     Waveform vfield;
-    for (unsigned j = 0; j <= N; ++j) {
-        const double frac = static_cast<double>(j) / static_cast<double>(N);
-        vfield.push(t_start + frac * dt_win, V_start + frac * (V_field_end - V_start));
+    for (size_t j = 0; j < N; ++j) {
+        const double t = I_eval.t[j];
+        double dl_dt;
+        if (j == 0) {
+            const double dt01 = I_eval.t[1] - t_win_start;
+            dl_dt = (dt01 > 0.0) ? dlam(I_eval.y[1], I_win_start) / dt01 : 0.0;
+        } else {
+            dl_dt = dlam(I_eval.y[j], I_win_start) / (t - t_win_start);
+        }
+        vfield.push(t, R_FEM * I_eval.y[j] + dl_dt);
     }
+    const double V_field_end = vfield.y.back();
+
+    // Optional colleague reconstruction: replace the interior with a straight line (modes 1/2 use V0).
+    if (g_cfg.reconstruct_mode == 1 || g_cfg.reconstruct_mode == 2) {
+        const double V_start = (g_cfg.reconstruct_mode == 2)
+                               ? 0.5 * (V_field_last_time + V_field_end)
+                               : V_field_last_time;
+        const double dt_win = t_end - t_win_start;
+        for (size_t j = 0; j < N; ++j) {
+            const double frac = (dt_win > 0.0) ? (I_eval.t[j] - t_win_start) / dt_win : 0.0;
+            vfield.y[j] = V_start + frac * (V_field_end - V_start);
+        }
+    }
+    const double I_end = I_eval.y.back();
 
     writePWLFile("vf_prev_k.pwl", vfield);                     // field -> circuit: the field voltage
     Write_Terminal_results("Field.txt", V_field_end, I_end);  // (V_field_end, I_end)
