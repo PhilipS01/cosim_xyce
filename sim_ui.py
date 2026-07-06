@@ -180,8 +180,8 @@ def emit_netlist():
 DEFAULT_SPEC = """\
 # Custom node-graph circuit. Reserved nodes: p = port (field attaches here), 0 = ground.
 # <TYPE> <name> <nodeA> <nodeB> <params...>
-#   R/L/C name a b val | VSIN/ISIN name a b amp freq | VDC name a b val
-#   VPULSE name a b v1 v2 td tr
+#   R/L/C name a b val | {V,I}SIN name a b amp freq | {V,I}DC name a b val
+#   {V,I}PULSE name a b v1 v2 td tr | {V,I}PWL name a b t1 v1 t2 v2 ...  (multi-step)
 # Example: source+C  ||  R+L   (two parallel branches p->0)
 VSIN src p a 1 50
 C    c1  a 0 1e-6
@@ -989,8 +989,9 @@ def _controls_html():
                            border-radius:6px;padding:8px;font-family:ui-monospace,monospace;font-size:11.5px;"
           >{spec_seed}</textarea>
           <div class="note">Nodes: <code>p</code>=port, <code>0</code>=gnd. One element/line:
-            <code>R/L/C name a b val</code>, <code>VSIN/ISIN name a b amp f</code>,
-            <code>VDC name a b val</code>. Click "Refresh circuit" to render.</div>
+            <code>R/L/C name a b val</code>, <code>{{V,I}}SIN amp f</code>, <code>{{V,I}}DC val</code>,
+            <code>{{V,I}}PULSE v1 v2 td tr</code>, <code>{{V,I}}PWL t1 v1 t2 v2 …</code>.
+            Click "Refresh circuit" to render.</div>
         </div>""")
     return "\n".join(rows)
 
@@ -1348,12 +1349,16 @@ const CE = (function(){
   const snap=v=>Math.round(v/GRID)*GRID;
   const termXY=(c,i)=>({x:c.x+(i?HW:-HW),y:c.y});
   function tpos(id){ if(id in PIN)return PIN[id]; const p=id.split('#'); const c=comps.find(x=>x.id===p[0]); return c?termXY(c,+p[1]):{x:0,y:0}; }
-  function add(type){ seq[type]++; const c={id:'k'+Math.random().toString(36).slice(2,7),type,name:type.toLowerCase()+seq[type],x:snap(320),y:snap(70+(comps.length%6)*45),sub:(type==='V'?'SIN':null),p:Object.assign({},defP[type])}; comps.push(c); sel=c.id; render(); renderProps(); }
+  function add(type){ seq[type]++; const c={id:'k'+Math.random().toString(36).slice(2,7),type,name:type.toLowerCase()+seq[type],x:snap(320),y:snap(70+(comps.length%6)*45),sub:((type==='V'||type==='I')?'SIN':null),p:Object.assign({},defP[type])}; comps.push(c); sel=c.id; render(); renderProps(); }
   function del(){ if(!sel)return; comps=comps.filter(c=>c.id!==sel); wires=wires.filter(w=>w.a.split('#')[0]!==sel&&w.b.split('#')[0]!==sel); sel=null; pend=null; render(); renderProps(); }
   function clr(){ comps=[]; wires=[]; sel=null; pend=null; render(); renderProps(); }
   function label(c){
-    if(c.type==='V'){ if(c.sub==='DC')return c.name+' DC '+c.p.val; if(c.sub==='PULSE')return c.name+' pulse'; return c.name+' '+c.p.amp+'/'+c.p.freq+'Hz'; }
-    if(c.type==='I') return c.name+' '+c.p.amp+'/'+c.p.freq+'Hz';
+    if(c.type==='V'||c.type==='I'){
+      if(c.sub==='DC')return c.name+' DC '+c.p.val;
+      if(c.sub==='PULSE')return c.name+' pulse';
+      if(c.sub==='PWL')return c.name+' pwl';
+      return c.name+' '+c.p.amp+'/'+c.p.freq+'Hz';
+    }
     return c.name+' '+c.p.val;
   }
   function render(){
@@ -1387,8 +1392,8 @@ const CE = (function(){
   function onMove(e){ if(!drag)return; const c=comps.find(x=>x.id===drag.id); if(!c)return; const p=xy(e); c.x=snap(p.x+drag.dx); c.y=snap(p.y+drag.dy); render(); e.preventDefault(); }
   function onUp(){ drag=null; }
   // --- properties panel: edit the selected component's type + type-dependent attributes ---
-  const subDef={SIN:{amp:1,freq:50},DC:{val:1},PULSE:{v1:0,v2:1,td:0,tr:1e-4}};
-  const subName={SIN:'sinusoidal',DC:'DC',PULSE:'pulse'};
+  const subDef={SIN:{amp:1,freq:50},DC:{val:1},PULSE:{v1:0,v2:1,td:0,tr:1e-4},PWL:{pts:'0 0 5e-3 1 15e-3 1 20e-3 0'}};
+  const subName={SIN:'sinusoidal',DC:'DC',PULSE:'pulse',PWL:'PWL (multi-step)'};
   function fld(lbl,inner){ return '<label>'+lbl+inner+'</label>'; }
   function inp(key,val){ return '<input data-cp="'+key+'" value="'+val+'">'; }
   function renderProps(){
@@ -1396,16 +1401,17 @@ const CE = (function(){
     const c=comps.find(x=>x.id===sel);
     if(!c){ host.innerHTML='<span class="ce-hint" style="padding:0">Select a component to edit its type &amp; values.</span>'; return; }
     let h='<div class="cprow"><b>'+c.name+'</b> — '+c.type+'</div>';
-    if(c.type==='V'){
+    if(c.type==='V'||c.type==='I'){
+      const u=c.type==='V'?'V':'A';
       h+='<label>Type<select data-cp="sub">'
-        +['SIN','DC','PULSE'].map(s=>'<option value="'+s+'"'+(c.sub===s?' selected':'')+'>'+subName[s]+'</option>').join('')
+        +['SIN','DC','PULSE','PWL'].map(s=>'<option value="'+s+'"'+(c.sub===s?' selected':'')+'>'+subName[s]+'</option>').join('')
         +'</select></label>';
-      if(c.sub==='SIN')       h+=fld('Amplitude',inp('amp',c.p.amp))+fld('Frequency (Hz)',inp('freq',c.p.freq));
-      else if(c.sub==='DC')   h+=fld('Value (V)',inp('val',c.p.val));
-      else                    h+=fld('V1',inp('v1',c.p.v1))+fld('V2',inp('v2',c.p.v2))
-                                +fld('Delay td (s)',inp('td',c.p.td))+fld('Rise tr (s)',inp('tr',c.p.tr));
-    } else if(c.type==='I'){
-      h+=fld('Amplitude',inp('amp',c.p.amp))+fld('Frequency (Hz)',inp('freq',c.p.freq));
+      if(c.sub==='SIN')        h+=fld('Amplitude ('+u+')',inp('amp',c.p.amp))+fld('Frequency (Hz)',inp('freq',c.p.freq));
+      else if(c.sub==='DC')    h+=fld('Value ('+u+')',inp('val',c.p.val));
+      else if(c.sub==='PULSE') h+=fld('Initial ('+u+')',inp('v1',c.p.v1))+fld('Pulsed ('+u+')',inp('v2',c.p.v2))
+                                 +fld('Delay td (s)',inp('td',c.p.td))+fld('Rise tr (s)',inp('tr',c.p.tr));
+      else                     h+='<label style="flex-basis:100%">Points &mdash; t v t v … ('+u+', times increasing)'
+                                 +'<input data-cp="pts" value="'+c.p.pts+'" style="width:100%"></label>';
     } else {
       h+=fld(c.type+' value',inp('val',c.p.val));
     }
@@ -1427,12 +1433,13 @@ const CE = (function(){
     const rn={}; rn[find('PIN:p')]='p'; rn[find('PIN:0')]='0'; let n=1;
     const nf=id=>{const r=find(id); if(!(r in rn))rn[r]='n'+(n++); return rn[r];};
     return comps.map(c=>{const a=nf(c.id+'#0'),b=nf(c.id+'#1');
-      if(c.type==='V'){
-        if(c.sub==='DC')    return 'VDC '+c.name+' '+a+' '+b+' '+c.p.val;
-        if(c.sub==='PULSE') return 'VPULSE '+c.name+' '+a+' '+b+' '+c.p.v1+' '+c.p.v2+' '+c.p.td+' '+c.p.tr;
-        return 'VSIN '+c.name+' '+a+' '+b+' '+c.p.amp+' '+c.p.freq;
+      if(c.type==='V'||c.type==='I'){
+        const P=c.type;   // 'V' or 'I' prefix -> VDC/IDC, VPULSE/IPULSE, VPWL/IPWL, VSIN/ISIN
+        if(c.sub==='DC')    return P+'DC '+c.name+' '+a+' '+b+' '+c.p.val;
+        if(c.sub==='PULSE') return P+'PULSE '+c.name+' '+a+' '+b+' '+c.p.v1+' '+c.p.v2+' '+c.p.td+' '+c.p.tr;
+        if(c.sub==='PWL')   return P+'PWL '+c.name+' '+a+' '+b+' '+c.p.pts;
+        return P+'SIN '+c.name+' '+a+' '+b+' '+c.p.amp+' '+c.p.freq;
       }
-      if(c.type==='I')return 'ISIN '+c.name+' '+a+' '+b+' '+c.p.amp+' '+c.p.freq;
       return c.type+' '+c.name+' '+a+' '+b+' '+c.p.val;
     }).join('\\n');
   }

@@ -873,13 +873,25 @@ static void emitCustomTopology(ofstream& out)
             const char q = (type == "VSIN") ? 'V' : 'I';
             out << "B" << tok[1] << " " << tok[2] << " " << tok[3] << " " << q
                 << " = { " << tok[4] << "*sin(2*pi*" << tok[5] << "*time) }\n";
-        } else if (type == "VDC") {
+        } else if (type == "VDC" || type == "IDC") {
             need(5);
-            out << "V" << tok[1] << " " << tok[2] << " " << tok[3] << " " << tok[4] << "\n";
-        } else if (type == "VPULSE") {
+            const char dev = (type == "VDC") ? 'V' : 'I';
+            out << dev << tok[1] << " " << tok[2] << " " << tok[3] << " " << tok[4] << "\n";
+        } else if (type == "VPULSE" || type == "IPULSE") {
             need(8);
-            out << "V" << tok[1] << " " << tok[2] << " " << tok[3] << " PULSE("
+            const char dev = (type == "VPULSE") ? 'V' : 'I';
+            out << dev << tok[1] << " " << tok[2] << " " << tok[3] << " PULSE("
                 << tok[4] << " " << tok[5] << " " << tok[6] << " " << tok[7] << " 0 1e30 1e30)\n";
+        } else if (type == "VPWL" || type == "IPWL") {
+            // Piecewise-linear (multi-step) source: <name> <a> <b> t1 v1 t2 v2 ... (>=1 pair).
+            need(6);
+            if ((tok.size() - 4) % 2 != 0)
+                throw runtime_error("emitCustomTopology: circuit_spec.txt line " + to_string(lineno)
+                                    + " (" + type + ") needs an even number of (time value) points.");
+            const char dev = (type == "VPWL") ? 'V' : 'I';
+            out << dev << tok[1] << " " << tok[2] << " " << tok[3] << " PWL(";
+            for (size_t i = 4; i < tok.size(); ++i) out << tok[i] << (i + 1 < tok.size() ? " " : "");
+            out << ")\n";
         } else {
             throw runtime_error("emitCustomTopology: circuit_spec.txt line " + to_string(lineno)
                                 + " unknown TYPE '" + type + "'.");
