@@ -1286,8 +1286,9 @@ function applyVisibility(){
   for(const k in VISIBLE_WHEN){ const box=document.getElementById('ctl_'+k);
     if(box) box.style.display = condMatch(VISIBLE_WHEN[k]) ? '' : 'none'; }
   const custom = ctlVal('circuit_kind')===4;
+  // The editor (ceWrap) shows every circuit now (increment B). The raw-spec textarea
+  // (specBox) is only relevant when authoring/holding a custom node-graph.
   const sb=document.getElementById('specBox'); if(sb) sb.style.display = custom?'':'none';
-  const ce=document.getElementById('ceWrap'); if(ce) ce.style.display = custom?'':'none';
 }
 // smart default: sine simple source -> periods; step/switch/custom -> absolute end time
 function suggestTimeMode(){ const ck=ctlVal('circuit_kind'), sk=ctlVal('source_kind'); return (ck===0 && (sk===0||sk===1))?0:1; }
