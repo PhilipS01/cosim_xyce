@@ -426,84 +426,73 @@ def netlist_to_lcapy(parsed, params):
     return "\n".join(r["line"] for r in _lcapy_records(parsed, params))
 
 
-def _lcapy_hinted(recs, port="p", gnd="0"):
-    """Add circuitikz drawing hints so the schematic lays out as a 2D ladder instead of one line.
-    Heuristic for the WR circuit family: find the main series path ground->port, draw the source leg
-    'up' (left), the series chain 'right' (top), the field/last leg 'down' (right); shunt branches to
-    ground go 'down'. Each grounded terminal gets its own ground copy '0__k', all joined by a bottom
-    rail wire. Returns a hinted netlist string, or None when the topology can't be confidently placed
-    (caller falls back to the unhinted netlist)."""
+def _lcapy_hinted(recs, gnd="0"):
+    """Add circuitikz drawing hints so the schematic lays out as a 2D comb/ladder instead of one line.
+
+    Comb model: the ungrounded ('series') elements form a horizontal chain across the top, ordered
+    left-to-right; every grounded ('shunt') element hangs 'down' from its node to a bottom ground rail.
+    This covers the WR circuit family -- a grounded source is just a down-leg (P1), and parallel
+    branches to ground each become their own down-leg (source + C || R+L). Each grounded terminal gets
+    its own ground copy (single-underscore 0_k; double underscore is an invalid lcapy subscript), all
+    joined by a rail wire + one ground symbol. Returns a hinted netlist string, or None when the
+    topology can't be confidently placed (branching/looped top chain, >1 shunt on a node, switches) --
+    the caller then falls back to the unhinted one-line netlist."""
     import collections
-    # The field (or any element straight across port<->ground) is the vertical RETURN leg on the
-    # right, not part of the source path. Set it aside so the BFS routes through the source chain.
-    ret = next((i for i, r in enumerate(recs)
-                if set(r["nodes"]) == {port, gnd} and r["line"].split()[0] == "Lfield"), None)
-    if ret is None:
-        ret = next((i for i, r in enumerate(recs) if set(r["nodes"]) == {port, gnd}), None)
-    adj = collections.defaultdict(list)
+    series, shunt = [], []                                    # indices; 'cross' (both gnd) skipped
     for i, r in enumerate(recs):
-        if i == ret:
-            continue
         a, b = r["nodes"]
-        adj[a].append((i, b)); adj[b].append((i, a))
-    if gnd not in adj or port not in adj:
-        return None
-    # BFS main path ground -> port (element index sequence + node sequence).
-    prev = {gnd: (None, None)}
-    q = collections.deque([gnd])
-    while q:
-        u = q.popleft()
-        if u == port:
-            break
-        for ei, v in adj[u]:
-            if v not in prev:
-                prev[v] = (u, ei); q.append(v)
-    if port not in prev:
-        return None
-    seq, nodeseq, u = [], [port], port
-    while prev[u][0] is not None:
-        seq.append(prev[u][1]); u = prev[u][0]; nodeseq.append(u)
-    seq.reverse(); nodeseq.reverse()                          # elements ground..port, nodes ground..port
-    onpath = set(seq)
-    hint = {}
-    for k, ei in enumerate(seq):                              # first leg 'up', rest of the chain 'right'
-        hint[ei] = "up" if k == 0 else "right"
-    if ret is not None:
-        hint[ret] = "down"                                    # field return leg
-    for i, r in enumerate(recs):                              # off-path: only shunts-to-ground allowed
-        if i in onpath or i == ret:
+        if a == gnd and b == gnd:
             continue
-        if gnd in r["nodes"]:
-            hint[i] = "down"
-        else:
+        (shunt if (a == gnd or b == gnd) else series).append(i)
+    topnode = lambda i: (recs[i]["nodes"][0] if recs[i]["nodes"][1] == gnd else recs[i]["nodes"][1])
+    nodes = set()
+    for i in series:
+        nodes.update(recs[i]["nodes"])
+    for i in shunt:
+        nodes.add(topnode(i))
+    if not nodes:
+        return None
+    # Order the top nodes: the series elements must form a single simple chain (a path).
+    adj = collections.defaultdict(list)
+    for i in series:
+        a, b = recs[i]["nodes"]
+        adj[a].append((b, i)); adj[b].append((a, i))
+    if not series:
+        if len(nodes) != 1:
             return None
-    # Emit, giving each ground terminal a private copy and orienting verticals ground-at-bottom.
-    gk = [0]; grounds = []
-    def gcopy():
-        gk[0] += 1; g = f"0_{gk[0]}"; grounds.append(g); return g
-    out = []
-    for i, r in enumerate(recs):
-        toks = r["line"].split()
-        dev = toks[0]; a, b = r["nodes"]; tail = toks[3:]
-        d = hint[i]
-        if d == "up":                                         # ground(bottom) .. top
-            na, nb = (gcopy() if a == gnd else a), (gcopy() if b == gnd else b)
-            if b == gnd:                                      # ensure ground is first (bottom)
-                na, nb = nb, na
-        elif d == "down":                                     # top .. ground(bottom)
-            na, nb = (gcopy() if a == gnd else a), (gcopy() if b == gnd else b)
-            if a == gnd:                                      # ensure ground is second (bottom)
-                na, nb = nb, na
-        else:                                                 # right: follow path node order
-            if i in onpath:
-                k = seq.index(i); na, nb = nodeseq[k], nodeseq[k + 1]
-            else:
-                na, nb = a, b
-        out.append(" ".join([dev, na, nb] + tail) + f"; {d}")
-    for j in range(1, len(grounds)):                          # bottom rail joins the ground copies
-        out.append(f"W {grounds[j-1]} {grounds[j]}; right")
+        order, seqE = [next(iter(nodes))], []
+    else:
+        deg = {n: len(adj[n]) for n in nodes}
+        if any(deg.get(n, 0) > 2 for n in nodes):             # branching top chain -> not a ladder
+            return None
+        ends = [n for n in nodes if deg.get(n, 0) == 1]
+        start = ends[0] if ends else next(iter(nodes))
+        order, seqE, usedE, cur = [start], [], set(), start
+        while True:
+            nxt = [(v, ei) for v, ei in adj[cur] if ei not in usedE]
+            if not nxt:
+                break
+            v, ei = nxt[0]; usedE.add(ei); seqE.append(ei); order.append(v); cur = v
+        if len(usedE) != len(series) or len(order) != len(nodes):
+            return None                                       # cycle / disconnected / branch
+    pos = {n: k for k, n in enumerate(order)}
+    per = collections.Counter(topnode(i) for i in shunt)
+    if any(v > 1 for v in per.values()):                      # two shunts on one node would overlap
+        return None
+    out, grounds = [], []                                     # grounds: (x_pos, node) for the rail
+    for k, ei in enumerate(seqE):                             # top chain, left -> right
+        toks = recs[ei]["line"].split()
+        out.append(" ".join([toks[0], order[k], order[k + 1]] + toks[3:]) + "; right")
+    gk = [0]
+    for i in shunt:                                           # down-legs to the ground rail
+        toks = recs[i]["line"].split(); tn = topnode(i)
+        gk[0] += 1; g = f"0_{gk[0]}"; grounds.append((pos[tn], g))
+        out.append(" ".join([toks[0], tn, g] + toks[3:]) + "; down")
+    grounds.sort()
+    for j in range(1, len(grounds)):                          # bottom rail joins ground copies L->R
+        out.append(f"W {grounds[j-1][1]} {grounds[j][1]}; right")
     if grounds:
-        out.append(f"W {grounds[0]} 0; down=0.3, ground")     # a single ground symbol
+        out.append(f"W {grounds[0][1]} 0; down=0.3, ground")  # a single ground symbol
     return "\n".join(out)
 
 
