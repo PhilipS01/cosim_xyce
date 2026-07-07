@@ -1,0 +1,11 @@
+# Python dependencies for the WR co-simulation UI (sim_ui.py).
+# The solver itself is C++ (built with `make`); these are only for the studio UI.
+#
+#   python3 -m pip install -r requirements.txt
+#
+# lcapy additionally needs a LaTeX toolchain (pdflatex + circuitikz) for the PDF
+# export; without it the "Export LaTeX/PDF" button still returns the .tex source.
+
+numpy
+matplotlib
+lcapy

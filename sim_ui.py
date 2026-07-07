@@ -162,6 +162,16 @@ VISIBLE_WHEN = {
 
 # Hover help: key -> HTML shown in a tooltip next to the control's label (a "?" icon).
 HELP = {
+    "lcapy_export": (
+        "<div class='hh'>LaTeX / PDF export (lcapy)</div>"
+        "<div class='hn'>Translates the current netlist to an lcapy (circuitikz) circuit and downloads "
+        "<code>circuit.tex</code> + a compiled <code>circuit.pdf</code>. It is a <b>physical view</b>, not "
+        "the literal WR netlist: the interface (Vmeas ammeter + Bfield ROM) collapses to a single field "
+        "inductor <code>L_field p 0</code>, the WR PWL signal sources are dropped, and switches render as "
+        "<code>SW</code>. Uses lcapy auto-layout (may be cramped / single-line &mdash; a nicer layout is a "
+        "later increment). Needs <code>lcapy</code> (pip) and <code>pdflatex</code>; without pdflatex you "
+        "still get the <code>.tex</code>.</div>"
+    ),
     "reconstruct_mode": (
         "<div class='hh'>Field reconstruction (current-driven)</div>"
         "<table>"
@@ -331,6 +341,112 @@ def write_spec(params):
     if spec:
         with open(os.path.join(HERE, "circuit_spec.txt"), "w") as f:
             f.write(spec)
+
+
+# ---------------------------------------------------------------------------
+# lcapy export (LaTeX / PDF)
+# ---------------------------------------------------------------------------
+def _read_sim_params():
+    """Parse sim_params.inc (.PARAM name = value) into a {name: value-string} dict."""
+    import re as _re
+    d = {}
+    path = os.path.join(HERE, "sim_params.inc")
+    if os.path.exists(path):
+        for ln in open(path):
+            mm = _re.match(r"\s*\.PARAM\s+(\w+)\s*=\s*(\S+)", ln.split("*", 1)[0], _re.I)
+            if mm:
+                d[mm.group(1)] = mm.group(2)
+    return d
+
+
+def _resolve(tok, params):
+    """{name} or a bare param name -> its sim_params value; otherwise the literal token."""
+    import re as _re
+    tok = tok.strip()
+    mm = _re.fullmatch(r"\{(\w+)\}", tok)
+    if mm:
+        return params.get(mm.group(1), tok)
+    return params.get(tok, tok)
+
+
+def netlist_to_lcapy(parsed, params):
+    """Translate the parsed Xyce netlist into an lcapy netlist for a PHYSICAL-view schematic:
+    R/L/C direct; sources -> V/I (sin/DC); behavioral gate resistors + native S -> switches; the WR
+    interface (Vmeas 0V ammeter + Bfield field-ROM) collapses to one inductor 'field' between the
+    port and ground; the PWL signal carriers (VFprev/VIprev) and switch control sources are dropped."""
+    import re as _re
+    els = parsed["elements"]
+    vmeas = next((e for e in els if e["name"] == "Vmeas"), None)
+    bfield = next((e for e in els if e["name"] == "Bfield"), None)
+    port = nx_node = None
+    if vmeas and bfield:
+        port, nx_node = vmeas["nodes"][0], vmeas["nodes"][1]   # Vmeas p nx ; Bfield nx 0
+
+    def sine(expr):                                            # 'amp*sin(2*pi*freq*time)' -> (amp,freq)
+        mm = _re.search(r"([A-Za-z0-9_.+\-]+)\s*\*\s*sin\(\s*2\s*\*\s*pi\s*\*\s*([A-Za-z0-9_.+\-]+)\s*\*\s*time",
+                        expr, _re.I)
+        return (_resolve(mm.group(1), params), _resolve(mm.group(2), params)) if mm else None
+
+    def val(expr):                                            # R/L/C value: strip IC=, resolve {param}
+        return _resolve(_re.sub(r"\bIC\s*=\s*\S+", "", expr).strip(), params)
+
+    lines, ncol = [], 0
+    for e in els:
+        nm, t, expr = e["name"], e["type"], e["expr"]
+        if e["signal"] or nm in ("Vmeas", "Bfield") or nm.startswith("Vctrl"):
+            continue                                          # drop WR signals, interface, switch ctrl
+        a, b = (port if n == nx_node else n for n in e["nodes"])
+        if t == "resistor" and expr.strip().startswith("R="):
+            ncol += 1; lines.append(f"SW{nm} {a} {b}")        # behavioral gate -> switch
+        elif t == "resistor":
+            lines.append(f"R{nm} {a} {b} {val(expr)}")
+        elif t == "inductor":
+            lines.append(f"L{nm} {a} {b} {val(expr)}")
+        elif t == "capacitor":
+            lines.append(f"C{nm} {a} {b} {val(expr)}")
+        elif nm[:1].upper() == "S":                           # native VC switch device
+            lines.append(f"SW{nm} {a} {b}")
+        elif t in ("behavioral V", "voltage src"):
+            s = sine(expr)
+            lines.append(f"V{nm} {a} {b} sin(0 {s[0]} {s[1]})" if s
+                         else f"V{nm} {a} {b} {val(expr) if '{' in expr or expr.strip()[:1].isdigit() else 'dc 1'}")
+        elif t in ("behavioral I", "current src"):
+            s = sine(expr)
+            lines.append(f"I{nm} {a} {b} sin(0 {s[0]} {s[1]})" if s else f"I{nm} {a} {b} dc 1")
+    if vmeas and bfield:                                      # collapsed field ROM -> inductor
+        lines.append(f"Lfield {port} 0 {params.get('Lrom', '1.44e-7')}")
+    return "\n".join(lines)
+
+
+def export_lcapy(params):
+    """Regenerate the netlist from the live config, translate to lcapy, and return the circuitikz
+    .tex source + a compiled PDF (base64). Degrades gracefully when lcapy or pdflatex are unavailable."""
+    import tempfile, base64, warnings
+    write_config(params); write_spec(params); emit_netlist()
+    parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
+    netlist = netlist_to_lcapy(parsed, _read_sim_params())
+    try:
+        from lcapy import Circuit
+    except Exception:
+        return {"ok": False, "lcapy_netlist": netlist,
+                "error": "lcapy not installed. Run:  python3 -m pip install --break-system-packages lcapy"}
+    d = tempfile.mkdtemp()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            c = Circuit(netlist)
+            c.draw(os.path.join(d, "c.schtex"))
+            tex = open(os.path.join(d, "c.schtex")).read()
+            pdf_b64 = warn = None
+            try:
+                c.draw(os.path.join(d, "c.pdf"))
+                pdf_b64 = base64.b64encode(open(os.path.join(d, "c.pdf"), "rb").read()).decode()
+            except Exception as pe:
+                warn = "PDF compile failed (tex still available): " + str(pe)[:200]
+        return {"ok": True, "tex": tex, "pdf_b64": pdf_b64, "warn": warn, "lcapy_netlist": netlist}
+    except Exception as e:
+        return {"ok": False, "lcapy_netlist": netlist,
+                "error": "lcapy could not lay out this circuit: " + str(e)[:300]}
 
 
 # ---------------------------------------------------------------------------
@@ -1018,7 +1134,7 @@ class Handler(BaseHTTPRequestHandler):
             }))
 
     def do_POST(self):
-        if self.path not in ("/run", "/sweep", "/netlist"):
+        if self.path not in ("/run", "/sweep", "/netlist", "/export"):
             self._send(404, json.dumps({"error": "unknown endpoint"}))
             return
         n = int(self.headers.get("Content-Length", 0))
@@ -1028,6 +1144,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/netlist":
             self._handle_netlist(body)
+            return
+        if self.path == "/export":
+            try:
+                self._send(200, json.dumps(export_lcapy(body)))
+            except Exception as e:
+                self._send(200, json.dumps({
+                    "ok": False, "error": str(e),
+                    "trace": traceback.format_exc()[-2000:],
+                }))
             return
         try:
             params = body
@@ -1194,6 +1319,7 @@ INDEX_HTML = """<!doctype html>
        border:1px solid #2c333f; border-radius:6px; padding:6px 8px; }
   .slider { flex:1; }
   .btns { display:flex; gap:10px; margin-top:8px; }
+  .mini { font-size:11px; color:var(--muted); align-self:center; font-family:ui-monospace,monospace; }
   button { background:var(--accent); color:#06122a; border:0; border-radius:8px;
            padding:10px 16px; font-weight:600; cursor:pointer; }
   button.secondary { background:#2c333f; color:var(--fg); }
@@ -1313,6 +1439,8 @@ INDEX_HTML = """<!doctype html>
         <div class="btns">
           <button class="secondary small" id="toggleCircuitBtn" onclick="toggleCircuit()">Hide</button>
           <button class="secondary small" onclick="loadCircuit()">Refresh circuit</button>
+          <button class="secondary small" onclick="exportCircuit()">Export LaTeX/PDF<span class="help" data-help="lcapy_export">?</span></button>
+          <span class="mini" id="exportStatus"></span>
         </div>
       </div>
       <div id="circuitContent">
@@ -1547,6 +1675,21 @@ async function loadCircuit(){
       showNetlist(j);
     }
   } catch(e){ /* leave circuit box empty on failure */ }
+}
+function _dl(name, href){ const a=document.createElement('a'); a.href=href; a.download=name; document.body.appendChild(a); a.click(); a.remove(); }
+async function exportCircuit(){
+  const st=document.getElementById('exportStatus');
+  st.textContent='exporting…'; st.style.color='var(--muted)';
+  try {
+    const res=await fetch('/export',{method:'POST',headers:{'Content-Type':'application/json'},
+                                     body:JSON.stringify(collect())});
+    const j=await res.json();
+    if(!j.ok){ st.textContent='✗ '+(j.error||'export failed'); st.style.color='var(--err)'; return; }
+    if(j.tex) _dl('circuit.tex','data:application/x-tex;charset=utf-8,'+encodeURIComponent(j.tex));
+    if(j.pdf_b64) _dl('circuit.pdf','data:application/pdf;base64,'+j.pdf_b64);
+    if(j.warn){ st.textContent='⚠ .tex only ('+j.warn+')'; st.style.color='var(--err)'; }
+    else { st.textContent='✓ circuit.tex + circuit.pdf'; st.style.color='var(--ok)'; }
+  } catch(e){ st.textContent='✗ '+e; st.style.color='var(--err)'; }
 }
 // ---- Custom circuit editor (increment 3b): hand-rolled SVG drag-drop -> circuit_spec ----
 const CE = (function(){
