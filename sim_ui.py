@@ -791,13 +791,17 @@ def make_circuit_plot(parsed):
                     and any(n in e["nodes"] for e in sig_elems)]
     top_nodes = [n for n in nodes if n not in signal_nodes and n not in GND]
 
-    # Geometry.
-    DX, H, R = 2.8, 2.2, 0.34
-    xpos = {n: i * DX for i, n in enumerate(top_nodes)}
-    x_lo = -1.0
-    x_hi = (len(top_nodes) - 1) * DX + 1.0 if top_nodes else 1.0
+    # Bus layout: each non-ground node is a VERTICAL bus; ground is the bottom rail. Every 2-terminal
+    # element is a rung -- node<->node = horizontal between two buses at its OWN y-level (so nothing
+    # overlaps and it never reads as a series rail); node<->ground = vertical from the bus down to the
+    # rail. Rungs cross intervening buses without a junction dot (= no connection, standard convention).
+    DX, ROW, R = 2.6, 1.15, 0.32
+    col = {n: i for i, n in enumerate(top_nodes)}
+    X = lambda n: col[n] * DX
+    x_lo = -1.2
+    x_hi = (len(top_nodes) - 1) * DX + 1.2 if top_nodes else 1.2
 
-    fig, ax = plt.subplots(figsize=(9.6, 6.0))
+    fig, ax = plt.subplots(figsize=(9.6, 6.4))
     fig.patch.set_facecolor("#0f1115")
     ax.set_facecolor("#12151b")
     ax.set_aspect("equal"); ax.axis("off")
@@ -809,31 +813,43 @@ def make_circuit_plot(parsed):
         ax.plot([a[0], b[0]], [a[1], b[1]], color=c, lw=lw, ls=ls,
                 zorder=z, alpha=alpha, solid_capstyle="round")
 
-    def place_on_segment(e, P0, P1, dashed=False):
+    def place_on_segment(e, P0, P1):
         """Draw wires P0->symbol->P1 with the component symbol at the midpoint."""
         x0, y0 = P0; x1, y1 = P1
         mx, my = (x0 + x1) / 2, (y0 + y1) / 2
         L = math.hypot(x1 - x0, y1 - y0) or 1.0
         dx, dy = (x1 - x0) / L, (y1 - y0) / L
-        kind = _classify_source(e)
-        if dashed:
-            wire(P0, P1, c=e["color"], lw=1.5, ls="--", alpha=0.6)
-        else:
-            wire(P0, (mx - R * dx, my - R * dy))
-            wire((mx + R * dx, my + R * dy), P1)
-        _draw_symbol(ax, kind, (mx, my), R, (dx, dy), e["color"])
+        wire(P0, (mx - R * dx, my - R * dy))
+        wire((mx + R * dx, my + R * dy), P1)
+        _draw_symbol(ax, _classify_source(e), (mx, my), R, (dx, dy), e["color"])
         elem_center[e["name"]] = (mx, my)
         legend_seen[e["type"]] = e["color"]
-        # Name label offset perpendicular to the wire.
-        px, py = -dy, dx
-        off = R + 0.26
-        ax.text(mx + off * px, my + off * py, e["name"], fontsize=8.5,
-                ha="center", va="center", color=e["color"], fontweight="bold",
-                zorder=5)
+        pxl, pyl = -dy, dx
+        off = R + 0.24
+        ax.text(mx + off * pxl, my + off * pyl, e["name"], fontsize=8.5,
+                ha="center", va="center", color=e["color"], fontweight="bold", zorder=6)
 
-    # Ground rail.
+    # Classify conductive elements: node<->node rungs vs node<->ground legs.
+    rungs, glegs = [], {}
+    for e in cond_elems:
+        a, b = e["nodes"]; ag, bg = a in GND, b in GND
+        if ag and bg:
+            continue
+        if ag ^ bg:
+            glegs.setdefault(b if ag else a, []).append(e)
+        elif a in col and b in col:
+            rungs.append((a, b, e))
+
+    GBAND = 1.0                       # ground legs occupy y in [0, GBAND]
+    conn = {n: [] for n in top_nodes}  # node -> y-levels where a rung meets its bus
+    top_y = GBAND + 0.4 + max(1, len(rungs)) * ROW
+    y = top_y
+    rung_rows = []
+    for a, b, e in rungs:
+        rung_rows.append((a, b, e, y)); conn[a].append(y); conn[b].append(y); y -= ROW
+
+    # Ground rail + symbol.
     wire((x_lo, 0.0), (x_hi, 0.0), c=WIRE, lw=2.2)
-    # Ground symbol near the rail centre.
     gx = (x_lo + x_hi) / 2
     wire((gx, 0.0), (gx, -0.18), c=WIRE)
     for i, w in enumerate((0.16, 0.10, 0.05)):
@@ -842,48 +858,37 @@ def make_circuit_plot(parsed):
     ax.text(gx + 0.22, -0.30, "0", fontsize=9.5, ha="left", va="center",
             color="#e6e6e6", fontweight="bold")
 
-    # Conductive branches.
-    legs = {}      # node -> list of leg elements (to ground)
-    spans = []     # (a, b, element)
-    for e in cond_elems:
-        a, b = e["nodes"]
-        ag, bg = a in GND, b in GND
-        if ag ^ bg:
-            node = b if ag else a
-            legs.setdefault(node, []).append(e)
-        elif not ag and not bg:
-            spans.append((a, b, e))
-        # ground-ground: skip
-
-    for node, es in legs.items():
-        if node not in xpos:
-            continue
-        bx = xpos[node]
-        cnt = len(es)
-        for idx, e in enumerate(es):
-            ox = bx + (idx - (cnt - 1) / 2.0) * 0.7      # fan parallel legs
-            wire((bx, H), (ox, H))                       # jog from node
-            place_on_segment(e, (ox, H), (ox, 0.0))
-
-    for a, b, e in spans:
-        if a not in xpos or b not in xpos:
-            continue
-        ia, ib = top_nodes.index(a), top_nodes.index(b)
-        ya = yb = H
-        if abs(ia - ib) > 1:                             # raise non-adjacent spans
-            yraise = H + 0.9
-            wire((xpos[a], H), (xpos[a], yraise))
-            wire((xpos[b], H), (xpos[b], yraise))
-            ya = yb = yraise
-        place_on_segment(e, (xpos[a], ya), (xpos[b], yb))
-
-    # Top-node terminals + labels.
+    # Vertical buses (one per non-ground node), with a terminal + label at the top.
     for n in top_nodes:
-        x = xpos[n]
-        ax.plot([x], [H], marker="o", ms=8, color="#0d0f14",
-                mec="tab:cyan", mew=1.7, zorder=4)
-        ax.text(x, H + 0.28, n, fontsize=10, ha="center", va="bottom",
-                color="#e6e6e6", fontweight="bold", zorder=5)
+        cs = conn[n]; grounded = n in glegs
+        if not cs and not grounded:
+            continue
+        y_hi = max(cs) if cs else GBAND
+        y_lo = GBAND if grounded else (min(cs) if cs else GBAND)
+        wire((X(n), y_lo), (X(n), y_hi))
+        deg = len(cs) + len(glegs.get(n, []))
+        if deg >= 3:                                     # junction dots at real T-connections
+            for yy in cs:
+                ax.plot([X(n)], [yy], marker="o", ms=5, color=WIRE, zorder=5)
+        ax.plot([X(n)], [y_hi], marker="o", ms=8, color="#0d0f14",
+                mec="tab:cyan", mew=1.7, zorder=5)
+        ax.text(X(n), y_hi + 0.24, n, fontsize=10, ha="center", va="bottom",
+                color="#e6e6e6", fontweight="bold", zorder=6)
+
+    # node<->node rungs (drawn over the buses).
+    for a, b, e, yy in rung_rows:
+        place_on_segment(e, (X(a), yy), (X(b), yy))
+
+    # node<->ground legs: vertical from the bus band down to the rail (fan if several on a node).
+    for n, es in glegs.items():
+        if n not in col:
+            continue
+        cnt = len(es)
+        for i, e in enumerate(es):
+            ox = X(n) + (i - (cnt - 1) / 2.0) * 0.75
+            if abs(ox - X(n)) > 1e-9:
+                wire((X(n), GBAND), (ox, GBAND))
+            place_on_segment(e, (ox, GBAND), (ox, 0.0))
 
     # PWL signal sources: a row beneath the rail, each feeding its reads-arrow.
     sy = -1.25
@@ -924,7 +929,7 @@ def make_circuit_plot(parsed):
                   labelcolor="#e6e6e6")
 
     ax.set_xlim(x_lo - 0.6, x_hi + 0.6)
-    ax.set_ylim(sy - 0.9, H + 1.4)
+    ax.set_ylim(sy - 0.9, top_y + 0.7)
     ax.set_title(f"Circuit schematic ({len(cond_elems)} branches, "
                  f"{len(sig_elems)} signal sources, {len(nodes)} nodes)",
                  color="#9aa4b2")
