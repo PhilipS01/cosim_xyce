@@ -37,28 +37,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # --- Parameter spec: (key, label, default, kind, slider min/max/step or None) ---
 # kind: "float" or "int". slider tuple => render a range slider alongside the box.
 PARAMS = [
-    ("source_kind",                     "Circuit source",               0,        "choice",
-        {0: "sinusoidal voltage", 1: "sinusoidal current", 2: "step/ramp voltage"}),
-    ("frequency",                       "Source frequency f (Hz)",      50.0,     "float", (1, 200, 1)),
-    ("amplitude",                       "Source amplitude (V or A)",    1.0,      "float", (0.1, 10, 0.1)),
-    ("step_v_initial",                  "Step: initial level",          0.0,      "float", None),
-    ("step_v_final",                    "Step: final level",            1.0,      "float", None),
-    ("step_delay",                      "Step: onset delay (s)",        0.0,      "float", None),
-    ("step_rise",                       "Step: ramp/rise time (s)",     1.0e-4,   "float", None),
-    ("R_series",                        "R_series src->port (Ohm)",     6.0e-3,   "float", None),
-    ("L_series",                        "L_series src->port (H)",       1.6e-7,   "float", None),
-    ("C_series",                        "C_series src->port (F, 0=off)",0.0,      "float", None),
-    ("circuit_kind",                    "Circuit topology",             0,        "choice",
-        {0: "simple source", 1: "#4 2-way (sine U,C)", 2: "#5 2-way (DC U,C)", 3: "#6 2-way (AC vs R)",
-         4: "custom (node-graph spec)"}),
-    ("switch_backend",                  "Switch backend",               0,        "choice",
-        {0: "behavioral R", 1: "native S"}),
-    ("switch_t1",                       "Switch t1 (s)",                6.0e-3,   "float", None),
-    ("switch_C",                        "Switch cap C (F)",             1.0e-6,   "float", None),
-    ("switch_R",                        "Switch R (Ohm, #6)",           1.0e4,    "float", None),
-    ("switch_Ron",                      "Switch Ron closed (Ohm)",      1.0e-3,   "float", None),
-    ("switch_Roff",                     "Switch Roff open (Ohm)",       1.0e9,    "float", None),
-    ("switch_trise",                    "Switch transition (s)",        1.0e-5,   "float", None),
+    # The circuit side (source + passives + topology) is authored in the circuit-netlist text panel,
+    # not here -- see the "Circuit netlist" box. Only field/coupling/timing/solver knobs live here.
+    ("frequency",                       "Reference freq f (Hz, timing)", 50.0,    "float", (1, 200, 1)),
     ("L_ROM",                           "L_ROM (H)",                    1.44e-7,  "float", None),
     ("R_ROM",                           "R_ROM (Ohm)",                  4.59e-4,  "float", None),
     ("L_FEM",                           "L_FEM (H, 'true' field)",      1.6e-7,   "float", None),
@@ -93,37 +74,20 @@ SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
 # Circuit-side presets (hybrid model): a preset seeds the editable primitive fields; the user
 # may then tweak any field. Increment 1 covers the three source kinds + series R/L; presets 4-6
 # (switches) arrive in increment 2. Keys map to the flat config the C++ generator consumes.
+# Presets seed the circuit-netlist text (circuit_spec) + the field/coupling/timing knobs. The circuit
+# side is a simplified spec: reserved nodes p=port, 0=gnd; one element/line (VSIN/ISIN/VPULSE/R/L/C...).
+# (Switch presets P4-P6 are retired here -- switches aren't expressible in the simplified spec yet.)
 PRESETS = {
-    "P1: Sine V + RL": {"circuit_kind": 0, "source_kind": 0, "amplitude": 1.0, "frequency": 50.0,
-                        "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0, "time_mode": 0,
-                        "coupling_mode": 0},
+    "P1: Sine V + RL": {"time_mode": 0, "coupling_mode": 0, "frequency": 50.0,
+                        "circuit_spec": "VSIN Bemf s 0 1 50\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
     # Bare current source directly on the port: series R/L/C are meaningless for a current drive
     # (the current is forced regardless) and an ideal I-source in series with L is degenerate.
-    "P2: Sine I (bare)": {"circuit_kind": 0, "source_kind": 1, "amplitude": 1.0, "frequency": 50.0,
-                          "R_series": 0.0, "L_series": 0.0, "C_series": 0.0, "time_mode": 0,
-                          "coupling_mode": 1},
-    "P3: Step/ramp V + RL": {"circuit_kind": 0, "source_kind": 2, "step_v_initial": 0.0,
-                             "step_v_final": 1.0, "step_delay": 0.0, "step_rise": 1.0e-4,
-                             "R_series": 6.0e-3, "L_series": 1.6e-7, "C_series": 0.0,
-                             "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50, "coupling_mode": 0,
-                             # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters
-                             "WRmaxSteps": 40},
-    # --- Increment 2: switch topologies. NOTE the passive values are numerical-survival defaults,
-    # not physically tuned to the field scale -- see the notes: C must stay small enough for WR to
-    # contract, and the cap<->coil freewheel (P4/P5) needs a damped closed switch (Ron~10) or its
-    # ~undamped LC ring dt-collapses. Tune C / Ron / times to your field for a meaningful excitation.
-    "P4: 2-way switch (sine U, C)": {"circuit_kind": 1, "switch_backend": 0, "amplitude": 1.0,
-                                     "frequency": 50.0, "switch_C": 1.0e-6, "switch_Ron": 10.0,
-                                     "switch_t1": 6.0e-3, "WRmaxSteps": 40,
-                                     "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50, "coupling_mode": 0},
-    "P5: 2-way switch (DC U, C)": {"circuit_kind": 2, "switch_backend": 0, "amplitude": 1.0,
-                                   "switch_C": 1.0e-6, "switch_Ron": 10.0,
-                                   "switch_t1": 6.0e-3, "WRmaxSteps": 40,
-                                   "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50, "coupling_mode": 0},
-    "P6: 2-way switch (AC vs R)": {"circuit_kind": 3, "switch_backend": 0, "amplitude": 1.0,
-                                   "frequency": 50.0, "switch_R": 1.0e4, "switch_Ron": 1.0e-3,
-                                   "switch_t1": 6.0e-3, "WRmaxSteps": 40,
-                                   "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50, "coupling_mode": 0},
+    "P2: Sine I (bare)": {"time_mode": 0, "coupling_mode": 1, "frequency": 50.0,
+                          "circuit_spec": "ISIN Bemf 0 p 1 50\n"},
+    # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters (WRmaxSteps=40)
+    "P3: Step/ramp V + RL": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
+                             "coupling_mode": 0, "WRmaxSteps": 40,
+                             "circuit_spec": "VPULSE Vemf s 0 0 1 0 1e-4\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
 }
 
 
@@ -134,24 +98,7 @@ PRESETS = {
 # matches the current control values (OR-of-ANDs). Keys absent here are always visible. The custom
 # spec box + SVG editor are handled separately in JS (visible only when circuit_kind == 4).
 VISIBLE_WHEN = {
-    "source_kind": [{"circuit_kind": [0]}],
-    "R_series":    [{"circuit_kind": [0]}],
-    "L_series":    [{"circuit_kind": [0]}],
-    "C_series":    [{"circuit_kind": [0]}],
-    "step_v_initial": [{"circuit_kind": [0], "source_kind": [2]}],
-    "step_v_final":   [{"circuit_kind": [0], "source_kind": [2]}],
-    "step_delay":     [{"circuit_kind": [0], "source_kind": [2]}],
-    "step_rise":      [{"circuit_kind": [0], "source_kind": [2]}],
-    "amplitude":   [{"circuit_kind": [0, 1, 2, 3]}],
-    "frequency":   [{"time_mode": [0]}, {"circuit_kind": [0], "source_kind": [0, 1]},
-                    {"circuit_kind": [1, 3]}],
-    "switch_backend": [{"circuit_kind": [1, 2, 3]}],
-    "switch_t1":      [{"circuit_kind": [1, 2, 3]}],
-    "switch_Ron":     [{"circuit_kind": [1, 2, 3]}],
-    "switch_Roff":    [{"circuit_kind": [1, 2, 3]}],
-    "switch_trise":   [{"circuit_kind": [1, 2, 3]}],
-    "switch_C":       [{"circuit_kind": [1, 2]}],
-    "switch_R":       [{"circuit_kind": [3]}],
+    "frequency":                       [{"time_mode": [0]}],   # only drives the 'source periods' duration
     "N_periods":                       [{"time_mode": [0]}],
     "N_field_steps_per_source_period": [{"time_mode": [0]}],
     "t_end":            [{"time_mode": [1]}],
@@ -164,15 +111,16 @@ VISIBLE_WHEN = {
 # Hover help: key -> HTML shown in a tooltip next to the control's label (a "?" icon).
 HELP = {
     "circuit_spec_edit": (
-        "<div class='hh'>Circuit spec (text editor)</div>"
-        "<div class='hn'>The circuit side as text. Presets seed it automatically; edit and <b>Apply spec</b> "
-        "to fork the circuit into a custom node-graph (topology = custom) and re-render. Nodes: <code>p</code>"
-        "=port, <code>0</code>=ground; reserved. One element per line:<br>"
+        "<div class='hh'>Circuit side (text)</div>"
+        "<div class='hn'>The circuit is authored here, not in the side panel. Presets seed it; edit and "
+        "<b>Apply &amp; render</b>. Nodes: <code>p</code>=port (field attaches here), <code>0</code>=ground; "
+        "reserved. One element per line:<br>"
         "<code>R/L/C name a b value</code><br>"
         "<code>VSIN/ISIN name a b amp freq</code> &middot; <code>VDC/IDC name a b value</code><br>"
         "<code>VPULSE/IPULSE name a b v1 v2 td tr</code> &middot; <code>VPWL/IPWL name a b t1 v1 t2 v2 …</code>"
-        "<br>The WR interface (ammeter + field ROM) is appended automatically. Switches can't be expressed "
-        "as a spec &mdash; a switch preset shows its schematic but its spec omits the switches.</div>"
+        "<br>The WR interface (<code>Vmeas</code> ammeter + <code>Bfield</code> field ROM) and the "
+        "<code>.INCLUDE</code>/<code>.print</code>/<code>.end</code> directives are generated and shown "
+        "locked around the editable box.</div>"
     ),
     "lcapy_export": (
         "<div class='hh'>LaTeX / PDF export (lcapy)</div>"
@@ -271,6 +219,9 @@ def write_config(params):
                 f.write(f"{k} = {int(round(float(v)))}\n")
             else:
                 f.write(f"{k} = {float(v):.10g}\n")
+        # The circuit side is always authored via the text spec (circuit_spec.txt), so force the
+        # custom node-graph path; source_kind / R_series / switch_* keep their C++ defaults (inert).
+        f.write("circuit_kind = 4\n")
     return path
 
 
@@ -380,19 +331,26 @@ def _resolve(tok, params):
     return params.get(tok, tok)
 
 
-def _lcapy_records(parsed, params):
-    """Map the parsed Xyce netlist to lcapy device records for a PHYSICAL-view schematic. Each record
-    is {"line": "<lcapy device w/o hint>", "nodes": [a, b]}. R/L/C direct; sources -> V/I (sin/DC);
-    behavioral gate resistors + native S -> switches; the WR interface (Vmeas 0V ammeter + Bfield
-    field-ROM) collapses to one inductor 'Lfield' between the port and ground; the PWL signal carriers
-    (VFprev/VIprev) and switch control sources are dropped."""
-    els = parsed["elements"]
-    vmeas = next((e for e in els if e["name"] == "Vmeas"), None)
-    bfield = next((e for e in els if e["name"] == "Bfield"), None)
-    port = nx_node = None
-    if vmeas and bfield:
-        port, nx_node = vmeas["nodes"][0], vmeas["nodes"][1]   # Vmeas p nx ; Bfield nx 0
+def _split_netlist(raw):
+    """Split the generated wr_circuit.cir into (head, tail) around the editable circuit side, using the
+    '* === CIRCUIT SIDE' / '* === WR INTERFACE' markers WriteCircuitNetlist emits. head = title +
+    .INCLUDE sim_params.inc (above the circuit); tail = the WR interface + directives (below). Both are
+    shown read-only in the UI; the circuit side between them is edited as the text spec."""
+    lines = raw.splitlines()
+    ci = next((i for i, l in enumerate(lines) if l.startswith("* === CIRCUIT SIDE")), None)
+    ii = next((i for i, l in enumerate(lines) if l.startswith("* === WR INTERFACE")), None)
+    head = "\n".join(lines[:ci]).rstrip() if ci is not None else ""
+    tail = "\n".join(lines[ii:]).strip() if ii is not None else ""
+    return head, tail
 
+
+def _lcapy_records(parsed, params):
+    """Map the parsed Xyce netlist to lcapy device records for the schematic. Each record is
+    {"line": "<lcapy device w/o hint>", "nodes": [a, b]}. R/L/C direct; sources -> V/I (sin/DC);
+    behavioral gate resistors + native S -> switches. The WR interface is shown FAITHFULLY (not
+    collapsed): Vmeas -> a 0 V source (ammeter) on p-nx, Bfield -> a labelled voltage source (the
+    field-ROM Thevenin) on nx-0. Only the PWL signal carriers (VFprev/VIprev) and switch control
+    sources are dropped -- they sit on isolated reference nodes and aren't physical branches."""
     def sine(expr):                                            # 'amp*sin(2*pi*freq*time)' -> (amp,freq)
         mm = re.search(r"([A-Za-z0-9_.+\-]+)\s*\*\s*sin\(\s*2\s*\*\s*pi\s*\*\s*([A-Za-z0-9_.+\-]+)\s*\*\s*time",
                        expr, re.I)
@@ -404,12 +362,16 @@ def _lcapy_records(parsed, params):
     recs = []
     def emit(line, a, b):
         recs.append({"line": line, "nodes": [a, b]})
-    for e in els:
+    for e in parsed["elements"]:
         nm, t, expr = e["name"], e["type"], e["expr"]
-        if e["signal"] or nm in ("Vmeas", "Bfield") or nm.startswith("Vctrl"):
-            continue                                          # drop WR signals, interface, switch ctrl
-        a, b = [port if n == nx_node else n for n in e["nodes"]]
-        if t == "resistor" and expr.strip().startswith("R="):
+        if e["signal"] or nm.startswith("Vctrl"):
+            continue                                          # drop PWL signal carriers + switch ctrl
+        a, b = e["nodes"]
+        if nm == "Vmeas":                                     # 0 V ammeter on the interface branch
+            emit(f"V{nm} {a} {b} 0", a, b)
+        elif nm == "Bfield":                                  # field-ROM Thevenin (matched secant)
+            emit(f"V{nm} {a} {b}", a, b)                      # symbolic (the expr is not lcapy-drawable)
+        elif t == "resistor" and expr.strip().startswith("R="):
             emit(f"SW{nm} {a} {b}", a, b)                     # behavioral gate -> switch
         elif t == "resistor":
             emit(f"R{nm} {a} {b} {val(expr)}", a, b)
@@ -426,8 +388,6 @@ def _lcapy_records(parsed, params):
         elif t in ("behavioral I", "current src"):
             s = sine(expr)
             emit(f"I{nm} {a} {b} sin(0 {s[0]} {s[1]})" if s else f"I{nm} {a} {b} dc 1", a, b)
-    if vmeas and bfield:                                      # collapsed field ROM -> inductor
-        emit(f"Lfield {port} 0 {params.get('Lrom', '1.44e-7')}", port, "0")
     return recs
 
 
@@ -1053,12 +1013,12 @@ class Handler(BaseHTTPRequestHandler):
             emit_netlist()
             parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
             sim_params = _read_sim_params()
-            spec, has_sw = graph_to_spec(netlist_to_editor(parsed, sim_params))
+            head, tail = _split_netlist(parsed["raw"])
             self._send(200, json.dumps({
                 "ok": True,
-                "schematic": lcapy_schematic_png(parsed, sim_params),   # inline 2D view (data-URI or null)
-                "spec": spec,                                           # current circuit as an editable spec
-                "spec_has_switch": has_sw,                              # switches can't be expressed as a spec
+                "schematic": lcapy_schematic_png(parsed, sim_params),   # inline schematic (data-URI or null)
+                "locked_head": head,                                    # includes above the circuit side
+                "locked_tail": tail,                                    # WR interface + directives (read-only)
                 "elements": [{k: e[k] for k in ("name", "type", "nodes", "desc")}
                              for e in parsed["elements"]],
                 "directives": parsed["directives"],
@@ -1211,7 +1171,7 @@ def _controls_html():
 
 def _sweep_options_html():
     return "".join(
-        f'<option value="{k}"{" selected" if k == "R_series" else ""}>{LABELS[k]}</option>'
+        f'<option value="{k}"{" selected" if k == "R_ROM" else ""}>{LABELS[k]}</option>'
         for k in SWEEPABLE
     )
 
@@ -1284,9 +1244,14 @@ INDEX_HTML = """<!doctype html>
   .cedit-hd { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px;
               font-weight:600; margin-bottom:6px; }
   .cedit-hd button { margin-left:auto; }
-  #f_circuit_spec { width:100%; min-height:200px; background:#0d0f14; color:#e6e6e6;
-       border:1px solid #2c333f; border-radius:6px; padding:8px; resize:vertical;
-       font-family:ui-monospace,monospace; font-size:12px; line-height:1.5; }
+  #f_circuit_spec { width:100%; min-height:120px; background:#0d0f14; color:#e6e6e6;
+       border:1px solid var(--accent); border-radius:0; padding:8px; resize:vertical;
+       font-family:ui-monospace,monospace; font-size:12px; line-height:1.5; display:block; }
+  pre.locked { margin:0; padding:6px 8px; background:#12151b; color:#7f8895;
+       border:1px solid #2c333f; font-family:ui-monospace,monospace; font-size:11px; line-height:1.5;
+       white-space:pre-wrap; overflow-x:auto; }
+  #lockHead { border-radius:6px 6px 0 0; border-bottom:none; }
+  #lockTail { border-radius:0 0 6px 6px; border-top:none; }
   .cedit-r img { width:100%; border-radius:8px; background:#fff; display:block; }
   .note.warn { color:var(--err); }
   /* --- hover help tooltip --- */
@@ -1350,10 +1315,10 @@ INDEX_HTML = """<!doctype html>
   <div class="panel" id="results">
     <div id="circuitBox">
       <div class="secthd">
-        <span>Circuit (<code>wr_circuit.cir</code>)</span>
+        <span>Circuit netlist (<code>wr_circuit.cir</code>)</span>
         <div class="btns">
           <button class="secondary small" id="toggleCircuitBtn" onclick="toggleCircuit()">Hide</button>
-          <button class="secondary small" onclick="loadCircuit()">Refresh circuit</button>
+          <button class="secondary small" onclick="loadCircuit()">Refresh</button>
           <button class="secondary small" onclick="exportCircuit()">Export LaTeX/PDF<span class="help" data-help="lcapy_export">?</span></button>
           <span class="mini" id="exportStatus"></span>
         </div>
@@ -1361,22 +1326,25 @@ INDEX_HTML = """<!doctype html>
       <div id="circuitContent">
         <div class="cedit">
           <div class="cedit-l">
-            <div class="cedit-hd">Circuit spec<span class="help" data-help="circuit_spec_edit">?</span>
-              <button class="small" onclick="applySpec()">Apply spec &rarr; run-ready</button></div>
+            <div class="cedit-hd">Circuit side<span class="help" data-help="circuit_spec_edit">?</span>
+              <button class="small" onclick="applySpec()">Apply &amp; render</button></div>
+            <pre class="locked" id="lockHead"></pre>
             <textarea id="f_circuit_spec" spellcheck="false">__SPEC_SEED__</textarea>
-            <div class="note" id="specNote">Nodes: <code>p</code>=port, <code>0</code>=gnd. One element/line:
-              <code>R/L/C name a b val</code>, <code>{V,I}SIN name a b amp f</code>,
-              <code>{V,I}DC name a b val</code>, <code>{V,I}PULSE name a b v1 v2 td tr</code>,
-              <code>{V,I}PWL name a b t1 v1 …</code>. "Apply spec" sets topology = custom.</div>
+            <pre class="locked" id="lockTail"></pre>
+            <div class="note">Only the <b>circuit side</b> (white box) is editable — the WR interface
+              (<code>Vmeas</code>, <code>Bfield</code>) and directives are generated and locked. Reserved
+              nodes <code>p</code>=port, <code>0</code>=gnd. One element/line: <code>R/L/C name a b val</code>,
+              <code>{V,I}SIN name a b amp f</code>, <code>{V,I}DC name a b val</code>,
+              <code>{V,I}PULSE name a b v1 v2 td tr</code>, <code>{V,I}PWL name a b t1 v1 …</code>.</div>
           </div>
           <div class="cedit-r">
-            <div class="cedit-hd">Schematic <span class="mini">(lcapy, physical view)</span></div>
+            <div class="cedit-hd">Schematic <span class="mini">(lcapy)</span></div>
             <img id="p_circuit" alt="circuit schematic">
             <div class="note" id="schemNote"></div>
           </div>
         </div>
         <div id="netlistTable"></div>
-        <details><summary>Raw netlist + directives</summary><pre id="netlistRaw"></pre></details>
+        <details><summary>Full raw netlist + directives</summary><pre id="netlistRaw"></pre></details>
       </div>
     </div>
     <div class="summary" id="summary"></div>
@@ -1410,15 +1378,6 @@ function condMatch(cond){ return cond.some(d => Object.keys(d).every(k => d[k].i
 function applyVisibility(){
   for(const k in VISIBLE_WHEN){ const box=document.getElementById('ctl_'+k);
     if(box) box.style.display = condMatch(VISIBLE_WHEN[k]) ? '' : 'none'; }
-}
-// smart default: sine simple source -> periods; step/switch/custom -> absolute end time
-function suggestTimeMode(){ const ck=ctlVal('circuit_kind'), sk=ctlVal('source_kind'); return (ck===0 && (sk===0||sk===1))?0:1; }
-// current-source circuit -> current-driven coupling (avoids the window-start V(p) secant spike)
-function suggestCouplingMode(){ const ck=ctlVal('circuit_kind'), sk=ctlVal('source_kind'); return (ck===0 && sk===1)?1:0; }
-function onTopoChange(){
-  const tm=document.getElementById('f_time_mode'); if(tm) tm.value=String(suggestTimeMode());
-  const cm=document.getElementById('f_coupling_mode'); if(cm) cm.value=String(suggestCouplingMode());
-  applyVisibility();
 }
 
 function applyPreset(){
@@ -1583,24 +1542,18 @@ async function loadCircuit(){
       if (j.schematic){ img.src=j.schematic; img.style.display=''; sn.textContent=''; }
       else { img.removeAttribute('src'); img.style.display='none';
              sn.textContent='(no schematic — lcapy/pdflatex unavailable, or layout not supported for this circuit)'; }
-      // Seed the spec textarea from the current circuit UNLESS the user is authoring a custom spec
-      // (circuit_kind=custom), so preset edits are not clobbered on refresh.
-      const ta=document.getElementById('f_circuit_spec'), pn=document.getElementById('specNote');
-      if (ta && ctlVal('circuit_kind')!==4) ta.value = j.spec || '';
-      if (pn) pn.classList.toggle('warn', !!j.spec_has_switch);
-      if (j.spec_has_switch && pn) pn.innerHTML =
-        '⚠ This circuit contains switches, which the custom spec cannot express — they are omitted from '
-        +'the spec above (the schematic still shows them). Editing here forks a switch-less custom circuit.';
+      // Locked context around the editable circuit side (read-only). The textarea itself is authored
+      // by the user / seeded by presets and is NOT overwritten here.
+      document.getElementById('lockHead').textContent = j.locked_head || '';
+      document.getElementById('lockTail').textContent = j.locked_tail || '';
       showNetlist(j);
     }
   } catch(e){ /* leave circuit box empty on failure */ }
 }
 function applySpec(){
   const ta=document.getElementById('f_circuit_spec');
-  if (!ta || !ta.value.trim()){ setStatus('Circuit spec is empty.','err'); return; }
-  const ks=document.getElementById('f_circuit_kind'); if (ks) ks.value='4';   // fork to custom topology
-  applyVisibility();
-  setStatus('Applied spec — topology set to custom.','');
+  if (!ta || !ta.value.trim()){ setStatus('Circuit side is empty.','err'); return; }
+  setStatus('Rendering circuit…','');
   loadCircuit();
 }
 function _dl(name, href){ const a=document.createElement('a'); a.href=href; a.download=name; document.body.appendChild(a); a.click(); a.remove(); }
@@ -1625,8 +1578,6 @@ window.addEventListener('load', ()=>{
   // Help hover is document-wide now (help icons live in both the controls and the circuit box).
   document.addEventListener('mouseover', e=>{ if(e.target.classList.contains('help')) helpShow(e.target); });
   document.addEventListener('mouseout',  e=>{ if(e.target.classList.contains('help')) helpHide(); });
-  const ck=document.getElementById('f_circuit_kind'); if(ck) ck.addEventListener('change', onTopoChange);
-  const sk=document.getElementById('f_source_kind'); if(sk) sk.addEventListener('change', onTopoChange);
   applyVisibility(); loadCircuit();
 });
 </script>
