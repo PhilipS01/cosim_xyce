@@ -48,12 +48,11 @@ PARAMS = [
     ("L_series",                        "L_series src->port (H)",       1.6e-7,   "float", None),
     ("C_series",                        "C_series src->port (F, 0=off)",0.0,      "float", None),
     ("circuit_kind",                    "Circuit topology",             0,        "choice",
-        {0: "simple source", 1: "#4 3-way (sine U,C)", 2: "#5 2-way (DC U,C)", 3: "#6 2-way (AC vs R)",
+        {0: "simple source", 1: "#4 2-way (sine U,C)", 2: "#5 2-way (DC U,C)", 3: "#6 2-way (AC vs R)",
          4: "custom (node-graph spec)"}),
     ("switch_backend",                  "Switch backend",               0,        "choice",
         {0: "behavioral R", 1: "native S"}),
     ("switch_t1",                       "Switch t1 (s)",                6.0e-3,   "float", None),
-    ("switch_t2",                       "Switch t2 (s, 3-way)",         1.3e-2,   "float", None),
     ("switch_C",                        "Switch cap C (F)",             1.0e-6,   "float", None),
     ("switch_R",                        "Switch R (Ohm, #6)",           1.0e4,    "float", None),
     ("switch_Ron",                      "Switch Ron closed (Ohm)",      1.0e-3,   "float", None),
@@ -112,9 +111,9 @@ PRESETS = {
     # not physically tuned to the field scale -- see the notes: C must stay small enough for WR to
     # contract, and the cap<->coil freewheel (P4/P5) needs a damped closed switch (Ron~10) or its
     # ~undamped LC ring dt-collapses. Tune C / Ron / times to your field for a meaningful excitation.
-    "P4: 3-way switch (sine U, C)": {"circuit_kind": 1, "switch_backend": 0, "amplitude": 1.0,
+    "P4: 2-way switch (sine U, C)": {"circuit_kind": 1, "switch_backend": 0, "amplitude": 1.0,
                                      "frequency": 50.0, "switch_C": 1.0e-6, "switch_Ron": 10.0,
-                                     "switch_t1": 6.0e-3, "switch_t2": 1.3e-2, "WRmaxSteps": 40,
+                                     "switch_t1": 6.0e-3, "WRmaxSteps": 40,
                                      "time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50, "coupling_mode": 0},
     "P5: 2-way switch (DC U, C)": {"circuit_kind": 2, "switch_backend": 0, "amplitude": 1.0,
                                    "switch_C": 1.0e-6, "switch_Ron": 10.0,
@@ -150,7 +149,6 @@ VISIBLE_WHEN = {
     "switch_Ron":     [{"circuit_kind": [1, 2, 3]}],
     "switch_Roff":    [{"circuit_kind": [1, 2, 3]}],
     "switch_trise":   [{"circuit_kind": [1, 2, 3]}],
-    "switch_t2":      [{"circuit_kind": [1]}],
     "switch_C":       [{"circuit_kind": [1, 2]}],
     "switch_R":       [{"circuit_kind": [3]}],
     "N_periods":                       [{"time_mode": [0]}],
@@ -193,8 +191,8 @@ HELP = {
         "<table>"
         "<tr><th>kind</th><th>circuit (coil always sits between port p and gnd)</th></tr>"
         "<tr><td>simple source</td><td>one source (sine V / sine I / step) + series R/L/C to the port</td></tr>"
-        "<tr><td>#4 3-way (sine U,C)</td><td>sine U + cap C. drive [0,t1): U charges C &amp; drives the "
-        "coil &rarr; freewheel [t1,t2): C &#8741; coil, U off &rarr; open [t2,&infin;)</td></tr>"
+        "<tr><td>#4 2-way (sine U,C)</td><td>sine U + cap C. drive [0,t1): U charges C &amp; drives the "
+        "coil &rarr; freewheel [t1,&infin;): C &#8741; coil, U off (the open pre-t0 state isn't a throw)</td></tr>"
         "<tr><td>#5 2-way (DC U,C)</td><td>DC U + cap C. drive [0,t1) &rarr; freewheel [t1,&infin;)</td></tr>"
         "<tr><td>#6 2-way (AC vs R)</td><td>V_AC and R both at the port. AC-drive [0,t1): V_AC drives "
         "the coil &rarr; R-damp [t1,&infin;): R &#8741; coil, source off</td></tr>"
@@ -211,10 +209,6 @@ HELP = {
         "<div class='hh'>Switch throw time t1</div>"
         "<div class='hn'>First throw instant. #4/#5: drive &rarr; freewheel at t1. #6: AC-drive &rarr; "
         "R-damp at t1. Must fall inside the run (&lt; end time).</div>"
-    ),
-    "switch_t2": (
-        "<div class='hh'>Switch throw time t2 (3-way, #4 only)</div>"
-        "<div class='hn'>Second throw: #4 freewheel &rarr; open at t2. Needs t1 &lt; t2 &lt; end time.</div>"
     ),
     "switch_C": (
         "<div class='hh'>Switch capacitor C (#4/#5)</div>"

@@ -55,16 +55,15 @@ struct SimConfig
 
     // --- Switch topologies (increment 2). circuit_kind selects the whole circuit side:
     //   0 = simple source (source_kind + series R/L/C above) -- increment 1, default.
-    //   1 = #4 three-way switch, sine U, cap C: drive [0,t1) -> freewheel [t1,t2) -> open [t2,inf).
-    //   2 = #5 two-way switch, DC U, cap C:     drive [0,t1) -> freewheel [t1,inf).
+    //   1 = #4 two-way switch, sine U, cap C: drive [0,t1) -> freewheel [t1,inf). (open = pre-t0 state)
+    //   2 = #5 two-way switch, DC U, cap C:   drive [0,t1) -> freewheel [t1,inf).
     //   3 = #6 two-way switch, AC V_AC vs R:    AC-drive [0,t1) -> R-damp [t1,inf).
     // The field/interface (Vmeas, Bfield) is unchanged; the switch side attaches at port p.
     unsigned circuit_kind = 0;
     // Switch realization: 0 = behavioral resistor R={IF(t..,Ron,Roff)}; 1 = native Xyce S + .MODEL SW.
     unsigned switch_backend = 0;
-    // Fixed throw instants (absolute time). t1 used by all; t2 only by the 3-way (#4).
+    // Fixed throw instant (absolute time): drive -> freewheel at t1.
     double switch_t1 = 6.0e-3;
-    double switch_t2 = 1.3e-2;
     // Switch-circuit passives: C for #4/#5 (F), R for #6 (Ohm).
     double switch_C = 1.0e-3;
     double switch_R = 1.0e4;

@@ -59,7 +59,6 @@ bool LoadConfig(const string& filename)
         else if (key == "circuit_kind")                     g_cfg.circuit_kind = (unsigned)val;
         else if (key == "switch_backend")                   g_cfg.switch_backend = (unsigned)val;
         else if (key == "switch_t1")                        g_cfg.switch_t1 = val;
-        else if (key == "switch_t2")                        g_cfg.switch_t2 = val;
         else if (key == "switch_C")                         g_cfg.switch_C = val;
         else if (key == "switch_R")                         g_cfg.switch_R = val;
         else if (key == "switch_Ron")                       g_cfg.switch_Ron = val;
@@ -908,7 +907,6 @@ static void emitSwitchTopology(ofstream& out)
 {
     const double tEnd = simEndTime();
     const double t1 = g_cfg.switch_t1;
-    const double t2 = g_cfg.switch_t2;
 
     if (g_cfg.switch_backend == 1) {
         out << ".MODEL SWMOD VSWITCH(RON=" << g_cfg.switch_Ron << " ROFF=" << g_cfg.switch_Roff
@@ -916,12 +914,11 @@ static void emitSwitchTopology(ofstream& out)
     }
 
     switch (g_cfg.circuit_kind) {
-        case 1: // #4 three-way, sine U, cap C: drive[0,t1) -> freewheel[t1,t2) -> open[t2,inf)
+        case 1: // #4 two-way, sine U, cap C: drive[0,t1) -> freewheel[t1,inf)
             out << "Bemf p a V = { amp_src*sin(2*pi*f_src*time) }\n";   // U: + at p, - at a
             out << "Csw w 0 " << g_cfg.switch_C << " IC=0\n";           // C: wiper -> gnd
-            emitThrow(out, "drv", "w", "a", 0.0, t1,   tEnd);          // pos1 drive     (w<->U-)
-            emitThrow(out, "fw",  "w", "p", t1,  t2,   tEnd);          // pos2 freewheel (w<->p)
-            // [t2,inf): both throws open -> pos0 (C isolated, field open).
+            emitThrow(out, "drv", "w", "a", 0.0, t1,   tEnd);          // drive     (w<->U-)
+            emitThrow(out, "fw",  "w", "p", t1,  1e30, tEnd);          // freewheel (w<->p)
             break;
         case 2: // #5 two-way, DC U, cap C: drive[0,t1) -> freewheel[t1,inf)
             out << "Vemf p a {amp_src}\n";                              // U_DC: + at p, - at a
