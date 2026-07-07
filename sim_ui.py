@@ -20,6 +20,7 @@ import base64
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -790,300 +791,84 @@ def parse_netlist(path):
             "nodes": nodes, "raw": raw, "title": title}
 
 
-WIRE = "#8b94a3"
+# ---------------------------------------------------------------------------
+# Netlist -> editor graph (increment B: the SVG editor renders every circuit)
+# ---------------------------------------------------------------------------
+_SIN_RE = re.compile(r"([\w.eE+\-]+)\s*\*\s*sin\s*\(\s*2\s*\*\s*pi\s*\*\s*([\w.eE+\-]+)\s*\*\s*time", re.I)
 
 
-def _classify_source(e):
-    """Map an element to a schematic symbol kind."""
-    t = e["type"]
-    if t == "PWL source":
-        return "pwl"
-    if t == "voltage src" and e.get("expr", "").strip() in ("0", "0.0", "DC 0"):
-        return "ammeter"          # a 0 V source is an ammeter
-    if t in ("voltage src",):
-        return "vsource"
-    if t in ("current src",):
-        return "isource"
-    if t == "behavioral V":
-        return "bvsource"         # dependent voltage source (diamond)
-    if t == "behavioral I":
-        return "bisource"         # dependent current source (diamond)
-    if t.startswith("resistor"):
-        return "res"
-    if t.startswith("inductor"):
-        return "ind"
-    if t.startswith("capacitor"):
-        return "cap"
-    return "box"
+def _val_tok(expr, params):
+    """First whitespace token of an R/L/C value expression, resolved against sim_params
+    ({name} or a bare param name -> number). Trailing 'IC=...' etc. is dropped."""
+    tok = (expr or "").strip().split()
+    return _resolve(tok[0], params) if tok else "0"
 
 
-def _draw_symbol(ax, kind, M, r, d, color):
-    """Draw a component symbol centred at M, 'radius' r, oriented along unit vec d
-    (the wire direction). Perp p is d rotated 90 deg."""
-    import numpy as _np
-    cx, cy = M
-    dx, dy = d
-    px, py = -dy, dx                       # perpendicular
-    circ_kinds = ("vsource", "isource", "ammeter", "pwl")
-    diamond_kinds = ("bvsource", "bisource")
-
-    def line(a, b, **kw):
-        ax.plot([a[0], b[0]], [a[1], b[1]], color=kw.pop("c", color),
-                lw=kw.pop("lw", 1.8), zorder=3, **kw)
-
-    if kind in circ_kinds or kind in diamond_kinds:
-        if kind in circ_kinds:
-            ax.add_patch(plt.Circle(M, r, fill=True, fc="#0f1115",
-                                    ec=color, lw=1.8, zorder=3))
-        else:
-            pts = [(cx + r * dx, cy + r * dy), (cx + r * px, cy + r * py),
-                   (cx - r * dx, cy - r * dy), (cx - r * px, cy - r * py)]
-            ax.add_patch(plt.Polygon(pts, closed=True, fill=True, fc="#0f1115",
-                                     ec=color, lw=1.8, zorder=3))
-        # Inner glyph.
-        if kind in ("vsource", "bvsource"):       # sine '~'
-            t = _np.linspace(-1, 1, 40)
-            gx = cx + 0.55 * r * t
-            gy = cy + 0.32 * r * _np.sin(_np.pi * t)
-            ax.plot(gx, gy, color=color, lw=1.6, zorder=4)
-        elif kind in ("isource", "bisource"):     # current arrow along d
-            from matplotlib.patches import FancyArrowPatch
-            a = (cx - 0.5 * r * dx, cy - 0.5 * r * dy)
-            b = (cx + 0.5 * r * dx, cy + 0.5 * r * dy)
-            ax.add_patch(FancyArrowPatch(a, b, arrowstyle="-|>",
-                                         mutation_scale=12, lw=1.6,
-                                         color=color, zorder=4))
-        elif kind == "ammeter":
-            ax.text(cx, cy, "A", ha="center", va="center", fontsize=11,
-                    color=color, fontweight="bold", zorder=4)
-        elif kind == "pwl":                        # small pwl wave
-            t = _np.array([-1, -0.4, 0.2, 0.7, 1])
-            gx = cx + 0.6 * r * t
-            gy = cy + 0.35 * r * _np.array([-1, 0.6, -0.3, 0.8, 0.1])
-            ax.plot(gx, gy, color=color, lw=1.4, zorder=4)
-        return r
-    if kind == "cap":                               # two plates perpendicular
-        g = 0.12 * r
-        for s in (+1, -1):
-            c0 = (cx + s * g * dx, cy + s * g * dy)
-            line((c0[0] - r * px, c0[1] - r * py), (c0[0] + r * px, c0[1] + r * py))
-        return g
-    # Rectangle body (resistor/inductor/generic), long axis along d.
-    hl, hw = r, 0.5 * r
-    corners = [(cx + hl * dx + hw * px, cy + hl * dy + hw * py),
-               (cx + hl * dx - hw * px, cy + hl * dy - hw * py),
-               (cx - hl * dx - hw * px, cy - hl * dy - hw * py),
-               (cx - hl * dx + hw * px, cy - hl * dy + hw * py)]
-    ax.add_patch(plt.Polygon(corners, closed=True, fill=True, fc="#0f1115",
-                             ec=color, lw=1.8, zorder=3))
-    glyph = {"res": "R", "ind": "L"}.get(kind, "")
-    if glyph:
-        ax.text(cx, cy, glyph, ha="center", va="center", fontsize=9,
-                color=color, fontweight="bold", zorder=4)
-    return r
-
-
-def make_circuit_plot(parsed):
-    """Render the netlist as a traditional ladder schematic: non-ground nodes on a
-    top line, a ground rail at the bottom, each conductive branch a component on a
-    vertical leg (to ground) or a horizontal top segment (node-to-node). PWL signal
-    sources sit below as reference inputs with dotted 'reads' arrows."""
-    import math
-    import re as _re
-    import numpy as _np
-    from matplotlib.patches import FancyArrowPatch
-    nodes, elems = parsed["nodes"], parsed["elements"]
-    if not nodes:
-        return {}
-
-    cond_elems = [e for e in elems if not e.get("signal")]
-    sig_elems = [e for e in elems if e.get("signal")]
-    cond_node_set = set()
-    for e in cond_elems:
-        cond_node_set.update(e["nodes"])
-    GND = ("0", "gnd", "GND")
-    signal_nodes = [n for n in nodes
-                    if n not in cond_node_set
-                    and any(n in e["nodes"] for e in sig_elems)]
-    top_nodes = [n for n in nodes if n not in signal_nodes and n not in GND]
-
-    # Bus layout: each non-ground node is a VERTICAL bus; ground is the bottom rail. Every 2-terminal
-    # element is a rung -- node<->node = horizontal between two buses at its OWN y-level (so nothing
-    # overlaps and it never reads as a series rail); node<->ground = vertical from the bus down to the
-    # rail. Rungs cross intervening buses without a junction dot (= no connection, standard convention).
-    DX, ROW, R = 2.6, 1.15, 0.32
-    col = {n: i for i, n in enumerate(top_nodes)}
-    X = lambda n: col[n] * DX
-    x_lo = -1.2
-    x_hi = (len(top_nodes) - 1) * DX + 1.2 if top_nodes else 1.2
-
-    fig, ax = plt.subplots(figsize=(9.6, 6.4))
-    fig.patch.set_facecolor("#0f1115")
-    ax.set_facecolor("#12151b")
-    ax.set_aspect("equal"); ax.axis("off")
-
-    legend_seen = {}
-    elem_center = {}
-
-    def wire(a, b, c=WIRE, lw=2.0, ls="-", z=1, alpha=1.0):
-        ax.plot([a[0], b[0]], [a[1], b[1]], color=c, lw=lw, ls=ls,
-                zorder=z, alpha=alpha, solid_capstyle="round")
-
-    def place_on_segment(e, P0, P1):
-        """Draw wires P0->symbol->P1 with the component symbol at the midpoint."""
-        x0, y0 = P0; x1, y1 = P1
-        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-        L = math.hypot(x1 - x0, y1 - y0) or 1.0
-        dx, dy = (x1 - x0) / L, (y1 - y0) / L
-        wire(P0, (mx - R * dx, my - R * dy))
-        wire((mx + R * dx, my + R * dy), P1)
-        _draw_symbol(ax, _classify_source(e), (mx, my), R, (dx, dy), e["color"])
-        elem_center[e["name"]] = (mx, my)
-        legend_seen[e["type"]] = e["color"]
-        pxl, pyl = -dy, dx
-        off = R + 0.24
-        ax.text(mx + off * pxl, my + off * pyl, e["name"], fontsize=8.5,
-                ha="center", va="center", color=e["color"], fontweight="bold", zorder=6)
-
-    # Classify conductive elements: node<->node rungs vs node<->ground legs.
-    rungs, glegs = [], {}
-    for e in cond_elems:
-        a, b = e["nodes"]; ag, bg = a in GND, b in GND
-        if ag and bg:
+def netlist_to_editor(parsed, params):
+    """Translate a parsed netlist into a component list the SVG editor (CE.load) can render
+    for ANY circuit. Drops the WR coupling infrastructure that WriteCircuitNetlist always
+    re-appends (interface Vmeas/Bfield, the vf/i PWL signal sources, native-switch control
+    sources), so the graph is exactly the user-editable circuit side. Each entry:
+      {et:'V'|'I'|'R'|'L'|'C'|'SW', name, sub, nodes:[a,b], p:{...}, editable:bool}
+    Switches (native S or a behavioral gate resistor R={...}) map to 'SW' -- display only,
+    because the custom-spec format supports only R/L/C + sources (see emitCustomTopology)."""
+    out = []
+    for e in parsed["elements"]:
+        name, t, nodes, expr = e["name"], e["type"], e["nodes"], e.get("expr", "")
+        # --- drop coupling infrastructure (re-appended by the generator) ---
+        if name in ("Vmeas", "Bfield"):
             continue
-        if ag ^ bg:
-            glegs.setdefault(b if ag else a, []).append(e)
-        elif a in col and b in col:
-            rungs.append((a, b, e))
-
-    GBAND = 1.0                       # ground legs occupy y in [0, GBAND]
-    conn = {n: [] for n in top_nodes}  # node -> y-levels where a rung meets its bus
-    top_y = GBAND + 0.4 + max(1, len(rungs)) * ROW
-    y = top_y
-    rung_rows = []
-    for a, b, e in rungs:
-        rung_rows.append((a, b, e, y)); conn[a].append(y); conn[b].append(y); y -= ROW
-
-    # Ground rail + symbol.
-    wire((x_lo, 0.0), (x_hi, 0.0), c=WIRE, lw=2.2)
-    gx = (x_lo + x_hi) / 2
-    wire((gx, 0.0), (gx, -0.18), c=WIRE)
-    for i, w in enumerate((0.16, 0.10, 0.05)):
-        yy = -0.18 - i * 0.07
-        wire((gx - w, yy), (gx + w, yy), c=WIRE)
-    ax.text(gx + 0.22, -0.30, "0", fontsize=9.5, ha="left", va="center",
-            color="#e6e6e6", fontweight="bold")
-
-    # Bus vertical extents (used to draw the buses AND to detect rung crossings).
-    bus_ext = {}
-    for n in top_nodes:
-        cs = conn[n]; grounded = n in glegs
-        if not cs and not grounded:
+        if e.get("signal") or t == "PWL source":          # VFprev / VIprev
             continue
-        y_hi = max(cs) if cs else GBAND
-        y_lo = GBAND if grounded else (min(cs) if cs else GBAND)
-        bus_ext[n] = (y_lo, y_hi)
-
-    # Vertical buses (one per non-ground node), with a terminal + label at the top.
-    for n, (y_lo, y_hi) in bus_ext.items():
-        wire((X(n), y_lo), (X(n), y_hi))
-        deg = len(conn[n]) + len(glegs.get(n, []))
-        if deg >= 3:                                     # junction dots at real T-connections
-            for yy in conn[n]:
-                ax.plot([X(n)], [yy], marker="o", ms=5, color=WIRE, zorder=5)
-        ax.plot([X(n)], [y_hi], marker="o", ms=8, color="#0d0f14",
-                mec="tab:cyan", mew=1.7, zorder=5)
-        ax.text(X(n), y_hi + 0.24, n, fontsize=10, ha="center", va="bottom",
-                color="#e6e6e6", fontweight="bold", zorder=6)
-
-    # node<->node rungs: horizontal at their own y-level, with a semicircular HOP wherever the rung
-    # crosses an intervening bus it does NOT connect to (unambiguous 'wires cross, no connection').
-    HOP = 0.13
-
-    def draw_rung(e, yy, xa, xb):
-        x0, x1 = (xa, xb) if xa <= xb else (xb, xa)
-        crosses = sorted(X(n) for n, (lo, hi) in bus_ext.items()
-                         if x0 < X(n) < x1 and lo - 1e-6 <= yy <= hi + 1e-6)
-        # place the symbol in the widest bus-free gap (so it never sits on a crossing bus)
-        posts = [x0] + crosses + [x1]
-        gi = max(range(len(posts) - 1), key=lambda i: posts[i + 1] - posts[i])
-        mx = (posts[gi] + posts[gi + 1]) / 2.0
-
-        def seg(sa, sb):                                 # straight wire sa->sb at yy, hopping crosses
-            cur = sa
-            for c in crosses:
-                if sa < c < sb:
-                    wire((cur, yy), (c - HOP, yy))
-                    th = _np.linspace(_np.pi, 0.0, 16)
-                    ax.plot(c + HOP * _np.cos(th), yy + HOP * _np.sin(th),
-                            color=WIRE, lw=2.0, zorder=1, solid_capstyle="round")
-                    cur = c + HOP
-            wire((cur, yy), (sb, yy))
-        seg(x0, mx - R); seg(mx + R, x1)
-        _draw_symbol(ax, _classify_source(e), (mx, yy), R, (1.0, 0.0), e["color"])
-        elem_center[e["name"]] = (mx, yy); legend_seen[e["type"]] = e["color"]
-        ax.text(mx, yy + R + 0.22, e["name"], fontsize=8.5, ha="center", va="bottom",
-                color=e["color"], fontweight="bold", zorder=6)
-
-    for a, b, e, yy in rung_rows:
-        draw_rung(e, yy, X(a), X(b))
-
-    # node<->ground legs: vertical from the bus band down to the rail (fan if several on a node).
-    for n, es in glegs.items():
-        if n not in col:
+        if name.startswith("Vctrl"):                       # native-switch control PWL
             continue
-        cnt = len(es)
-        for i, e in enumerate(es):
-            ox = X(n) + (i - (cnt - 1) / 2.0) * 0.75
-            if abs(ox - X(n)) > 1e-9:
-                wire((X(n), GBAND), (ox, GBAND))
-            place_on_segment(e, (ox, GBAND), (ox, 0.0))
-
-    # PWL signal sources: a row beneath the rail, each feeding its reads-arrow.
-    sy = -1.25
-    sxs = _np.linspace(0.2, max(0.2, x_hi - 1.0), max(1, len(sig_elems)))
-    for e, sx in zip(sig_elems, sxs):
-        sx = float(sx)
-        _draw_symbol(ax, "pwl", (sx, sy), R * 0.85, (1.0, 0.0), e["color"])
-        elem_center[e["name"]] = (sx, sy)
-        legend_seen["PWL signal source"] = e["color"]
-        nd = next((n for n in e["nodes"] if n in signal_nodes), None)
-        label = (nd or e["name"])
-        ax.text(sx, sy - R - 0.12, f"{e['name']} ({label})", fontsize=8,
-                ha="center", va="top", color=e["color"], fontweight="bold")
-
-    # 'reads' arrows: signal node's source -> element whose expr uses V(node).
-    for e in sig_elems:
-        sn = next((n for n in e["nodes"] if n in signal_nodes), None)
-        if not sn or e["name"] not in elem_center:
-            continue
-        pat = _re.compile(r"V\(\s*" + _re.escape(sn) + r"\s*\)", _re.I)
-        for c in cond_elems:
-            if pat.search(c.get("expr", "")) and c["name"] in elem_center:
-                ax.add_patch(FancyArrowPatch(
-                    elem_center[e["name"]], elem_center[c["name"]],
-                    connectionstyle="arc3,rad=-0.18", arrowstyle="-|>",
-                    mutation_scale=11, lw=1.1, color="#9aa4b2", ls=":",
-                    shrinkA=14, shrinkB=16, zorder=0, alpha=0.85))
-
-    # Legend.
-    handles = [plt.Line2D([0], [0], color=c, lw=3, label=t)
-               for t, c in sorted(legend_seen.items())]
-    if sig_elems:
-        handles.append(plt.Line2D([0], [0], color="#9aa4b2", lw=1.1, ls=":",
-                                  label="reads V(node)"))
-    if handles:
-        ax.legend(handles=handles, fontsize=8, loc="upper left",
-                  framealpha=0.3, facecolor="#181b22", edgecolor="#2c333f",
-                  labelcolor="#e6e6e6")
-
-    ax.set_xlim(x_lo - 0.6, x_hi + 0.6)
-    ax.set_ylim(sy - 0.9, top_y + 0.7)
-    ax.set_title(f"Circuit schematic ({len(cond_elems)} branches, "
-                 f"{len(sig_elems)} signal sources, {len(nodes)} nodes)",
-                 color="#9aa4b2")
-    fig.tight_layout()
-    return {"circuit": _png(fig)}
+        # --- switches ---
+        if t == "element" and "SWMOD" in expr.upper():     # native Xyce S: 'ctrl 0 SWMOD'
+            out.append({"et": "SW", "name": name, "sub": None, "nodes": nodes,
+                        "p": {}, "editable": False}); continue
+        if t.startswith("resistor") and re.match(r"\s*R\s*=", expr, re.I):  # behavioral gate resistor R={...}
+            out.append({"et": "SW", "name": name, "sub": None, "nodes": nodes,
+                        "p": {}, "editable": False}); continue
+        # --- passives ---
+        if t.startswith("resistor"):
+            out.append({"et": "R", "name": name, "sub": None, "nodes": nodes,
+                        "p": {"val": _val_tok(expr, params)}, "editable": True}); continue
+        if t.startswith("inductor"):
+            out.append({"et": "L", "name": name, "sub": None, "nodes": nodes,
+                        "p": {"val": _val_tok(expr, params)}, "editable": True}); continue
+        if t.startswith("capacitor"):
+            out.append({"et": "C", "name": name, "sub": None, "nodes": nodes,
+                        "p": {"val": _val_tok(expr, params)}, "editable": True}); continue
+        # --- sources ---
+        if t in ("behavioral V", "behavioral I", "voltage src", "current src"):
+            et = "I" if t in ("behavioral I", "current src") else "V"
+            body = expr
+            if "=" in body and body.split("=")[0].strip().upper() in ("V", "I"):
+                body = body.split("=", 1)[1]               # 'V = { ... }' -> ' { ... }'
+            body = body.strip().strip("{}").strip()
+            m = _SIN_RE.search(body)
+            if m:
+                sub, p = "SIN", {"amp": _resolve(m.group(1), params),
+                                 "freq": _resolve(m.group(2), params)}
+            else:
+                up = body.upper()
+                if up.startswith("PULSE"):
+                    seg = body[body.find("(")+1:] if "(" in body else body[5:]
+                    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", seg)
+                    nums = (nums + ["0", "1", "0", "1e-4"])[:4]
+                    sub, p = "PULSE", {"v1": nums[0], "v2": nums[1], "td": nums[2], "tr": nums[3]}
+                elif up.startswith("PWL"):
+                    inner = body[body.find("(")+1:body.rfind(")")] if "(" in body else body[3:]
+                    sub, p = "PWL", {"pts": " ".join(inner.replace(",", " ").split())}
+                else:
+                    tok = body.replace("DC", "").split()
+                    sub, p = "DC", {"val": _resolve(tok[0], params) if tok else "0"}
+            out.append({"et": et, "name": name, "sub": sub, "nodes": nodes,
+                        "p": p, "editable": True}); continue
+        # --- anything else: show as a generic (non-editable) box ---
+        out.append({"et": "SW", "name": name, "sub": None, "nodes": nodes,
+                    "p": {}, "editable": False})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1120,7 +905,7 @@ class Handler(BaseHTTPRequestHandler):
             parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
             self._send(200, json.dumps({
                 "ok": True,
-                "plots": make_circuit_plot(parsed),
+                "graph": netlist_to_editor(parsed, _read_sim_params()),
                 "elements": [{k: e[k] for k in ("name", "type", "nodes", "desc")}
                              for e in parsed["elements"]],
                 "directives": parsed["directives"],
@@ -1458,12 +1243,13 @@ INDEX_HTML = """<!doctype html>
           </div>
           <svg id="ceSvg"></svg>
           <div class="ce-props" id="ceProps"></div>
-          <div class="ce-hint">Palette adds a component &middot; drag bodies to move &middot; click a
-            terminal then another to wire &middot; select a component to edit its type/values below
-            &middot; select + "Delete sel" removes. Red pins <b>p</b>=port, <b>0</b>=ground.
-            "Use as circuit" writes the spec &amp; sets topology = custom.</div>
+          <div class="ce-hint">The editor shows the <b>current circuit</b> (any preset). Drag bodies to
+            move &middot; click a terminal then another to wire &middot; palette adds a component
+            &middot; select to edit type/values below &middot; "Delete sel" removes. Red pins
+            <b>p</b>=port, <b>0</b>=ground. Editing &amp; "Use as circuit" forks the preset into a custom
+            node-graph (topology = custom). Switches (<b>SW</b>) are shown read-only &mdash; the custom
+            spec supports only R/L/C + sources.</div>
         </div>
-        <img class="plot" id="p_circuit" hidden>
         <div id="netlistTable"></div>
         <details><summary>Raw netlist + directives</summary><pre id="netlistRaw"></pre></details>
       </div>
@@ -1671,7 +1457,7 @@ async function loadCircuit(){
                                          body: JSON.stringify(collect())});
     const j = await res.json();
     if (j.ok){
-      setPlot('p_circuit', j.plots ? j.plots.circuit : null);
+      if (j.graph) CE.load(j.graph);   // editor renders the live circuit
       showNetlist(j);
     }
   } catch(e){ /* leave circuit box empty on failure */ }
@@ -1705,7 +1491,33 @@ const CE = (function(){
   function add(type){ seq[type]++; const c={id:'k'+Math.random().toString(36).slice(2,7),type,name:type.toLowerCase()+seq[type],x:snap(320),y:snap(70+(comps.length%6)*45),sub:((type==='V'||type==='I')?'SIN':null),p:Object.assign({},defP[type])}; comps.push(c); sel=c.id; render(); renderProps(); }
   function del(){ if(!sel)return; comps=comps.filter(c=>c.id!==sel); wires=wires.filter(w=>w.a.split('#')[0]!==sel&&w.b.split('#')[0]!==sel); sel=null; pend=null; render(); renderProps(); }
   function clr(){ comps=[]; wires=[]; sel=null; pend=null; render(); renderProps(); }
+  // Load a parsed circuit (from /netlist -> netlist_to_editor) into the editor: one comp per
+  // element, auto-placed on a grid, terminals sharing a netlist node chained by wires (reserved
+  // p/0 anchored to the fixed pins). Round-trips: serialize() reproduces an equivalent spec.
+  function load(list){
+    comps=[]; wires=[]; sel=null; pend=null; seq={V:0,I:0,R:0,L:0,C:0,SW:0};
+    if(!Array.isArray(list)||!list.length){ render(); renderProps(); return; }
+    const cols=Math.min(4,Math.max(1,Math.ceil(Math.sqrt(list.length))));
+    const x0=260,y0=80,dx=150,dy=90, map={};
+    list.forEach((el,i)=>{
+      const type=el.et||'R'; seq[type]=(seq[type]||0)+1;
+      const c={id:'k'+Math.random().toString(36).slice(2,7),type,
+        name:el.name||(type.toLowerCase()+seq[type]),
+        x:snap(x0+(i%cols)*dx), y:snap(y0+Math.floor(i/cols)*dy),
+        sub:el.sub||null, p:Object.assign({},el.p||{}), ro:!el.editable};
+      comps.push(c);
+      (el.nodes||[]).forEach((nd,ti)=>{ (map[nd]=map[nd]||[]).push(c.id+'#'+ti); });
+    });
+    for(const nd in map){
+      const refs=map[nd].slice();
+      if(nd==='p')      refs.unshift('PIN:p');
+      else if(nd==='0') refs.unshift('PIN:0');
+      for(let k=1;k<refs.length;k++) wires.push({a:refs[k-1],b:refs[k]});
+    }
+    render(); renderProps();
+  }
   function label(c){
+    if(c.type==='SW') return c.name+' (switch)';
     if(c.type==='V'||c.type==='I'){
       if(c.sub==='DC')return c.name+' DC '+c.p.val;
       if(c.sub==='PULSE')return c.name+' pulse';
@@ -1727,8 +1539,9 @@ const CE = (function(){
       g.appendChild(E('line',{x1:c.x+16,y1:c.y,x2:c.x+HW,y2:c.y,stroke:'#8b94a3','stroke-width':2}));
       if(c.type==='V'||c.type==='I') g.appendChild(E('circle',{class:'body',cx:c.x,cy:c.y,r:16,fill:'#0f1115',stroke:'var(--accent)','stroke-width':1.8}));
       else if(c.type==='C'){ g.appendChild(E('line',{class:'plate',x1:c.x-4,y1:c.y-13,x2:c.x-4,y2:c.y+13,stroke:'var(--accent)','stroke-width':2})); g.appendChild(E('line',{class:'plate',x1:c.x+4,y1:c.y-13,x2:c.x+4,y2:c.y+13,stroke:'var(--accent)','stroke-width':2})); }
+      else if(c.type==='SW'){ g.appendChild(E('circle',{cx:c.x-12,cy:c.y,r:2.5,fill:'#d9a441'})); g.appendChild(E('circle',{cx:c.x+12,cy:c.y,r:2.5,fill:'#d9a441'})); g.appendChild(E('line',{x1:c.x-12,y1:c.y,x2:c.x+9,y2:c.y-11,stroke:'#d9a441','stroke-width':2})); }
       else g.appendChild(E('rect',{x:c.x-16,y:c.y-10,width:32,height:20,rx:3,fill:'#0f1115',stroke:'var(--accent)','stroke-width':1.8}));
-      const gl=E('text',{class:'ce-lbl',x:c.x,y:c.y+4,'text-anchor':'middle'}); gl.textContent=(c.type==='V'?'~':c.type==='I'?'↑':c.type==='C'?'':c.type); g.appendChild(gl);
+      const gl=E('text',{class:'ce-lbl',x:c.x,y:c.y+4,'text-anchor':'middle'}); gl.textContent=(c.type==='V'?'~':c.type==='I'?'↑':(c.type==='C'||c.type==='SW')?'':c.type); g.appendChild(gl);
       [0,1].forEach(i=>{const tp=termXY(c,i); g.appendChild(E('circle',{class:'ce-term'+(pend===c.id+'#'+i?' pend':''),cx:tp.x,cy:tp.y,r:TR,'data-term':c.id+'#'+i}));});
       const nl=E('text',{class:'ce-lbl',x:c.x,y:c.y-15,'text-anchor':'middle'}); nl.textContent=label(c); g.appendChild(nl);
       s.appendChild(g);
@@ -1765,6 +1578,9 @@ const CE = (function(){
                                  +fld('Delay td (s)',inp('td',c.p.td))+fld('Rise tr (s)',inp('tr',c.p.tr));
       else                     h+='<label style="flex-basis:100%">Points &mdash; t v t v … ('+u+', times increasing)'
                                  +'<input data-cp="pts" value="'+c.p.pts+'" style="width:100%"></label>';
+    } else if(c.type==='SW'){
+      h+='<span class="ce-hint" style="padding:0">Switch — display only. The custom spec supports '
+        +'only R/L/C + sources, so switch presets can be viewed but not forked to custom.</span>';
     } else {
       h+=fld(c.type+' value',inp('val',c.p.val));
     }
@@ -1785,7 +1601,7 @@ const CE = (function(){
     wires.forEach(w=>uni(w.a,w.b));
     const rn={}; rn[find('PIN:p')]='p'; rn[find('PIN:0')]='0'; let n=1;
     const nf=id=>{const r=find(id); if(!(r in rn))rn[r]='n'+(n++); return rn[r];};
-    return comps.map(c=>{const a=nf(c.id+'#0'),b=nf(c.id+'#1');
+    return comps.filter(c=>c.type!=='SW').map(c=>{const a=nf(c.id+'#0'),b=nf(c.id+'#1');
       if(c.type==='V'||c.type==='I'){
         const P=c.type;   // 'V' or 'I' prefix -> VDC/IDC, VPULSE/IPULSE, VPWL/IPWL, VSIN/ISIN
         if(c.sub==='DC')    return P+'DC '+c.name+' '+a+' '+b+' '+c.p.val;
@@ -1798,6 +1614,9 @@ const CE = (function(){
   }
   function apply(){
     if(!comps.length){ setStatus('Editor empty — add components first.','err'); return; }
+    if(comps.some(c=>c.type==='SW')){
+      setStatus('This circuit contains switches (SW), which the custom spec cannot express. '
+               +'Delete them or build an R/L/C + source circuit before saving.','err'); return; }
     const ta=document.getElementById('f_circuit_spec');
     if(ta) ta.value='# generated by circuit editor\\n'+serialize()+'\\n';
     const ks=document.getElementById('f_circuit_kind'); if(ks) ks.value='4';
@@ -1809,7 +1628,7 @@ const CE = (function(){
     s.addEventListener('touchstart',onDown,{passive:false}); s.addEventListener('touchmove',onMove,{passive:false}); window.addEventListener('touchend',onUp);
     render(); renderProps();
   }
-  return {add,del,clear:clr,apply,init};
+  return {add,del,clear:clr,apply,init,load};
 })();
 
 window.addEventListener('load', ()=>{
