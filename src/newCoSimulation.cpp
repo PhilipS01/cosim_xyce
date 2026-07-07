@@ -1010,6 +1010,27 @@ static void emitCustomTopology(ofstream& out)
             out << dev << tok[1] << " " << tok[2] << " " << tok[3] << " PWL(";
             for (size_t i = 4; i < tok.size(); ++i) out << tok[i] << (i + 1 < tok.size() ? " " : "");
             out << ")\n";
+        } else if (type == "SW") {
+            // Time-gated switch: CLOSED (Ron) during [tclose, topen), OPEN (Roff) otherwise, with a
+            // finite trapezoidal transition (tau) so the integrator steps through the throw instead of
+            // colliding with a discontinuity. Behavioral gated resistor (no .MODEL). topen>=tEnd (e.g.
+            // 1e30) = stays closed to the end; tclose<=0 = closed from the start.
+            //   SW name a b tclose topen [Ron Roff trise]
+            need(6);
+            const string& nm = tok[1]; const string& a = tok[2]; const string& b = tok[3];
+            const double tclose = std::strtod(tok[4].c_str(), nullptr);
+            const double topen  = std::strtod(tok[5].c_str(), nullptr);
+            const double Ron  = (tok.size() > 6) ? std::strtod(tok[6].c_str(), nullptr) : 10.0;
+            const double Roff = (tok.size() > 7) ? std::strtod(tok[7].c_str(), nullptr) : 1.0e9;
+            double tau        = (tok.size() > 8) ? std::strtod(tok[8].c_str(), nullptr) : 1.0e-5;
+            if (tau <= 0.0) tau = 1.0e-9;
+            const double tEnd = simEndTime();
+            const string up = (tclose <= 0.0) ? string("1")
+                : ("MIN(MAX((TIME-" + fmtg(tclose) + ")/" + fmtg(tau) + ",0),1)");
+            const string dn = (topen >= tEnd) ? string("0")
+                : ("MIN(MAX((TIME-" + fmtg(topen) + ")/" + fmtg(tau) + ",0),1)");
+            out << "R" << nm << " " << a << " " << b << " R={" << fmtg(Roff)
+                << " + (" << fmtg(Ron) << "-" << fmtg(Roff) << ")*(" << up << " - " << dn << ")}\n";
         } else {
             throw runtime_error("emitCustomTopology: circuit_spec.txt line " + to_string(lineno)
                                 + " unknown TYPE '" + type + "'.");

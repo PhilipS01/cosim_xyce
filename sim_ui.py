@@ -75,8 +75,8 @@ SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
 # may then tweak any field. Increment 1 covers the three source kinds + series R/L; presets 4-6
 # (switches) arrive in increment 2. Keys map to the flat config the C++ generator consumes.
 # Presets seed the circuit-netlist text (circuit_spec) + the field/coupling/timing knobs. The circuit
-# side is a simplified spec: reserved nodes p=port, 0=gnd; one element/line (VSIN/ISIN/VPULSE/R/L/C...).
-# (Switch presets P4-P6 are retired here -- switches aren't expressible in the simplified spec yet.)
+# side is a simplified spec: reserved nodes p=port, 0=gnd; one element/line (VSIN/ISIN/VPULSE/R/L/C and
+# SW name a b tclose topen [Ron Roff trise]).
 PRESETS = {
     "P1: Sine V + RL": {"time_mode": 0, "coupling_mode": 0, "frequency": 50.0,
                         "circuit_spec": "VSIN Bemf s 0 1 50\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
@@ -88,6 +88,21 @@ PRESETS = {
     "P3: Step/ramp V + RL": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
                              "coupling_mode": 0, "WRmaxSteps": 40,
                              "circuit_spec": "VPULSE Vemf s 0 0 1 0 1e-4\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
+    # Switch circuits (SW = time-gated resistor, closed during [tclose, topen)). NOTE C/Ron/times are
+    # numerical-survival defaults (C small enough for WR to contract; the cap<->coil freewheel needs a
+    # damped closed switch Ron~10 or its ~undamped LC ring dt-collapses) -- tune to your field.
+    "P4: 2-way switch (sine U, C)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
+        "coupling_mode": 0, "WRmaxSteps": 40,
+        "circuit_spec": "VSIN Bemf p a 1 50\nC Csw w 0 1e-6\n"
+                        "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w p 6e-3 1e30 10 1e9 1e-5\n"},
+    "P5: 2-way switch (DC U, C)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
+        "coupling_mode": 0, "WRmaxSteps": 40,
+        "circuit_spec": "VDC Vemf p a 1\nC Csw w 0 1e-6\n"
+                        "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w p 6e-3 1e30 10 1e9 1e-5\n"},
+    "P6: 2-way switch (AC vs R)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
+        "coupling_mode": 0, "WRmaxSteps": 40, "frequency": 50.0,
+        "circuit_spec": "VSIN Bemf p bac 1 50\nR Rload p br 1e4\n"
+                        "SW ac bac 0 0 6e-3 1e-3 1e9 1e-5\nSW rd br 0 6e-3 1e30 1e-3 1e9 1e-5\n"},
 }
 
 
@@ -117,10 +132,12 @@ HELP = {
         "reserved. One element per line:<br>"
         "<code>R/L/C name a b value</code><br>"
         "<code>VSIN/ISIN name a b amp freq</code> &middot; <code>VDC/IDC name a b value</code><br>"
-        "<code>VPULSE/IPULSE name a b v1 v2 td tr</code> &middot; <code>VPWL/IPWL name a b t1 v1 t2 v2 …</code>"
-        "<br>The WR interface (<code>Vmeas</code> ammeter + <code>Bfield</code> field ROM) and the "
-        "<code>.INCLUDE</code>/<code>.print</code>/<code>.end</code> directives are generated and shown "
-        "locked around the editable box.</div>"
+        "<code>VPULSE/IPULSE name a b v1 v2 td tr</code> &middot; <code>VPWL/IPWL name a b t1 v1 t2 v2 …</code><br>"
+        "<code>SW name a b tclose topen [Ron Roff trise]</code> &mdash; time-gated switch, closed during "
+        "[tclose, topen) (use a big topen e.g. <code>1e30</code> to stay closed to the end; Ron=10, "
+        "Roff=1e9, trise=1e-5 default).<br>The WR interface (<code>Vmeas</code> ammeter + <code>Bfield</code> "
+        "field ROM) and the <code>.INCLUDE</code>/<code>.print</code>/<code>.end</code> directives are "
+        "generated and shown locked around the editable box.</div>"
     ),
     "lcapy_export": (
         "<div class='hh'>LaTeX / PDF export (lcapy)</div>"
@@ -359,41 +376,57 @@ def _lcapy_records(parsed, params):
     def val(expr):                                            # R/L/C value: strip IC=, resolve {param}
         return _resolve(re.sub(r"\bIC\s*=\s*\S+", "", expr).strip(), params)
 
+    def num(x):                                               # tidy number for a label (1.00e+00 -> 1)
+        try:
+            return f"{float(x):g}"
+        except (TypeError, ValueError):
+            return str(x)
+
     recs = []
-    def emit(line, a, b):
-        recs.append({"line": line, "nodes": [a, b]})
+    def emit(line, a, b, label=None):
+        recs.append({"line": line, "nodes": [a, b], "label": label})
     for e in parsed["elements"]:
         nm, t, expr = e["name"], e["type"], e["expr"]
         if e["signal"] or nm.startswith("Vctrl"):
             continue                                          # drop PWL signal carriers + switch ctrl
         a, b = e["nodes"]
+        u = nm[1:] or nm                                      # user name (strip the C++ type prefix)
         if nm == "Vmeas":                                     # 0 V ammeter on the interface branch
-            emit(f"V{nm} {a} {b} 0", a, b)
+            emit(f"V{u} {a} {b} 0", a, b, "ammeter")
         elif nm == "Bfield":                                  # field-ROM Thevenin (matched secant)
-            emit(f"V{nm} {a} {b}", a, b)                      # symbolic (the expr is not lcapy-drawable)
+            emit(f"Vfield {a} {b}", a, b, "field ROM")        # symbolic (the expr is not lcapy-drawable)
         elif t == "resistor" and expr.strip().startswith("R="):
-            emit(f"SW{nm} {a} {b}", a, b)                     # behavioral gate -> switch
+            emit(f"SW{u} {a} {b}", a, b)                      # behavioral gate -> switch
         elif t == "resistor":
-            emit(f"R{nm} {a} {b} {val(expr)}", a, b)
+            emit(f"R{u} {a} {b} {val(expr)}", a, b)
         elif t == "inductor":
-            emit(f"L{nm} {a} {b} {val(expr)}", a, b)
+            emit(f"L{u} {a} {b} {val(expr)}", a, b)
         elif t == "capacitor":
-            emit(f"C{nm} {a} {b} {val(expr)}", a, b)
+            emit(f"C{u} {a} {b} {val(expr)}", a, b)
         elif nm[:1].upper() == "S":                           # native VC switch device
-            emit(f"SW{nm} {a} {b}", a, b)
+            emit(f"SW{u} {a} {b}", a, b)
         elif t in ("behavioral V", "voltage src"):
             s = sine(expr)
-            emit(f"V{nm} {a} {b} sin(0 {s[0]} {s[1]})" if s
-                 else f"V{nm} {a} {b} {val(expr) if '{' in expr or expr.strip()[:1].isdigit() else 'dc 1'}", a, b)
+            # lcapy labels a sin() source with its DC offset (0), so give it an explicit amp/freq label.
+            emit(f"V{u} {a} {b} sin(0 {s[0]} {s[1]})" if s
+                 else f"V{u} {a} {b} {val(expr) if '{' in expr or expr.strip()[:1].isdigit() else 'dc 1'}",
+                 a, b, f"{num(s[0])}V/{num(s[1])}Hz" if s else None)
         elif t in ("behavioral I", "current src"):
             s = sine(expr)
-            emit(f"I{nm} {a} {b} sin(0 {s[0]} {s[1]})" if s else f"I{nm} {a} {b} dc 1", a, b)
+            emit(f"I{u} {a} {b} sin(0 {s[0]} {s[1]})" if s else f"I{u} {a} {b} dc 1",
+                 a, b, f"{num(s[0])}A/{num(s[1])}Hz" if s else None)
     return recs
+
+
+def _lcapy_attrs(rec, direction=None):
+    """Build the '; <dir>, l={label}' attribute suffix for a record (either part may be absent)."""
+    parts = ([direction] if direction else []) + ([f"l={{{rec['label']}}}"] if rec.get("label") else [])
+    return ("; " + ", ".join(parts)) if parts else ""
 
 
 def netlist_to_lcapy(parsed, params):
     """Plain (unhinted) lcapy netlist string; see _lcapy_records for the mapping."""
-    return "\n".join(r["line"] for r in _lcapy_records(parsed, params))
+    return "\n".join(r["line"] + _lcapy_attrs(r) for r in _lcapy_records(parsed, params))
 
 
 def _lcapy_hinted(recs, gnd="0"):
@@ -452,12 +485,12 @@ def _lcapy_hinted(recs, gnd="0"):
     out, grounds = [], []                                     # grounds: (x_pos, node) for the rail
     for k, ei in enumerate(seqE):                             # top chain, left -> right
         toks = recs[ei]["line"].split()
-        out.append(" ".join([toks[0], order[k], order[k + 1]] + toks[3:]) + "; right")
+        out.append(" ".join([toks[0], order[k], order[k + 1]] + toks[3:]) + _lcapy_attrs(recs[ei], "right"))
     gk = [0]
     for i in shunt:                                           # down-legs to the ground rail
         toks = recs[i]["line"].split(); tn = topnode(i)
         gk[0] += 1; g = f"0_{gk[0]}"; grounds.append((pos[tn], g))
-        out.append(" ".join([toks[0], tn, g] + toks[3:]) + "; down")
+        out.append(" ".join([toks[0], tn, g] + toks[3:]) + _lcapy_attrs(recs[i], "down"))
     grounds.sort()
     for j in range(1, len(grounds)):                          # bottom rail joins ground copies L->R
         out.append(f"W {grounds[j-1][1]} {grounds[j][1]}; right")
@@ -474,7 +507,7 @@ def export_lcapy(params):
     parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
     sim_params = _read_sim_params()
     recs = _lcapy_records(parsed, sim_params)
-    plain = "\n".join(r["line"] for r in recs)
+    plain = "\n".join(r["line"] + _lcapy_attrs(r) for r in recs)
     hinted = _lcapy_hinted(recs)                              # 2D ladder hints, or None
     try:
         from lcapy import Circuit
@@ -516,7 +549,7 @@ def lcapy_schematic_png(parsed, params):
     recs = _lcapy_records(parsed, params)
     if not recs:
         return None
-    plain = "\n".join(r["line"] for r in recs)
+    plain = "\n".join(r["line"] + _lcapy_attrs(r) for r in recs)
     hinted = _lcapy_hinted(recs)
     try:
         from lcapy import Circuit
@@ -1120,17 +1153,8 @@ def _controls_html():
     # Seed the form from the actual saved sim_config.txt (fall back to factory defaults),
     # so the studio opens on the current working setup, not a blank/trivial config.
     initial = {**DEFAULTS, **read_config()}
-    # Preset selector (hybrid model): seeds the fields below, then the user may edit them.
-    preset_opts = '<option value="">— custom —</option>' + "".join(
-        f'<option value="{name}">{name}</option>' for name in PRESETS
-    )
-    rows = [f"""
-        <div class="ctl">
-          <label for="presetSel">Circuit preset</label>
-          <div class="inputs">
-            <select id="presetSel" class="choice" onchange="applyPreset()">{preset_opts}</select>
-          </div>
-        </div>"""]
+    # (The circuit preset "library" lives in the circuit-netlist panel, not here.)
+    rows = []
     for k, label, default, kind, slider in PARAMS:
         default = initial.get(k, default)
         help_icon = f'<span class="help" data-help="{k}">?</span>' if k in HELP else ''
@@ -1238,7 +1262,13 @@ INDEX_HTML = """<!doctype html>
   table.netlist th, table.netlist td { border:1px solid #2c333f; padding:4px 8px; text-align:left; }
   table.netlist th { color:var(--muted); font-weight:600; background:#0d0f14; }
   table.netlist td.nm { color:var(--accent); }
-  /* --- circuit spec editor + inline schematic view --- */
+  /* --- circuit preset library + spec editor + inline schematic view --- */
+  .library { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px;
+             padding:8px 10px; background:#12151b; border:1px solid #2c333f; border-radius:8px; }
+  .library .lib-lbl { color:var(--muted); font-size:12px; font-weight:600; }
+  .library button { padding:5px 10px; font-size:12px; background:#22305a; color:#cfe0ff;
+                    border:1px solid #33436e; border-radius:6px; cursor:pointer; }
+  .library button:hover { filter:brightness(1.2); }
   .cedit { display:flex; gap:14px; margin-bottom:12px; align-items:flex-start; flex-wrap:wrap; }
   .cedit-l, .cedit-r { flex:1; min-width:280px; }
   .cedit-hd { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px;
@@ -1324,6 +1354,10 @@ INDEX_HTML = """<!doctype html>
         </div>
       </div>
       <div id="circuitContent">
+        <div class="library" id="library">
+          <span class="lib-lbl">Library:</span>
+          <span id="libButtons"></span>
+        </div>
         <div class="cedit">
           <div class="cedit-l">
             <div class="cedit-hd">Circuit side<span class="help" data-help="circuit_spec_edit">?</span>
@@ -1380,15 +1414,25 @@ function applyVisibility(){
     if(box) box.style.display = condMatch(VISIBLE_WHEN[k]) ? '' : 'none'; }
 }
 
-function applyPreset(){
-  const name = document.getElementById('presetSel').value;
+function buildLibrary(){
+  const host=document.getElementById('libButtons'); if(!host) return;
+  host.innerHTML='';
+  for(const name in PRESETS){
+    const b=document.createElement('button');
+    b.textContent=name.split(':')[0];   // short chip: "P1", "P4", ...
+    b.title=name;
+    b.onclick=()=>applyPreset(name);
+    host.appendChild(b);
+  }
+}
+function applyPreset(name){
   const p = PRESETS[name];
   if (!p) return;
   for (const k in p){
     const b = document.getElementById('f_'+k);
     if (b){ b.value = p[k]; if (b.tagName !== 'SELECT') syncFromBox(b); }
   }
-  setStatus('Preset applied: '+name, '');
+  setStatus('Loaded: '+name, '');
   applyVisibility();
   loadCircuit();
 }
@@ -1578,7 +1622,7 @@ window.addEventListener('load', ()=>{
   // Help hover is document-wide now (help icons live in both the controls and the circuit box).
   document.addEventListener('mouseover', e=>{ if(e.target.classList.contains('help')) helpShow(e.target); });
   document.addEventListener('mouseout',  e=>{ if(e.target.classList.contains('help')) helpHide(); });
-  applyVisibility(); loadCircuit();
+  buildLibrary(); applyVisibility(); loadCircuit();
 });
 </script>
 </body></html>
