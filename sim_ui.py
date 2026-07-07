@@ -858,26 +858,59 @@ def make_circuit_plot(parsed):
     ax.text(gx + 0.22, -0.30, "0", fontsize=9.5, ha="left", va="center",
             color="#e6e6e6", fontweight="bold")
 
-    # Vertical buses (one per non-ground node), with a terminal + label at the top.
+    # Bus vertical extents (used to draw the buses AND to detect rung crossings).
+    bus_ext = {}
     for n in top_nodes:
         cs = conn[n]; grounded = n in glegs
         if not cs and not grounded:
             continue
         y_hi = max(cs) if cs else GBAND
         y_lo = GBAND if grounded else (min(cs) if cs else GBAND)
+        bus_ext[n] = (y_lo, y_hi)
+
+    # Vertical buses (one per non-ground node), with a terminal + label at the top.
+    for n, (y_lo, y_hi) in bus_ext.items():
         wire((X(n), y_lo), (X(n), y_hi))
-        deg = len(cs) + len(glegs.get(n, []))
+        deg = len(conn[n]) + len(glegs.get(n, []))
         if deg >= 3:                                     # junction dots at real T-connections
-            for yy in cs:
+            for yy in conn[n]:
                 ax.plot([X(n)], [yy], marker="o", ms=5, color=WIRE, zorder=5)
         ax.plot([X(n)], [y_hi], marker="o", ms=8, color="#0d0f14",
                 mec="tab:cyan", mew=1.7, zorder=5)
         ax.text(X(n), y_hi + 0.24, n, fontsize=10, ha="center", va="bottom",
                 color="#e6e6e6", fontweight="bold", zorder=6)
 
-    # node<->node rungs (drawn over the buses).
+    # node<->node rungs: horizontal at their own y-level, with a semicircular HOP wherever the rung
+    # crosses an intervening bus it does NOT connect to (unambiguous 'wires cross, no connection').
+    HOP = 0.13
+
+    def draw_rung(e, yy, xa, xb):
+        x0, x1 = (xa, xb) if xa <= xb else (xb, xa)
+        crosses = sorted(X(n) for n, (lo, hi) in bus_ext.items()
+                         if x0 < X(n) < x1 and lo - 1e-6 <= yy <= hi + 1e-6)
+        # place the symbol in the widest bus-free gap (so it never sits on a crossing bus)
+        posts = [x0] + crosses + [x1]
+        gi = max(range(len(posts) - 1), key=lambda i: posts[i + 1] - posts[i])
+        mx = (posts[gi] + posts[gi + 1]) / 2.0
+
+        def seg(sa, sb):                                 # straight wire sa->sb at yy, hopping crosses
+            cur = sa
+            for c in crosses:
+                if sa < c < sb:
+                    wire((cur, yy), (c - HOP, yy))
+                    th = _np.linspace(_np.pi, 0.0, 16)
+                    ax.plot(c + HOP * _np.cos(th), yy + HOP * _np.sin(th),
+                            color=WIRE, lw=2.0, zorder=1, solid_capstyle="round")
+                    cur = c + HOP
+            wire((cur, yy), (sb, yy))
+        seg(x0, mx - R); seg(mx + R, x1)
+        _draw_symbol(ax, _classify_source(e), (mx, yy), R, (1.0, 0.0), e["color"])
+        elem_center[e["name"]] = (mx, yy); legend_seen[e["type"]] = e["color"]
+        ax.text(mx, yy + R + 0.22, e["name"], fontsize=8.5, ha="center", va="bottom",
+                color=e["color"], fontweight="bold", zorder=6)
+
     for a, b, e, yy in rung_rows:
-        place_on_segment(e, (X(a), yy), (X(b), yy))
+        draw_rung(e, yy, X(a), X(b))
 
     # node<->ground legs: vertical from the bus band down to the rail (fan if several on a node).
     for n, es in glegs.items():
