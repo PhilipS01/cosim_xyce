@@ -370,12 +370,12 @@ def _resolve(tok, params):
     return params.get(tok, tok)
 
 
-def netlist_to_lcapy(parsed, params):
-    """Translate the parsed Xyce netlist into an lcapy netlist for a PHYSICAL-view schematic:
-    R/L/C direct; sources -> V/I (sin/DC); behavioral gate resistors + native S -> switches; the WR
-    interface (Vmeas 0V ammeter + Bfield field-ROM) collapses to one inductor 'field' between the
-    port and ground; the PWL signal carriers (VFprev/VIprev) and switch control sources are dropped."""
-    import re as _re
+def _lcapy_records(parsed, params):
+    """Map the parsed Xyce netlist to lcapy device records for a PHYSICAL-view schematic. Each record
+    is {"line": "<lcapy device w/o hint>", "nodes": [a, b]}. R/L/C direct; sources -> V/I (sin/DC);
+    behavioral gate resistors + native S -> switches; the WR interface (Vmeas 0V ammeter + Bfield
+    field-ROM) collapses to one inductor 'Lfield' between the port and ground; the PWL signal carriers
+    (VFprev/VIprev) and switch control sources are dropped."""
     els = parsed["elements"]
     vmeas = next((e for e in els if e["name"] == "Vmeas"), None)
     bfield = next((e for e in els if e["name"] == "Bfield"), None)
@@ -384,39 +384,127 @@ def netlist_to_lcapy(parsed, params):
         port, nx_node = vmeas["nodes"][0], vmeas["nodes"][1]   # Vmeas p nx ; Bfield nx 0
 
     def sine(expr):                                            # 'amp*sin(2*pi*freq*time)' -> (amp,freq)
-        mm = _re.search(r"([A-Za-z0-9_.+\-]+)\s*\*\s*sin\(\s*2\s*\*\s*pi\s*\*\s*([A-Za-z0-9_.+\-]+)\s*\*\s*time",
-                        expr, _re.I)
+        mm = re.search(r"([A-Za-z0-9_.+\-]+)\s*\*\s*sin\(\s*2\s*\*\s*pi\s*\*\s*([A-Za-z0-9_.+\-]+)\s*\*\s*time",
+                       expr, re.I)
         return (_resolve(mm.group(1), params), _resolve(mm.group(2), params)) if mm else None
 
     def val(expr):                                            # R/L/C value: strip IC=, resolve {param}
-        return _resolve(_re.sub(r"\bIC\s*=\s*\S+", "", expr).strip(), params)
+        return _resolve(re.sub(r"\bIC\s*=\s*\S+", "", expr).strip(), params)
 
-    lines, ncol = [], 0
+    recs = []
+    def emit(line, a, b):
+        recs.append({"line": line, "nodes": [a, b]})
     for e in els:
         nm, t, expr = e["name"], e["type"], e["expr"]
         if e["signal"] or nm in ("Vmeas", "Bfield") or nm.startswith("Vctrl"):
             continue                                          # drop WR signals, interface, switch ctrl
-        a, b = (port if n == nx_node else n for n in e["nodes"])
+        a, b = [port if n == nx_node else n for n in e["nodes"]]
         if t == "resistor" and expr.strip().startswith("R="):
-            ncol += 1; lines.append(f"SW{nm} {a} {b}")        # behavioral gate -> switch
+            emit(f"SW{nm} {a} {b}", a, b)                     # behavioral gate -> switch
         elif t == "resistor":
-            lines.append(f"R{nm} {a} {b} {val(expr)}")
+            emit(f"R{nm} {a} {b} {val(expr)}", a, b)
         elif t == "inductor":
-            lines.append(f"L{nm} {a} {b} {val(expr)}")
+            emit(f"L{nm} {a} {b} {val(expr)}", a, b)
         elif t == "capacitor":
-            lines.append(f"C{nm} {a} {b} {val(expr)}")
+            emit(f"C{nm} {a} {b} {val(expr)}", a, b)
         elif nm[:1].upper() == "S":                           # native VC switch device
-            lines.append(f"SW{nm} {a} {b}")
+            emit(f"SW{nm} {a} {b}", a, b)
         elif t in ("behavioral V", "voltage src"):
             s = sine(expr)
-            lines.append(f"V{nm} {a} {b} sin(0 {s[0]} {s[1]})" if s
-                         else f"V{nm} {a} {b} {val(expr) if '{' in expr or expr.strip()[:1].isdigit() else 'dc 1'}")
+            emit(f"V{nm} {a} {b} sin(0 {s[0]} {s[1]})" if s
+                 else f"V{nm} {a} {b} {val(expr) if '{' in expr or expr.strip()[:1].isdigit() else 'dc 1'}", a, b)
         elif t in ("behavioral I", "current src"):
             s = sine(expr)
-            lines.append(f"I{nm} {a} {b} sin(0 {s[0]} {s[1]})" if s else f"I{nm} {a} {b} dc 1")
+            emit(f"I{nm} {a} {b} sin(0 {s[0]} {s[1]})" if s else f"I{nm} {a} {b} dc 1", a, b)
     if vmeas and bfield:                                      # collapsed field ROM -> inductor
-        lines.append(f"Lfield {port} 0 {params.get('Lrom', '1.44e-7')}")
-    return "\n".join(lines)
+        emit(f"Lfield {port} 0 {params.get('Lrom', '1.44e-7')}", port, "0")
+    return recs
+
+
+def netlist_to_lcapy(parsed, params):
+    """Plain (unhinted) lcapy netlist string; see _lcapy_records for the mapping."""
+    return "\n".join(r["line"] for r in _lcapy_records(parsed, params))
+
+
+def _lcapy_hinted(recs, port="p", gnd="0"):
+    """Add circuitikz drawing hints so the schematic lays out as a 2D ladder instead of one line.
+    Heuristic for the WR circuit family: find the main series path ground->port, draw the source leg
+    'up' (left), the series chain 'right' (top), the field/last leg 'down' (right); shunt branches to
+    ground go 'down'. Each grounded terminal gets its own ground copy '0__k', all joined by a bottom
+    rail wire. Returns a hinted netlist string, or None when the topology can't be confidently placed
+    (caller falls back to the unhinted netlist)."""
+    import collections
+    # The field (or any element straight across port<->ground) is the vertical RETURN leg on the
+    # right, not part of the source path. Set it aside so the BFS routes through the source chain.
+    ret = next((i for i, r in enumerate(recs)
+                if set(r["nodes"]) == {port, gnd} and r["line"].split()[0] == "Lfield"), None)
+    if ret is None:
+        ret = next((i for i, r in enumerate(recs) if set(r["nodes"]) == {port, gnd}), None)
+    adj = collections.defaultdict(list)
+    for i, r in enumerate(recs):
+        if i == ret:
+            continue
+        a, b = r["nodes"]
+        adj[a].append((i, b)); adj[b].append((i, a))
+    if gnd not in adj or port not in adj:
+        return None
+    # BFS main path ground -> port (element index sequence + node sequence).
+    prev = {gnd: (None, None)}
+    q = collections.deque([gnd])
+    while q:
+        u = q.popleft()
+        if u == port:
+            break
+        for ei, v in adj[u]:
+            if v not in prev:
+                prev[v] = (u, ei); q.append(v)
+    if port not in prev:
+        return None
+    seq, nodeseq, u = [], [port], port
+    while prev[u][0] is not None:
+        seq.append(prev[u][1]); u = prev[u][0]; nodeseq.append(u)
+    seq.reverse(); nodeseq.reverse()                          # elements ground..port, nodes ground..port
+    onpath = set(seq)
+    hint = {}
+    for k, ei in enumerate(seq):                              # first leg 'up', rest of the chain 'right'
+        hint[ei] = "up" if k == 0 else "right"
+    if ret is not None:
+        hint[ret] = "down"                                    # field return leg
+    for i, r in enumerate(recs):                              # off-path: only shunts-to-ground allowed
+        if i in onpath or i == ret:
+            continue
+        if gnd in r["nodes"]:
+            hint[i] = "down"
+        else:
+            return None
+    # Emit, giving each ground terminal a private copy and orienting verticals ground-at-bottom.
+    gk = [0]; grounds = []
+    def gcopy():
+        gk[0] += 1; g = f"0_{gk[0]}"; grounds.append(g); return g
+    out = []
+    for i, r in enumerate(recs):
+        toks = r["line"].split()
+        dev = toks[0]; a, b = r["nodes"]; tail = toks[3:]
+        d = hint[i]
+        if d == "up":                                         # ground(bottom) .. top
+            na, nb = (gcopy() if a == gnd else a), (gcopy() if b == gnd else b)
+            if b == gnd:                                      # ensure ground is first (bottom)
+                na, nb = nb, na
+        elif d == "down":                                     # top .. ground(bottom)
+            na, nb = (gcopy() if a == gnd else a), (gcopy() if b == gnd else b)
+            if a == gnd:                                      # ensure ground is second (bottom)
+                na, nb = nb, na
+        else:                                                 # right: follow path node order
+            if i in onpath:
+                k = seq.index(i); na, nb = nodeseq[k], nodeseq[k + 1]
+            else:
+                na, nb = a, b
+        out.append(" ".join([dev, na, nb] + tail) + f"; {d}")
+    for j in range(1, len(grounds)):                          # bottom rail joins the ground copies
+        out.append(f"W {grounds[j-1]} {grounds[j]}; right")
+    if grounds:
+        out.append(f"W {grounds[0]} 0; down=0.3, ground")     # a single ground symbol
+    return "\n".join(out)
 
 
 def export_lcapy(params):
@@ -425,14 +513,18 @@ def export_lcapy(params):
     import tempfile, base64, warnings
     write_config(params); write_spec(params); emit_netlist()
     parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
-    netlist = netlist_to_lcapy(parsed, _read_sim_params())
+    sim_params = _read_sim_params()
+    recs = _lcapy_records(parsed, sim_params)
+    plain = "\n".join(r["line"] for r in recs)
+    hinted = _lcapy_hinted(recs)                              # 2D ladder hints, or None
     try:
         from lcapy import Circuit
     except Exception:
-        return {"ok": False, "lcapy_netlist": netlist,
+        return {"ok": False, "lcapy_netlist": plain,
                 "error": "lcapy not installed. Run:  python3 -m pip install --break-system-packages lcapy"}
     d = tempfile.mkdtemp()
-    try:
+
+    def render(netlist):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             c = Circuit(netlist)
@@ -444,10 +536,17 @@ def export_lcapy(params):
                 pdf_b64 = base64.b64encode(open(os.path.join(d, "c.pdf"), "rb").read()).decode()
             except Exception as pe:
                 warn = "PDF compile failed (tex still available): " + str(pe)[:200]
-        return {"ok": True, "tex": tex, "pdf_b64": pdf_b64, "warn": warn, "lcapy_netlist": netlist}
-    except Exception as e:
-        return {"ok": False, "lcapy_netlist": netlist,
-                "error": "lcapy could not lay out this circuit: " + str(e)[:300]}
+        return tex, pdf_b64, warn
+
+    # Prefer the 2D-hinted layout; if lcapy can't place it, fall back to the plain one-line netlist.
+    for netlist in ([hinted, plain] if hinted else [plain]):
+        try:
+            tex, pdf_b64, warn = render(netlist)
+            return {"ok": True, "tex": tex, "pdf_b64": pdf_b64, "warn": warn, "lcapy_netlist": netlist}
+        except Exception as e:
+            last = e
+    return {"ok": False, "lcapy_netlist": plain,
+            "error": "lcapy could not lay out this circuit: " + str(last)[:300]}
 
 
 # ---------------------------------------------------------------------------
