@@ -163,15 +163,25 @@ VISIBLE_WHEN = {
 
 # Hover help: key -> HTML shown in a tooltip next to the control's label (a "?" icon).
 HELP = {
+    "circuit_spec_edit": (
+        "<div class='hh'>Circuit spec (text editor)</div>"
+        "<div class='hn'>The circuit side as text. Presets seed it automatically; edit and <b>Apply spec</b> "
+        "to fork the circuit into a custom node-graph (topology = custom) and re-render. Nodes: <code>p</code>"
+        "=port, <code>0</code>=ground; reserved. One element per line:<br>"
+        "<code>R/L/C name a b value</code><br>"
+        "<code>VSIN/ISIN name a b amp freq</code> &middot; <code>VDC/IDC name a b value</code><br>"
+        "<code>VPULSE/IPULSE name a b v1 v2 td tr</code> &middot; <code>VPWL/IPWL name a b t1 v1 t2 v2 …</code>"
+        "<br>The WR interface (ammeter + field ROM) is appended automatically. Switches can't be expressed "
+        "as a spec &mdash; a switch preset shows its schematic but its spec omits the switches.</div>"
+    ),
     "lcapy_export": (
         "<div class='hh'>LaTeX / PDF export (lcapy)</div>"
-        "<div class='hn'>Translates the current netlist to an lcapy (circuitikz) circuit and downloads "
-        "<code>circuit.tex</code> + a compiled <code>circuit.pdf</code>. It is a <b>physical view</b>, not "
-        "the literal WR netlist: the interface (Vmeas ammeter + Bfield ROM) collapses to a single field "
-        "inductor <code>L_field p 0</code>, the WR PWL signal sources are dropped, and switches render as "
-        "<code>SW</code>. Uses lcapy auto-layout (may be cramped / single-line &mdash; a nicer layout is a "
-        "later increment). Needs <code>lcapy</code> (pip) and <code>pdflatex</code>; without pdflatex you "
-        "still get the <code>.tex</code>.</div>"
+        "<div class='hn'>Downloads the schematic as <code>circuit.tex</code> (circuitikz) + a compiled "
+        "<code>circuit.pdf</code> for thesis figures &mdash; the same 2D-laid-out <b>physical view</b> shown "
+        "on the right. The interface (Vmeas ammeter + Bfield ROM) collapses to a single field inductor "
+        "<code>L_field p 0</code>, the WR PWL signal sources are dropped, and switches render as <code>SW</code>. "
+        "Needs <code>lcapy</code> (pip) and <code>pdflatex</code>; without pdflatex you still get the "
+        "<code>.tex</code>.</div>"
     ),
     "reconstruct_mode": (
         "<div class='hh'>Field reconstruction (current-driven)</div>"
@@ -536,6 +546,57 @@ def export_lcapy(params):
             last = e
     return {"ok": False, "lcapy_netlist": plain,
             "error": "lcapy could not lay out this circuit: " + str(last)[:300]}
+
+
+def lcapy_schematic_png(parsed, params):
+    """Render the current circuit to an lcapy PNG (2D-hinted, falling back to the plain layout) and
+    return it as a data-URI for the inline live view. Returns None when lcapy/pdflatex are unavailable
+    or the layout fails (the UI then shows a hint instead of a schematic)."""
+    import tempfile, base64, warnings
+    recs = _lcapy_records(parsed, params)
+    if not recs:
+        return None
+    plain = "\n".join(r["line"] for r in recs)
+    hinted = _lcapy_hinted(recs)
+    try:
+        from lcapy import Circuit
+    except Exception:
+        return None
+    d = tempfile.mkdtemp()
+    for netlist in ([hinted, plain] if hinted else [plain]):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                Circuit(netlist).draw(os.path.join(d, "c.png"), dpi=150)
+            b64 = base64.b64encode(open(os.path.join(d, "c.png"), "rb").read()).decode()
+            return "data:image/png;base64," + b64
+        except Exception:
+            continue
+    return None
+
+
+def graph_to_spec(graph):
+    """Serialize an editor graph (from netlist_to_editor) into the custom circuit_spec line format so a
+    preset can seed / be forked into a custom node-graph. Switch elements can't be expressed as a spec;
+    they are skipped and flagged. Returns (spec_text, has_switch)."""
+    lines, has_sw = [], False
+    for c in graph:
+        et, nm, (a, b), sub, p = c["et"], c["name"], c["nodes"], c.get("sub"), c.get("p", {})
+        if et == "SW":
+            has_sw = True
+            continue
+        if et in ("R", "L", "C"):
+            lines.append(f"{et} {nm} {a} {b} {p.get('val', 0)}")
+        elif et in ("V", "I"):
+            if sub == "DC":
+                lines.append(f"{et}DC {nm} {a} {b} {p.get('val', 1)}")
+            elif sub == "PULSE":
+                lines.append(f"{et}PULSE {nm} {a} {b} {p.get('v1',0)} {p.get('v2',1)} {p.get('td',0)} {p.get('tr',1e-4)}")
+            elif sub == "PWL":
+                lines.append(f"{et}PWL {nm} {a} {b} {p.get('pts','0 0')}")
+            else:  # SIN
+                lines.append(f"{et}SIN {nm} {a} {b} {p.get('amp',1)} {p.get('freq',50)}")
+    return "\n".join(lines), has_sw
 
 
 # ---------------------------------------------------------------------------
@@ -991,9 +1052,13 @@ class Handler(BaseHTTPRequestHandler):
                 write_spec(params)
             emit_netlist()
             parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
+            sim_params = _read_sim_params()
+            spec, has_sw = graph_to_spec(netlist_to_editor(parsed, sim_params))
             self._send(200, json.dumps({
                 "ok": True,
-                "graph": netlist_to_editor(parsed, _read_sim_params()),
+                "schematic": lcapy_schematic_png(parsed, sim_params),   # inline 2D view (data-URI or null)
+                "spec": spec,                                           # current circuit as an editable spec
+                "spec_has_switch": has_sw,                              # switches can't be expressed as a spec
                 "elements": [{k: e[k] for k in ("name", "type", "nodes", "desc")}
                              for e in parsed["elements"]],
                 "directives": parsed["directives"],
@@ -1140,21 +1205,7 @@ def _controls_html():
             {slider_html}
           </div>
         </div>""")
-    # Custom node-graph spec editor (used when circuit_kind = custom). "Refresh circuit" re-renders it.
-    import html as _html
-    spec_seed = _html.escape(read_spec())
-    rows.append(f"""
-        <div class="ctl" id="specBox">
-          <label for="f_circuit_spec">Custom circuit spec (circuit topology = custom)</label>
-          <textarea id="f_circuit_spec" rows="9" spellcheck="false"
-                    style="width:100%;background:#0d0f14;color:#e6e6e6;border:1px solid #2c333f;
-                           border-radius:6px;padding:8px;font-family:ui-monospace,monospace;font-size:11.5px;"
-          >{spec_seed}</textarea>
-          <div class="note">Nodes: <code>p</code>=port, <code>0</code>=gnd. One element/line:
-            <code>R/L/C name a b val</code>, <code>{{V,I}}SIN amp f</code>, <code>{{V,I}}DC val</code>,
-            <code>{{V,I}}PULSE v1 v2 td tr</code>, <code>{{V,I}}PWL t1 v1 t2 v2 …</code>.
-            Click "Refresh circuit" to render.</div>
-        </div>""")
+    # The circuit spec is edited in the circuit box (right panel), not here.
     return "\n".join(rows)
 
 
@@ -1227,26 +1278,17 @@ INDEX_HTML = """<!doctype html>
   table.netlist th, table.netlist td { border:1px solid #2c333f; padding:4px 8px; text-align:left; }
   table.netlist th { color:var(--muted); font-weight:600; background:#0d0f14; }
   table.netlist td.nm { color:var(--accent); }
-  /* --- custom circuit editor (SVG drag-drop) --- */
-  .cewrap { border:1px solid #2c333f; border-radius:8px; margin-bottom:12px; background:#0d0f14; }
-  .cebar { display:flex; flex-wrap:wrap; gap:6px; padding:8px; border-bottom:1px solid #2c333f; align-items:center; }
-  .cebar button { padding:5px 9px; font-size:12px; }
-  .cebar .pal { background:#22305a; color:#cfe0ff; }
-  .cebar .sep { flex:1; }
-  #ceSvg { width:100%; height:360px; display:block; background:#12151b; border-radius:0 0 8px 8px; touch-action:none; }
-  .ce-comp { cursor:grab; }
-  .ce-term { fill:#0d0f14; stroke:var(--accent); stroke-width:1.5; cursor:crosshair; }
-  .ce-term.pend { fill:var(--ok); stroke:var(--ok); }
-  .ce-sel rect, .ce-sel circle.body, .ce-sel line.plate { stroke:var(--ok) !important; }
-  .ce-wire { stroke:#8b94a3; stroke-width:2; }
-  .ce-pin { fill:var(--err); }
-  .ce-lbl { fill:#e6e6e6; font:10px ui-monospace,monospace; pointer-events:none; }
-  .ce-hint { color:var(--muted); font-size:11px; padding:6px 8px; line-height:1.5; }
-  .ce-props { padding:8px 10px; border-top:1px solid #2c333f; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:flex-end; }
-  .ce-props .cprow { flex-basis:100%; color:var(--muted); font-size:12px; }
-  .ce-props label { color:var(--muted); font-size:11px; display:flex; flex-direction:column; gap:3px; }
-  .ce-props input, .ce-props select { background:#0d0f14; color:#e6e6e6; border:1px solid #2c333f;
-       border-radius:5px; padding:4px 6px; font-family:ui-monospace,monospace; font-size:11.5px; width:112px; }
+  /* --- circuit spec editor + inline schematic view --- */
+  .cedit { display:flex; gap:14px; margin-bottom:12px; align-items:flex-start; flex-wrap:wrap; }
+  .cedit-l, .cedit-r { flex:1; min-width:280px; }
+  .cedit-hd { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px;
+              font-weight:600; margin-bottom:6px; }
+  .cedit-hd button { margin-left:auto; }
+  #f_circuit_spec { width:100%; min-height:200px; background:#0d0f14; color:#e6e6e6;
+       border:1px solid #2c333f; border-radius:6px; padding:8px; resize:vertical;
+       font-family:ui-monospace,monospace; font-size:12px; line-height:1.5; }
+  .cedit-r img { width:100%; border-radius:8px; background:#fff; display:block; }
+  .note.warn { color:var(--err); }
   /* --- hover help tooltip --- */
   .help { display:inline-block; margin-left:6px; width:14px; height:14px; border-radius:50%;
           background:#2c333f; color:var(--muted); font-size:10px; line-height:14px; text-align:center;
@@ -1317,26 +1359,21 @@ INDEX_HTML = """<!doctype html>
         </div>
       </div>
       <div id="circuitContent">
-        <div class="cewrap" id="ceWrap">
-          <div class="cebar">
-            <button class="pal" onclick="CE.add('V')">+V</button>
-            <button class="pal" onclick="CE.add('I')">+I</button>
-            <button class="pal" onclick="CE.add('R')">+R</button>
-            <button class="pal" onclick="CE.add('L')">+L</button>
-            <button class="pal" onclick="CE.add('C')">+C</button>
-            <span class="sep"></span>
-            <button class="secondary small" onclick="CE.del()">Delete sel</button>
-            <button class="secondary small" onclick="CE.clear()">Clear</button>
-            <button class="small" onclick="CE.apply()">&rarr; Use as circuit</button>
+        <div class="cedit">
+          <div class="cedit-l">
+            <div class="cedit-hd">Circuit spec<span class="help" data-help="circuit_spec_edit">?</span>
+              <button class="small" onclick="applySpec()">Apply spec &rarr; run-ready</button></div>
+            <textarea id="f_circuit_spec" spellcheck="false">__SPEC_SEED__</textarea>
+            <div class="note" id="specNote">Nodes: <code>p</code>=port, <code>0</code>=gnd. One element/line:
+              <code>R/L/C name a b val</code>, <code>{V,I}SIN name a b amp f</code>,
+              <code>{V,I}DC name a b val</code>, <code>{V,I}PULSE name a b v1 v2 td tr</code>,
+              <code>{V,I}PWL name a b t1 v1 …</code>. "Apply spec" sets topology = custom.</div>
           </div>
-          <svg id="ceSvg"></svg>
-          <div class="ce-props" id="ceProps"></div>
-          <div class="ce-hint">The editor shows the <b>current circuit</b> (any preset). Drag bodies to
-            move &middot; click a terminal then another to wire &middot; palette adds a component
-            &middot; select to edit type/values below &middot; "Delete sel" removes. Red pins
-            <b>p</b>=port, <b>0</b>=ground. Editing &amp; "Use as circuit" forks the preset into a custom
-            node-graph (topology = custom). Switches (<b>SW</b>) are shown read-only &mdash; the custom
-            spec supports only R/L/C + sources.</div>
+          <div class="cedit-r">
+            <div class="cedit-hd">Schematic <span class="mini">(lcapy, physical view)</span></div>
+            <img id="p_circuit" alt="circuit schematic">
+            <div class="note" id="schemNote"></div>
+          </div>
         </div>
         <div id="netlistTable"></div>
         <details><summary>Raw netlist + directives</summary><pre id="netlistRaw"></pre></details>
@@ -1373,10 +1410,6 @@ function condMatch(cond){ return cond.some(d => Object.keys(d).every(k => d[k].i
 function applyVisibility(){
   for(const k in VISIBLE_WHEN){ const box=document.getElementById('ctl_'+k);
     if(box) box.style.display = condMatch(VISIBLE_WHEN[k]) ? '' : 'none'; }
-  const custom = ctlVal('circuit_kind')===4;
-  // The editor (ceWrap) shows every circuit now (increment B). The raw-spec textarea
-  // (specBox) is only relevant when authoring/holding a custom node-graph.
-  const sb=document.getElementById('specBox'); if(sb) sb.style.display = custom?'':'none';
 }
 // smart default: sine simple source -> periods; step/switch/custom -> absolute end time
 function suggestTimeMode(){ const ck=ctlVal('circuit_kind'), sk=ctlVal('source_kind'); return (ck===0 && (sk===0||sk===1))?0:1; }
@@ -1546,10 +1579,29 @@ async function loadCircuit(){
                                          body: JSON.stringify(collect())});
     const j = await res.json();
     if (j.ok){
-      if (j.graph) CE.load(j.graph);   // editor renders the live circuit
+      const img=document.getElementById('p_circuit'), sn=document.getElementById('schemNote');
+      if (j.schematic){ img.src=j.schematic; img.style.display=''; sn.textContent=''; }
+      else { img.removeAttribute('src'); img.style.display='none';
+             sn.textContent='(no schematic — lcapy/pdflatex unavailable, or layout not supported for this circuit)'; }
+      // Seed the spec textarea from the current circuit UNLESS the user is authoring a custom spec
+      // (circuit_kind=custom), so preset edits are not clobbered on refresh.
+      const ta=document.getElementById('f_circuit_spec'), pn=document.getElementById('specNote');
+      if (ta && ctlVal('circuit_kind')!==4) ta.value = j.spec || '';
+      if (pn) pn.classList.toggle('warn', !!j.spec_has_switch);
+      if (j.spec_has_switch && pn) pn.innerHTML =
+        '⚠ This circuit contains switches, which the custom spec cannot express — they are omitted from '
+        +'the spec above (the schematic still shows them). Editing here forks a switch-less custom circuit.';
       showNetlist(j);
     }
   } catch(e){ /* leave circuit box empty on failure */ }
+}
+function applySpec(){
+  const ta=document.getElementById('f_circuit_spec');
+  if (!ta || !ta.value.trim()){ setStatus('Circuit spec is empty.','err'); return; }
+  const ks=document.getElementById('f_circuit_kind'); if (ks) ks.value='4';   // fork to custom topology
+  applyVisibility();
+  setStatus('Applied spec — topology set to custom.','');
+  loadCircuit();
 }
 function _dl(name, href){ const a=document.createElement('a'); a.href=href; a.download=name; document.body.appendChild(a); a.click(); a.remove(); }
 async function exportCircuit(){
@@ -1566,176 +1618,26 @@ async function exportCircuit(){
     else { st.textContent='✓ circuit.tex + circuit.pdf'; st.style.color='var(--ok)'; }
   } catch(e){ st.textContent='✗ '+e; st.style.color='var(--err)'; }
 }
-// ---- Custom circuit editor (increment 3b): hand-rolled SVG drag-drop -> circuit_spec ----
-const CE = (function(){
-  const NS='http://www.w3.org/2000/svg', GRID=20, HW=30, TR=6;
-  const defP={V:{amp:1,freq:50},I:{amp:1,freq:50},R:{val:10000},L:{val:1.6e-7},C:{val:1e-6}};
-  let comps=[], wires=[], seq={V:0,I:0,R:0,L:0,C:0}, sel=null, pend=null, drag=null;
-  const PIN={'PIN:p':{x:90,y:250,label:'p'},'PIN:0':{x:90,y:315,label:'0'}};
-  const S=()=>document.getElementById('ceSvg');
-  function E(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
-  const snap=v=>Math.round(v/GRID)*GRID;
-  const termXY=(c,i)=>({x:c.x+(i?HW:-HW),y:c.y});
-  function tpos(id){ if(id in PIN)return PIN[id]; const p=id.split('#'); const c=comps.find(x=>x.id===p[0]); return c?termXY(c,+p[1]):{x:0,y:0}; }
-  function add(type){ seq[type]++; const c={id:'k'+Math.random().toString(36).slice(2,7),type,name:type.toLowerCase()+seq[type],x:snap(320),y:snap(70+(comps.length%6)*45),sub:((type==='V'||type==='I')?'SIN':null),p:Object.assign({},defP[type])}; comps.push(c); sel=c.id; render(); renderProps(); }
-  function del(){ if(!sel)return; comps=comps.filter(c=>c.id!==sel); wires=wires.filter(w=>w.a.split('#')[0]!==sel&&w.b.split('#')[0]!==sel); sel=null; pend=null; render(); renderProps(); }
-  function clr(){ comps=[]; wires=[]; sel=null; pend=null; render(); renderProps(); }
-  // Load a parsed circuit (from /netlist -> netlist_to_editor) into the editor: one comp per
-  // element, auto-placed on a grid, terminals sharing a netlist node chained by wires (reserved
-  // p/0 anchored to the fixed pins). Round-trips: serialize() reproduces an equivalent spec.
-  function load(list){
-    comps=[]; wires=[]; sel=null; pend=null; seq={V:0,I:0,R:0,L:0,C:0,SW:0};
-    if(!Array.isArray(list)||!list.length){ render(); renderProps(); return; }
-    const cols=Math.min(4,Math.max(1,Math.ceil(Math.sqrt(list.length))));
-    const x0=260,y0=80,dx=150,dy=90, map={};
-    list.forEach((el,i)=>{
-      const type=el.et||'R'; seq[type]=(seq[type]||0)+1;
-      const c={id:'k'+Math.random().toString(36).slice(2,7),type,
-        name:el.name||(type.toLowerCase()+seq[type]),
-        x:snap(x0+(i%cols)*dx), y:snap(y0+Math.floor(i/cols)*dy),
-        sub:el.sub||null, p:Object.assign({},el.p||{}), ro:!el.editable};
-      comps.push(c);
-      (el.nodes||[]).forEach((nd,ti)=>{ (map[nd]=map[nd]||[]).push(c.id+'#'+ti); });
-    });
-    for(const nd in map){
-      const refs=map[nd].slice();
-      if(nd==='p')      refs.unshift('PIN:p');
-      else if(nd==='0') refs.unshift('PIN:0');
-      for(let k=1;k<refs.length;k++) wires.push({a:refs[k-1],b:refs[k]});
-    }
-    render(); renderProps();
-  }
-  function label(c){
-    if(c.type==='SW') return c.name+' (switch)';
-    if(c.type==='V'||c.type==='I'){
-      if(c.sub==='DC')return c.name+' DC '+c.p.val;
-      if(c.sub==='PULSE')return c.name+' pulse';
-      if(c.sub==='PWL')return c.name+' pwl';
-      return c.name+' '+c.p.amp+'/'+c.p.freq+'Hz';
-    }
-    return c.name+' '+c.p.val;
-  }
-  function render(){
-    const s=S(); if(!s)return; while(s.firstChild)s.removeChild(s.firstChild);
-    wires.forEach(w=>{const A=tpos(w.a),B=tpos(w.b); s.appendChild(E('line',{class:'ce-wire',x1:A.x,y1:A.y,x2:B.x,y2:B.y}));});
-    for(const id in PIN){const p=PIN[id];
-      s.appendChild(E('circle',{class:'ce-term'+(pend===id?' pend':''),cx:p.x,cy:p.y,r:TR,'data-term':id}));
-      s.appendChild(E('circle',{class:'ce-pin',cx:p.x,cy:p.y,r:3}));
-      const t=E('text',{class:'ce-lbl',x:p.x-20,y:p.y+4}); t.textContent=p.label; s.appendChild(t);}
-    comps.forEach(c=>{
-      const g=E('g',{class:'ce-comp'+(sel===c.id?' ce-sel':''),'data-comp':c.id});
-      g.appendChild(E('line',{x1:c.x-HW,y1:c.y,x2:c.x-16,y2:c.y,stroke:'#8b94a3','stroke-width':2}));
-      g.appendChild(E('line',{x1:c.x+16,y1:c.y,x2:c.x+HW,y2:c.y,stroke:'#8b94a3','stroke-width':2}));
-      if(c.type==='V'||c.type==='I') g.appendChild(E('circle',{class:'body',cx:c.x,cy:c.y,r:16,fill:'#0f1115',stroke:'var(--accent)','stroke-width':1.8}));
-      else if(c.type==='C'){ g.appendChild(E('line',{class:'plate',x1:c.x-4,y1:c.y-13,x2:c.x-4,y2:c.y+13,stroke:'var(--accent)','stroke-width':2})); g.appendChild(E('line',{class:'plate',x1:c.x+4,y1:c.y-13,x2:c.x+4,y2:c.y+13,stroke:'var(--accent)','stroke-width':2})); }
-      else if(c.type==='SW'){ g.appendChild(E('circle',{cx:c.x-12,cy:c.y,r:2.5,fill:'#d9a441'})); g.appendChild(E('circle',{cx:c.x+12,cy:c.y,r:2.5,fill:'#d9a441'})); g.appendChild(E('line',{x1:c.x-12,y1:c.y,x2:c.x+9,y2:c.y-11,stroke:'#d9a441','stroke-width':2})); }
-      else g.appendChild(E('rect',{x:c.x-16,y:c.y-10,width:32,height:20,rx:3,fill:'#0f1115',stroke:'var(--accent)','stroke-width':1.8}));
-      const gl=E('text',{class:'ce-lbl',x:c.x,y:c.y+4,'text-anchor':'middle'}); gl.textContent=(c.type==='V'?'~':c.type==='I'?'↑':(c.type==='C'||c.type==='SW')?'':c.type); g.appendChild(gl);
-      [0,1].forEach(i=>{const tp=termXY(c,i); g.appendChild(E('circle',{class:'ce-term'+(pend===c.id+'#'+i?' pend':''),cx:tp.x,cy:tp.y,r:TR,'data-term':c.id+'#'+i}));});
-      const nl=E('text',{class:'ce-lbl',x:c.x,y:c.y-15,'text-anchor':'middle'}); nl.textContent=label(c); g.appendChild(nl);
-      s.appendChild(g);
-    });
-  }
-  function xy(e){const r=S().getBoundingClientRect(); const t=e.touches&&e.touches[0]; return {x:(t?t.clientX:e.clientX)-r.left,y:(t?t.clientY:e.clientY)-r.top};}
-  function onDown(e){
-    const term=e.target.getAttribute&&e.target.getAttribute('data-term');
-    if(term){ if(pend===null)pend=term; else{ if(pend!==term)wires.push({a:pend,b:term}); pend=null; } render(); e.preventDefault(); return; }
-    const g=e.target.closest&&e.target.closest('[data-comp]');
-    if(g){ const id=g.getAttribute('data-comp'); sel=id; const c=comps.find(x=>x.id===id); const p=xy(e); drag={id,dx:c.x-p.x,dy:c.y-p.y}; render(); renderProps(); e.preventDefault(); return; }
-    sel=null; pend=null; render(); renderProps();
-  }
-  function onMove(e){ if(!drag)return; const c=comps.find(x=>x.id===drag.id); if(!c)return; const p=xy(e); c.x=snap(p.x+drag.dx); c.y=snap(p.y+drag.dy); render(); e.preventDefault(); }
-  function onUp(){ drag=null; }
-  // --- properties panel: edit the selected component's type + type-dependent attributes ---
-  const subDef={SIN:{amp:1,freq:50},DC:{val:1},PULSE:{v1:0,v2:1,td:0,tr:1e-4},PWL:{pts:'0 0 5e-3 1 15e-3 1 20e-3 0'}};
-  const subName={SIN:'sinusoidal',DC:'DC',PULSE:'pulse',PWL:'PWL (multi-step)'};
-  function fld(lbl,inner){ return '<label>'+lbl+inner+'</label>'; }
-  function inp(key,val){ return '<input data-cp="'+key+'" value="'+val+'">'; }
-  function renderProps(){
-    const host=document.getElementById('ceProps'); if(!host)return;
-    const c=comps.find(x=>x.id===sel);
-    if(!c){ host.innerHTML='<span class="ce-hint" style="padding:0">Select a component to edit its type &amp; values.</span>'; return; }
-    let h='<div class="cprow"><b>'+c.name+'</b> — '+c.type+'</div>';
-    if(c.type==='V'||c.type==='I'){
-      const u=c.type==='V'?'V':'A';
-      h+='<label>Type<select data-cp="sub">'
-        +['SIN','DC','PULSE','PWL'].map(s=>'<option value="'+s+'"'+(c.sub===s?' selected':'')+'>'+subName[s]+'</option>').join('')
-        +'</select></label>';
-      if(c.sub==='SIN')        h+=fld('Amplitude ('+u+')',inp('amp',c.p.amp))+fld('Frequency (Hz)',inp('freq',c.p.freq));
-      else if(c.sub==='DC')    h+=fld('Value ('+u+')',inp('val',c.p.val));
-      else if(c.sub==='PULSE') h+=fld('Initial ('+u+')',inp('v1',c.p.v1))+fld('Pulsed ('+u+')',inp('v2',c.p.v2))
-                                 +fld('Delay td (s)',inp('td',c.p.td))+fld('Rise tr (s)',inp('tr',c.p.tr));
-      else                     h+='<label style="flex-basis:100%">Points &mdash; t v t v … ('+u+', times increasing)'
-                                 +'<input data-cp="pts" value="'+c.p.pts+'" style="width:100%"></label>';
-    } else if(c.type==='SW'){
-      h+='<span class="ce-hint" style="padding:0">Switch — display only. The custom spec supports '
-        +'only R/L/C + sources, so switch presets can be viewed but not forked to custom.</span>';
-    } else {
-      h+=fld(c.type+' value',inp('val',c.p.val));
-    }
-    host.innerHTML=h;
-    host.querySelectorAll('[data-cp]').forEach(el2=>{
-      el2.addEventListener(el2.tagName==='SELECT'?'change':'input',()=>onProp(el2));
-    });
-  }
-  function onProp(el2){
-    const c=comps.find(x=>x.id===sel); if(!c)return;
-    const key=el2.getAttribute('data-cp'), v=el2.value;
-    if(key==='sub'){ c.sub=v; c.p=Object.assign({},subDef[v]); renderProps(); render(); return; }
-    c.p[key]=v.trim(); render();   // live-update the on-canvas label
-  }
-  function serialize(){
-    const par={}, find=x=>{par[x]=par[x]||x; return par[x]===x?x:(par[x]=find(par[x]));}, uni=(a,b)=>{par[find(a)]=find(b);};
-    find('PIN:p'); find('PIN:0'); comps.forEach(c=>{find(c.id+'#0');find(c.id+'#1');});
-    wires.forEach(w=>uni(w.a,w.b));
-    const rn={}; rn[find('PIN:p')]='p'; rn[find('PIN:0')]='0'; let n=1;
-    const nf=id=>{const r=find(id); if(!(r in rn))rn[r]='n'+(n++); return rn[r];};
-    return comps.filter(c=>c.type!=='SW').map(c=>{const a=nf(c.id+'#0'),b=nf(c.id+'#1');
-      if(c.type==='V'||c.type==='I'){
-        const P=c.type;   // 'V' or 'I' prefix -> VDC/IDC, VPULSE/IPULSE, VPWL/IPWL, VSIN/ISIN
-        if(c.sub==='DC')    return P+'DC '+c.name+' '+a+' '+b+' '+c.p.val;
-        if(c.sub==='PULSE') return P+'PULSE '+c.name+' '+a+' '+b+' '+c.p.v1+' '+c.p.v2+' '+c.p.td+' '+c.p.tr;
-        if(c.sub==='PWL')   return P+'PWL '+c.name+' '+a+' '+b+' '+c.p.pts;
-        return P+'SIN '+c.name+' '+a+' '+b+' '+c.p.amp+' '+c.p.freq;
-      }
-      return c.type+' '+c.name+' '+a+' '+b+' '+c.p.val;
-    }).join('\\n');
-  }
-  function apply(){
-    if(!comps.length){ setStatus('Editor empty — add components first.','err'); return; }
-    if(comps.some(c=>c.type==='SW')){
-      setStatus('This circuit contains switches (SW), which the custom spec cannot express. '
-               +'Delete them or build an R/L/C + source circuit before saving.','err'); return; }
-    const ta=document.getElementById('f_circuit_spec');
-    if(ta) ta.value='# generated by circuit editor\\n'+serialize()+'\\n';
-    const ks=document.getElementById('f_circuit_kind'); if(ks) ks.value='4';
-    setStatus('Circuit applied to spec (topology = custom).','');
-    loadCircuit();
-  }
-  function init(){ const s=S(); if(!s)return;
-    s.addEventListener('mousedown',onDown); s.addEventListener('mousemove',onMove); window.addEventListener('mouseup',onUp);
-    s.addEventListener('touchstart',onDown,{passive:false}); s.addEventListener('touchmove',onMove,{passive:false}); window.addEventListener('touchend',onUp);
-    render(); renderProps();
-  }
-  return {add,del,clear:clr,apply,init,load};
-})();
 
 window.addEventListener('load', ()=>{
   const ctrls=document.getElementById('controls');
-  if(ctrls){ ctrls.addEventListener('input', applyVisibility); ctrls.addEventListener('change', applyVisibility);
-    ctrls.addEventListener('mouseover', e=>{ if(e.target.classList.contains('help')) helpShow(e.target); });
-    ctrls.addEventListener('mouseout',  e=>{ if(e.target.classList.contains('help')) helpHide(); }); }
+  if(ctrls){ ctrls.addEventListener('input', applyVisibility); ctrls.addEventListener('change', applyVisibility); }
+  // Help hover is document-wide now (help icons live in both the controls and the circuit box).
+  document.addEventListener('mouseover', e=>{ if(e.target.classList.contains('help')) helpShow(e.target); });
+  document.addEventListener('mouseout',  e=>{ if(e.target.classList.contains('help')) helpHide(); });
   const ck=document.getElementById('f_circuit_kind'); if(ck) ck.addEventListener('change', onTopoChange);
   const sk=document.getElementById('f_source_kind'); if(sk) sk.addEventListener('change', onTopoChange);
-  applyVisibility(); loadCircuit(); CE.init();
+  applyVisibility(); loadCircuit();
 });
 </script>
 </body></html>
 """
 
+import html as _html
 INDEX_HTML = (INDEX_HTML
               .replace("__CONTROLS__", _controls_html())
               .replace("__SWEEP_OPTS__", _sweep_options_html())
+              .replace("__SPEC_SEED__", _html.escape(read_spec()))
               .replace("__DEFAULTS__", json.dumps(DEFAULTS))
               .replace("__PRESETS__", json.dumps(PRESETS))
               .replace("__VISIBILITY__", json.dumps(VISIBLE_WHEN))
