@@ -76,6 +76,7 @@ bool LoadConfig(const string& filename)
         else if (key == "wr_convergence_method")            g_cfg.wr_convergence_method = (unsigned)val;
         else if (key == "coupling_mode")                    g_cfg.coupling_mode = (unsigned)val;
         else if (key == "reconstruct_mode")                 g_cfg.reconstruct_mode = (unsigned)val;
+        else if (key == "interface_form")                   g_cfg.interface_form = (unsigned)val;
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
     }
     return true;
@@ -1161,9 +1162,20 @@ void WriteCircuitNetlist(const string& filename)
     out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
     out << "VIprev iprev  0 PWL FILE \"i_prev_k.pwl\"\n";
     out << "Vmeas p nx 0\n";
-    out << "Bfield nx 0 V = {\n";
-    out << "+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))\n";
-    out << "+ }\n\n";
+    if (g_cfg.interface_form == 1) {
+        // Norton (dual of the Thevenin): a behavioral CURRENT source with shunt G = 1/Z. Same TERMINAL
+        // fixpoint, but G -> 0 at the window start -> V(p) weakly tied -> stiffer, and the interior V(p)
+        // waveform differs from the Thevenin one (converges anyway; no dt-collapse observed up to ~MHz).
+        out << "* interface_form = Norton: current source I = V(iprev) + (V(nx) - V(vfprev))/Z, Z = Rrom + Lrom/dt\n";
+        out << "Bfield nx 0 I = {\n";
+        out << "+ V(iprev) + (V(nx) - V(vfprev)) / (Rrom + Lrom/MAX(time - t_abs_start, t_floor))\n";
+        out << "+ }\n\n";
+    } else {
+        // Thevenin (default): a behavioral VOLTAGE source that pins V(nx)=V(p).
+        out << "Bfield nx 0 V = {\n";
+        out << "+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))\n";
+        out << "+ }\n\n";
+    }
 
     out << ".INCLUDE restart.inc\n";
     out << ".print tran V(p) V(nx) I(Vmeas)\n";

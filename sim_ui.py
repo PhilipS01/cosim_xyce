@@ -63,6 +63,8 @@ PARAMS = [
     ("reconstruct_mode",                "Field reconstruction",         0,        "choice",
         {0: "pointwise (secant)", 1: "linear ramp", 2: "average (linear+const)",
          3: "pointwise (central diff)"}),
+    ("interface_form",                  "Interface stamping",           0,        "choice",
+        {0: "Thevenin (V source)", 1: "Norton (I source)"}),
 ]
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
 KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}
@@ -164,6 +166,20 @@ HELP = {
         "<div class='hn'>Both coupling directions. All modes carry the seam (C0-continuous). Accuracy is "
         "within ~1&ndash;2% across modes; the extra solves buy little. Recommend <b>linear</b> / "
         "<b>average</b> (1 field solve per window).</div>"
+    ),
+    "interface_form": (
+        "<div class='hh'>Interface stamping (Thevenin vs Norton)</div>"
+        "<div class='hn'>How the field ROM's linearised V&ndash;I law (the matched secant, "
+        "Z = Rrom + Lrom/dt) is put into the circuit. <b>Same fixpoint either way</b> (algebraic duals) &mdash; "
+        "only the conditioning differs.<br>"
+        "<b>Thevenin</b> (default): <code>Bfield</code> is a <b>voltage</b> source "
+        "V(nx)=V(vfprev)+Z&middot;(I(Vmeas)&minus;V(iprev)). Pins V(p); the huge window-start Z multiplies "
+        "only the small iteration change &rarr; robust.<br>"
+        "<b>Norton</b>: the dual, a behavioural <b>current</b> source "
+        "I=V(iprev)+(V(nx)&minus;V(vfprev))/Z with shunt G=1/Z. G&rarr;0 at the window start &rarr; V(p) "
+        "weakly tied &rarr; stiffer. Same terminal (window-boundary) fixpoint, but the <b>interior V(p) "
+        "waveform differs</b> from Thevenin (measured &gt; the signal amplitude on a 20&nbsp;kHz current "
+        "source); it still converges (no dt-collapse seen up to ~MHz). Provided to compare the two.</div>"
     ),
     "coupling_mode": (
         "<div class='hh'>Coupling direction</div>"

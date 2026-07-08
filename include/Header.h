@@ -106,6 +106,18 @@ struct SimConfig
     //   3 = central-diff pointwise: interior V via local central difference (N solves; no window-start lag).
     // The window-end value uses the accumulated window secant (I_end - I0)/dt_win.
     unsigned reconstruct_mode = 0;
+    // WR interface stamping (orthogonal to coupling_mode): how the field ROM's linearised V-I law
+    // (the matched secant, Z = Rrom + Lrom/dt) enters the circuit. Algebraic DUALS -- same TERMINAL
+    // fixpoint (the window-boundary V,I the WR metric checks), but the two stampings give a DIFFERENT
+    // interior V(p) WAVEFORM inside each window (and different Xyce timestepping):
+    //   0 = Thevenin (default): Bfield is a VOLTAGE source V(nx) = V(vfprev) + Z*(I(Vmeas) - V(iprev)).
+    //       Pins V(p); the huge window-start Z multiplies only the small iteration change -> well-conditioned.
+    //   1 = Norton: the dual, a behavioral CURRENT source I = V(iprev) + (V(nx) - V(vfprev))/Z with
+    //       shunt G = 1/Z. G -> 0 at the window start -> V(p) weakly tied -> stiffer, and the interior
+    //       V(p) differs (measured up to > the signal amplitude on a 20 kHz current source). It still
+    //       converges (no dt-collapse seen up to ~MHz -- Xyce handles the stiffness), just less cleanly.
+    //       Provided to compare the two.
+    unsigned interface_form = 0;
 };
 
 extern SimConfig g_cfg;
