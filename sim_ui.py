@@ -557,31 +557,157 @@ def export_lcapy(params):
             "error": "lcapy could not lay out this circuit: " + str(last)[:300]}
 
 
+def _draw_symbol(ax, kind, M, r, d, color):
+    """Draw a component symbol centred at M, 'radius' r, oriented along unit vec d (the wire direction)."""
+    import numpy as _np
+    cx, cy = M
+    dx, dy = d
+    px, py = -dy, dx                                    # perpendicular
+    circ_kinds = ("vsource", "isource", "ammeter")
+
+    if kind == "switch":                                # two contacts + a lifted lever
+        ax.plot([cx - r * dx], [cy - r * dy], "o", ms=4, color=color, zorder=4)
+        ax.plot([cx + r * dx], [cy + r * dy], "o", ms=4, color=color, zorder=4)
+        ax.plot([cx - r * dx, cx + 0.5 * r * dx + 0.6 * r * px],
+                [cy - r * dy, cy + 0.5 * r * dy + 0.6 * r * py], color=color, lw=1.8, zorder=4)
+        return r
+    if kind in circ_kinds:
+        ax.add_patch(plt.Circle(M, r, fill=True, fc="#0f1115", ec=color, lw=1.8, zorder=3))
+        if kind == "vsource":                           # sine '~'
+            t = _np.linspace(-1, 1, 40)
+            ax.plot(cx + 0.55 * r * t, cy + 0.32 * r * _np.sin(_np.pi * t), color=color, lw=1.6, zorder=4)
+        elif kind == "isource":                         # current arrow along d
+            from matplotlib.patches import FancyArrowPatch
+            ax.add_patch(FancyArrowPatch((cx - 0.5 * r * dx, cy - 0.5 * r * dy),
+                                         (cx + 0.5 * r * dx, cy + 0.5 * r * dy),
+                                         arrowstyle="-|>", mutation_scale=12, lw=1.6, color=color, zorder=4))
+        else:                                           # ammeter
+            ax.text(cx, cy, "A", ha="center", va="center", fontsize=10, color=color, fontweight="bold", zorder=4)
+        return r
+    if kind == "cap":                                   # two plates perpendicular to d
+        g = 0.14 * r
+        for s in (+1, -1):
+            c0 = (cx + s * g * dx, cy + s * g * dy)
+            ax.plot([c0[0] - r * px, c0[0] + r * px], [c0[1] - r * py, c0[1] + r * py],
+                    color=color, lw=2, zorder=3)
+        return g
+    hl, hw = r, 0.5 * r                                 # rectangle body (R / L / generic)
+    corners = [(cx + hl * dx + hw * px, cy + hl * dy + hw * py),
+               (cx + hl * dx - hw * px, cy + hl * dy - hw * py),
+               (cx - hl * dx - hw * px, cy - hl * dy - hw * py),
+               (cx - hl * dx + hw * px, cy - hl * dy + hw * py)]
+    ax.add_patch(plt.Polygon(corners, closed=True, fill=True, fc="#0f1115", ec=color, lw=1.8, zorder=3))
+    glyph = {"res": "R", "ind": "L"}.get(kind, "")
+    if glyph:
+        ax.text(cx, cy, glyph, ha="center", va="center", fontsize=8, color=color, fontweight="bold", zorder=4)
+    return r
+
+
+def _disp_name(dev):
+    """Readable element name from the lcapy device: strip the duplicated type letter (RRload->Rload,
+    VBemf->Bemf) but keep SW.. / Vmeas / Vfield as-is."""
+    if dev.startswith("SW") or dev in ("Vmeas", "Vfield"):
+        return dev
+    return dev[1:] if len(dev) > 1 and dev[0].upper() in "RLCVI" else dev
+
+
+def _rec_kind(rec):
+    """(symbol kind, colour) for a record, from its lcapy device + label."""
+    dev = rec["line"].split()[0]
+    label = rec.get("label") or ""
+    if dev == "Vmeas" or label == "ammeter":
+        return "ammeter", "#4f9dff"
+    if dev == "Vfield" or label == "field ROM":
+        return "vsource", "#39d98a"
+    if dev.startswith("SW"):
+        return "switch", "#d9a441"
+    return {"V": ("vsource", "#ff6b6b"), "I": ("isource", "#ffa64f"), "R": ("res", "#9aa4b2"),
+            "L": ("ind", "#c9b458"), "C": ("cap", "#b5835a")}.get(dev[0].upper(), ("box", "#9aa4b2"))
+
+
+def make_circuit_graph_png(recs):
+    """General fallback schematic for ANY topology -- including the switch meshes lcapy cannot grid-lay-out.
+    Place nodes with a force-directed graph layout (networkx), orient the port->ground axis vertical, and
+    draw each element as a symbol on its edge with our own matplotlib symbols. Returns a PNG data-URI or None."""
+    try:
+        import networkx as nx
+    except Exception:
+        return None
+    if not recs:
+        return None
+    G = nx.Graph()
+    G.add_nodes_from({n for r in recs for n in r["nodes"]})
+    for r in recs:
+        G.add_edge(*r["nodes"])
+    try:
+        pos = nx.kamada_kawai_layout(G)
+    except Exception:
+        pos = nx.spring_layout(G, seed=1)
+    P = {n: np.asarray(xy, float) for n, xy in pos.items()}
+    if "p" in P and "0" in P and np.linalg.norm(P["p"] - P["0"]) > 1e-9:
+        v = P["p"] - P["0"]
+        rot = np.pi / 2 - np.arctan2(v[1], v[0])        # rotate so port sits above ground
+        c, s = np.cos(rot), np.sin(rot)
+        Rm = np.array([[c, -s], [s, c]])
+        P = {n: Rm @ xy for n, xy in P.items()}
+    lens = [np.linalg.norm(P[a] - P[b]) for a, b in (r["nodes"] for r in recs)]
+    L = float(np.median([x for x in lens if x > 1e-9]) or 1.0)
+    Rsym = 0.18 * L
+
+    fig, ax = plt.subplots(figsize=(6.6, 4.8))
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_aspect("equal"); ax.axis("off")
+    for r in recs:
+        a, b = r["nodes"]; A, B = P[a], P[b]
+        d = B - A; dl = float(np.linalg.norm(d))
+        if dl < 1e-9:
+            continue
+        u = d / dl; M = (A + B) / 2.0
+        kind, color = _rec_kind(r)
+        e1, e2 = M - u * Rsym, M + u * Rsym
+        ax.plot([A[0], e1[0]], [A[1], e1[1]], color="#8b94a3", lw=1.6, zorder=1)
+        ax.plot([e2[0], B[0]], [e2[1], B[1]], color="#8b94a3", lw=1.6, zorder=1)
+        _draw_symbol(ax, kind, (M[0], M[1]), Rsym, (u[0], u[1]), color)
+        toks = r["line"].split()
+        val = r.get("label") or (toks[3] if len(toks) > 3 else "")
+        nm = _disp_name(toks[0])
+        ax.annotate(nm if not val else f"{nm}\n{val}", (M[0], M[1]), textcoords="offset points",
+                    xytext=(0, Rsym * 42), ha="center", va="bottom", fontsize=7.5, color="#333")
+    for n, xy in P.items():
+        ax.plot([xy[0]], [xy[1]], "o", ms=4.5, color="#8b94a3", zorder=2)
+        if n == "0":                                    # ground symbol
+            for k, w in ((0, 0.10 * L), (0.05 * L, 0.06 * L), (0.10 * L, 0.03 * L)):
+                ax.plot([xy[0] - w, xy[0] + w], [xy[1] - k, xy[1] - k], color="#8b94a3", lw=1.6, zorder=2)
+        else:
+            ax.annotate(n, (xy[0], xy[1]), textcoords="offset points", xytext=(4, 4),
+                        fontsize=8, color="#4f9dff", fontweight="bold")
+    ax.margins(0.15)
+    fig.tight_layout()
+    return _png(fig)
+
+
 def lcapy_schematic_png(parsed, params):
-    """Render the current circuit to an lcapy PNG (2D-hinted, falling back to the plain layout) and
-    return it as a data-URI for the inline live view. Returns None when lcapy/pdflatex are unavailable
-    or the layout fails (the UI then shows a hint instead of a schematic)."""
+    """Render the current circuit to a schematic PNG data-URI for the inline live view. Uses lcapy's 2D
+    comb layout when the topology allows it (series/parallel -- nice orthogonal, LaTeX-consistent with the
+    export); for meshes lcapy can't grid-lay-out (switches), falls back to a general force-directed graph
+    renderer instead of lcapy's one-line default. Returns None when nothing can render."""
     import tempfile, base64, warnings
     recs = _lcapy_records(parsed, params)
     if not recs:
         return None
-    plain = "\n".join(r["line"] + _lcapy_attrs(r) for r in recs)
     hinted = _lcapy_hinted(recs)
-    try:
-        from lcapy import Circuit
-    except Exception:
-        return None
-    d = tempfile.mkdtemp()
-    for netlist in ([hinted, plain] if hinted else [plain]):
+    if hinted is not None:                              # comb layout worked -> nice lcapy render
         try:
+            from lcapy import Circuit
+            d = tempfile.mkdtemp()
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                Circuit(netlist).draw(os.path.join(d, "c.png"), dpi=150)
+                Circuit(hinted).draw(os.path.join(d, "c.png"), dpi=150)
             b64 = base64.b64encode(open(os.path.join(d, "c.png"), "rb").read()).decode()
             return "data:image/png;base64," + b64
         except Exception:
-            continue
-    return None
+            pass
+    return make_circuit_graph_png(recs)                 # mesh / lcapy unavailable -> graph renderer
 
 
 def graph_to_spec(graph):

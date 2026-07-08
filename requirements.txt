@@ -9,3 +9,4 @@
 numpy
 matplotlib
 lcapy
+networkx   # force-directed layout for the general (mesh) schematic fallback
