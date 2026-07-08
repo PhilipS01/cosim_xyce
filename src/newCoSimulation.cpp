@@ -620,8 +620,10 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
 
 // Current-driven (Neumann) field solver. Reads the interface current I(t) (i_prev_k.pwl, circuit
 // output) and returns the field voltage V(t) = R_FEM*I + dlambda/dt in vf_prev_k.pwl -- this is the
-// V(vfprev) base of the circuit's matched-secant Bfield (the secant then Newton-linearises about the
-// previous current using the ROM impedance, and vanishes at convergence). reconstruct_mode:
+// V(vfprev) base of the circuit's matched-secant Bfield. The secant is a Newton linearisation of the
+// field V-I characteristic in BOTH coupling directions; current-driven's difference is only that this
+// base voltage is the field's OWN directly-computed V (an accurate base), not the circuit's prior port
+// voltage -- so the amplified window-start term stays small. reconstruct_mode:
 //   0 pointwise (default): V computed at every field-eval point from I(t) -- symmetric to the
 //      voltage-driven solver, needs only I0 (V_field_last_time unused); follows the current's curve.
 //   1 linear: replace the interior with a straight ramp from V_field_last_time (previous window end)
@@ -1137,13 +1139,19 @@ void WriteCircuitNetlist(const string& filename)
     }
 
     // Feste WR-Schnittstelle. Kopplungsrichtung per coupling_mode.
-    // Both coupling directions use the SAME matched-secant Bfield (Thevenin field ROM). The device
-    // lines are identical; only the meaning of the two PWL channels differs (set by the FEM solver +
-    // ReadXyceResults resample target):
-    //   voltage-driven: vf_prev = V(p) [ReadXyce], i_prev = I_field [FEM];   secant infers V(p).
-    //   current-driven: vf_prev = V_field [FEM],  i_prev = I(Vmeas) [ReadXyce]; secant is a Newton
-    //     linearisation of V_field about the previous current: V = V_field_prev + (dV_field/dI)*(I - I_prev),
-    //     with the ROM impedance Rrom + Lrom/dt as the Jacobian estimate (vanishes at convergence).
+    // Both coupling directions use the SAME matched-secant Bfield: the field's Thevenin equivalent, a
+    // voltage source V(vfprev) behind the ROM impedance Z = Rrom + Lrom/dt. That IS a Newton/secant
+    // linearisation of the field's V-I characteristic V = Z_field(I) about the previous iterate
+    // (V_prev, I_prev), with Z as the Jacobian estimate; the correction Z*(I(Vmeas) - V(iprev)) vanishes
+    // at convergence. The device lines are identical -- only which point (V_prev, I_prev) the base sits
+    // on differs, i.e. how the FEM evaluated the field (set by the FEM solver + ReadXyceResults target):
+    //   voltage-driven (Dirichlet): vf_prev = V(p) [ReadXyce], i_prev = I_field [FEM]. Base = the
+    //     circuit's prior port voltage (= the field's voltage only at convergence); the residual is the
+    //     cross-solver current defect I_circuit - I_field, so at the window start Lrom/t_floor amplifies
+    //     it -> the ~f V(p) spike.
+    //   current-driven (Neumann):  vf_prev = V_field [FEM], i_prev = I(Vmeas) [ReadXyce]. Base = the
+    //     field's OWN directly-computed voltage (accurate); the residual is the iteration change
+    //     I_k - I_{k-1} of a single variable, so the amplified term stays small -> no window-start spike.
     if (g_cfg.coupling_mode == 1)
         out << "* === WR INTERFACE (current-driven): matched-secant Bfield "
                "(vf_prev = V_field from FEM, i_prev = I(Vmeas)) ===\n";
