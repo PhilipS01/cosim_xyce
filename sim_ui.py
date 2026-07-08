@@ -141,13 +141,14 @@ HELP = {
         "generated and shown locked around the editable box.</div>"
     ),
     "lcapy_export": (
-        "<div class='hh'>LaTeX / PDF export (lcapy)</div>"
-        "<div class='hn'>Downloads the schematic as <code>circuit.tex</code> (circuitikz) + a compiled "
-        "<code>circuit.pdf</code> for thesis figures &mdash; the same 2D-laid-out <b>physical view</b> shown "
-        "on the right. The interface (Vmeas ammeter + Bfield ROM) collapses to a single field inductor "
-        "<code>L_field p 0</code>, the WR PWL signal sources are dropped, and switches render as <code>SW</code>. "
-        "Needs <code>lcapy</code> (pip) and <code>pdflatex</code>; without pdflatex you still get the "
-        "<code>.tex</code>.</div>"
+        "<div class='hh'>LaTeX / PDF export</div>"
+        "<div class='hn'>Downloads the schematic as <code>circuit.tex</code> (a standalone circuitikz "
+        "document) + a compiled <code>circuit.pdf</code> for thesis figures &mdash; the same render shown "
+        "on the right. Layout is by <b>ELK</b> (orthogonal placement + wire routing); it's a <b>physical "
+        "view</b> &mdash; the interface is the ammeter (<code>Vmeas</code>) + the field ROM source "
+        "(<code>Bfield</code>), and the WR PWL signal carriers are dropped. Needs <code>node</code>+"
+        "<code>elkjs</code> (<code>npm install</code>) for the layout and <code>pdflatex</code>+"
+        "<code>circuitikz</code> for the PDF; without pdflatex you still get the <code>.tex</code>.</div>"
     ),
     "reconstruct_mode": (
         "<div class='hh'>Field reconstruction</div>"
@@ -436,176 +437,46 @@ def _lcapy_records(parsed, params):
     return recs
 
 
-def _lcapy_attrs(rec, direction=None):
-    """Build the '; <dir>, l={label}' attribute suffix for a record (either part may be absent)."""
-    parts = ([direction] if direction else []) + ([f"l={{{rec['label']}}}"] if rec.get("label") else [])
-    return ("; " + ", ".join(parts)) if parts else ""
+# --- ELK layout + circuitikz renderer -------------------------------------------------------------
+# The schematic is laid out by ELK (Eclipse Layout Kernel via elk_layout.js/elkjs) -- a professional
+# orthogonal placement + wire-routing engine -- and drawn with circuitikz (LaTeX), so the inline PNG
+# and the LaTeX/PDF export are the SAME render for every topology. Nets are ELK nodes; each 2-terminal
+# element is an ELK edge whose routed polyline becomes the wire, with the component symbol placed on it.
+def _ck_component(rec):
+    """(circuitikz to[] type, label) for a device record."""
+    dev = rec["line"].split()[0]
+    label = rec.get("label") or ""
+    if dev == "Vmeas" or label == "ammeter":
+        return "rmeter, t=A", ""                          # 0 V ammeter (A shown inside the meter)
+    if dev == "Vfield" or label == "field ROM":
+        return "sV", "field ROM"
+    if dev.startswith("SW"):
+        return "nos", dev[2:]                             # normally-open switch (label = switch name)
+    if not label:
+        toks = rec["line"].split()
+        label = toks[3] if len(toks) > 3 else ""
+    return {"V": "sV", "I": "sI", "R": "R", "L": "L", "C": "C"}.get(dev[0].upper(), "generic"), label
 
 
-def netlist_to_lcapy(parsed, params):
-    """Plain (unhinted) lcapy netlist string; see _lcapy_records for the mapping."""
-    return "\n".join(r["line"] + _lcapy_attrs(r) for r in _lcapy_records(parsed, params))
+def _ck_sanitize(s):
+    """Escape the few LaTeX-special characters that appear in element labels."""
+    for a, b in (("µ", "\\textmu "), ("μ", "\\textmu "), ("Ω", "\\textohm "),
+                 ("&", "\\&"), ("%", "\\%"), ("_", "\\_"), ("#", "\\#")):
+        s = s.replace(a, b)
+    return s
 
 
-def _lcapy_comb(recs, gnd="0"):
-    """Add circuitikz drawing hints so the schematic lays out as a 2D comb/ladder instead of one line.
-
-    Comb model: the ungrounded ('series') elements form a horizontal chain across the top, ordered
-    left-to-right; every grounded ('shunt') element hangs 'down' from its node to a bottom ground rail.
-    This covers the WR circuit family -- a grounded source is just a down-leg (P1), and parallel
-    branches to ground each become their own down-leg (source + C || R+L). Each grounded terminal gets
-    its own ground copy (single-underscore 0_k; double underscore is an invalid lcapy subscript), all
-    joined by a rail wire + one ground symbol. Returns a hinted netlist string, or None when the
-    topology can't be confidently placed (branching/looped top chain, >1 shunt on a node, switches) --
-    the caller then falls back to the unhinted one-line netlist."""
-    import collections
-    series, shunt = [], []                                    # indices; 'cross' (both gnd) skipped
-    for i, r in enumerate(recs):
-        a, b = r["nodes"]
-        if a == gnd and b == gnd:
-            continue
-        (shunt if (a == gnd or b == gnd) else series).append(i)
-    topnode = lambda i: (recs[i]["nodes"][0] if recs[i]["nodes"][1] == gnd else recs[i]["nodes"][1])
-    nodes = set()
-    for i in series:
-        nodes.update(recs[i]["nodes"])
-    for i in shunt:
-        nodes.add(topnode(i))
-    if not nodes:
-        return None
-    # Order the top nodes: the series elements must form a single simple chain (a path).
-    adj = collections.defaultdict(list)
-    for i in series:
-        a, b = recs[i]["nodes"]
-        adj[a].append((b, i)); adj[b].append((a, i))
-    if not series:
-        if len(nodes) != 1:
-            return None
-        order, seqE = [next(iter(nodes))], []
-    else:
-        deg = {n: len(adj[n]) for n in nodes}
-        if any(deg.get(n, 0) > 2 for n in nodes):             # branching top chain -> not a ladder
-            return None
-        ends = [n for n in nodes if deg.get(n, 0) == 1]
-        start = ends[0] if ends else next(iter(nodes))
-        order, seqE, usedE, cur = [start], [], set(), start
-        while True:
-            nxt = [(v, ei) for v, ei in adj[cur] if ei not in usedE]
-            if not nxt:
-                break
-            v, ei = nxt[0]; usedE.add(ei); seqE.append(ei); order.append(v); cur = v
-        if len(usedE) != len(series) or len(order) != len(nodes):
-            return None                                       # cycle / disconnected / branch
-    pos = {n: k for k, n in enumerate(order)}
-    per = collections.Counter(topnode(i) for i in shunt)
-    if any(v > 1 for v in per.values()):                      # two shunts on one node would overlap
-        return None
-    out, grounds = [], []                                     # grounds: (x_pos, node) for the rail
-    for k, ei in enumerate(seqE):                             # top chain, left -> right
-        toks = recs[ei]["line"].split()
-        out.append(" ".join([toks[0], order[k], order[k + 1]] + toks[3:]) + _lcapy_attrs(recs[ei], "right"))
-    gk = [0]
-    for i in shunt:                                           # down-legs to the ground rail
-        toks = recs[i]["line"].split(); tn = topnode(i)
-        gk[0] += 1; g = f"0_{gk[0]}"; grounds.append((pos[tn], g))
-        out.append(" ".join([toks[0], tn, g] + toks[3:]) + _lcapy_attrs(recs[i], "down"))
-    grounds.sort()
-    for j in range(1, len(grounds)):                          # bottom rail joins ground copies L->R
-        out.append(f"W {grounds[j-1][1]} {grounds[j][1]}; right")
-    if grounds:
-        out.append(f"W {grounds[0][1]} 0; down=0.3, ground")  # a single ground symbol
-    return "\n".join(out)
-
-
-def _lcapy_emit_positioned(recs, pos, gnd="0"):
-    """Emit circuitikz hints from an integer {node:(col,row)} placement. An axis-aligned edge is a direct
-    component; a diagonal edge is L-routed (component on one leg + a wire on the other via a helper node)
-    with the corner chosen to avoid landing on another node; a grounded element goes down to its OWN
-    ground copy + symbol (grounds decoupled, no shared-node routing). Every loop becomes a rectilinear
-    polygon lcapy can place."""
-    occupied = set(pos.values())
-    out, hk, gk = [], [0], [0]
-
-    def attr(rec, d, length):
-        s = f"{d}={max(int(round(length)), 1)}"
-        if rec.get("label"):
-            s += f", l={{{rec['label']}}}"
-        return s
-
-    for r in recs:
-        toks = r["line"].split(); dev = toks[0]; tail = toks[3:]
-        a, b = r["nodes"]
-        if a == gnd or b == gnd:                              # grounded -> own ground copy below
-            live = b if a == gnd else a
-            gk[0] += 1; gc = f"{gnd}g{gk[0]}"
-            out.append(" ".join([dev, live, gc] + tail) + "; " + attr(r, "down", 1))
-            out.append(f"W {gc} {gc}s; down=0.3, ground")
-            continue
-        ca, ra = pos[a]; cb, rb = pos[b]
-        if ra == rb and ca != cb:                             # horizontal
-            out.append(" ".join([dev, a, b] + tail) + "; " + attr(r, "right" if cb > ca else "left", abs(cb - ca)))
-        elif ca == cb and ra != rb:                           # vertical
-            out.append(" ".join([dev, a, b] + tail) + "; " + attr(r, "up" if rb > ra else "down", abs(rb - ra)))
-        else:                                                 # diagonal -> L-route, corner off other nodes
-            hk[0] += 1; h = f"_h{hk[0]}"
-            horiz_first = (cb, ra) not in occupied or (ca, rb) in occupied
-            if horiz_first:
-                out.append(" ".join([dev, a, h] + tail) + "; " + attr(r, "right" if cb > ca else "left", abs(cb - ca)))
-                out.append(f"W {h} {b}; {'up' if rb > ra else 'down'}={max(abs(rb - ra), 1)}")
-            else:
-                out.append(" ".join([dev, a, h] + tail) + "; " + attr(r, "up" if rb > ra else "down", abs(rb - ra)))
-                out.append(f"W {h} {b}; {'right' if cb > ca else 'left'}={max(abs(cb - ca), 1)}")
-    return "\n".join(out)
-
-
-def _lcapy_grid(recs, gnd="0", port="p"):
-    """General fallback layout for meshes the comb can't handle. Layered embedding (row = graph distance
-    from the port so the port sits on top; column = barycentre ordering to reduce crossings) via networkx,
-    then _lcapy_emit_positioned. Returns a hinted netlist string, or None if networkx is unavailable."""
-    try:
-        import networkx as nx
-    except Exception:
-        return None
-    G = nx.Graph()
-    G.add_nodes_from({n for r in recs for n in r["nodes"]})
-    for r in recs:
-        G.add_edge(*r["nodes"])
-    if G.number_of_nodes() == 0:
-        return None
-    root = port if port in G else next(iter(G))
-    layer = nx.single_source_shortest_path_length(G, root)
-    maxd = max(layer.values()) if layer else 0
-    layer = {n: layer.get(n, maxd) for n in G}
-    by_layer = {}
-    for n, l in layer.items():
-        by_layer.setdefault(l, []).append(n)
-    col = {}
-    for l in by_layer:
-        for i, n in enumerate(sorted(by_layer[l])):
-            col[n] = 2 * i
-    for _ in range(6):                                        # barycentre sweeps to reduce crossings
-        for l in by_layer:
-            bary = sorted(((np.mean([col[x] for x in G[n] if x != n] or [col[n]]), n) for n in by_layer[l]))
-            for i, (_, n) in enumerate(bary):
-                col[n] = 2 * i
-    pos = {n: (col[n], maxd - layer[n]) for n in G}           # port (layer 0) at the top row
-    return _lcapy_emit_positioned(recs, pos, gnd)
-
-
-def _lcapy_elk(recs, gnd="0", port="p"):
-    """Primary mesh layout: run the graph through ELK (Eclipse Layout Kernel, via elk_layout.js/elkjs) --
-    a professional orthogonal placement+routing engine built for netlist-shaped graphs -- then snap the
-    coordinates to an integer grid (col by x-rank, row by inverted y-rank so the port sits on top) and
-    emit via _lcapy_emit_positioned. Returns a hinted netlist, or None if node/elkjs is unavailable or the
-    layout fails (caller falls through to the networkx grid)."""
+def _elk_layout(recs, gnd="0", port="p"):
+    """Run the circuit graph (nets + 2-terminal element edges) through ELK; return {nets, routes, size}
+    (net positions + the routed wire polyline per element), or None if node/elkjs is unavailable."""
     import json as _json
     import subprocess
     script = os.path.join(HERE, "elk_layout.js")
-    if not os.path.exists(script):
+    if not os.path.exists(script) or not recs:
         return None
-    nodes = sorted({n for r in recs for n in r["nodes"]})
-    edges = [r["nodes"] for r in recs]
-    payload = _json.dumps({"nodes": nodes, "edges": edges, "port": port, "gnd": gnd})
+    comps = [{"id": f"c{i}", "a": r["nodes"][0], "b": r["nodes"][1]} for i, r in enumerate(recs)]
+    nets = sorted({n for r in recs for n in r["nodes"]})
+    payload = _json.dumps({"components": comps, "nets": nets, "port": port, "gnd": gnd})
     try:
         out = subprocess.run(["node", script], input=payload, capture_output=True, text=True,
                              cwd=HERE, timeout=20)
@@ -614,106 +485,116 @@ def _lcapy_elk(recs, gnd="0", port="p"):
     if out.returncode != 0 or not out.stdout.strip():
         return None
     try:
-        raw = _json.loads(out.stdout)
+        d = _json.loads(out.stdout)
     except Exception:
         return None
-    if len(raw) != len(nodes):
+    return d if d.get("nets") else None
+
+
+def _circuitikz(recs, gnd="0", port="p"):
+    """Emit a circuitikz picture from the ELK layout: each element's symbol on its routed wire, plus
+    junction dots (nets with >=3 connections) and a ground symbol. Returns the tikz string, or None."""
+    import collections
+    import math
+    lay = _elk_layout(recs, gnd, port)
+    if lay is None:
         return None
-    # Compress ELK's continuous coords to a small integer grid, PRESERVING its alignment: a new grid
-    # index starts only when the gap to the previous coordinate exceeds a tolerance, so nodes ELK aligned
-    # (same x or y) keep the same column/row (-> direct wires, not L-routes). Row is inverted so the port
-    # (ELK's first layer) sits on top.
-    def compress(coord):
-        vals = sorted({coord(n) for n in raw})
-        gaps = [b - a for a, b in zip(vals, vals[1:]) if b - a > 1e-9]
-        tol = 0.4 * min(gaps) if gaps else 1.0                # < the smallest real gap -> no chaining
-        idx, c, prev = {}, 0, None
-        for v in vals:
-            if prev is not None and v - prev > tol:
-                c += 1
-            idx[v] = c; prev = v
-        return {n: idx[coord(n)] for n in raw}
-    col = compress(lambda n: raw[n][0])
-    row = compress(lambda n: raw[n][1])
-    rmax = max(row.values())
-    return _lcapy_emit_positioned(recs, {n: (col[n], rmax - row[n]) for n in raw}, gnd)
+    P, R, H, scale = lay["nets"], lay["routes"], lay["size"][1], 1.0 / 40.0
+
+    def T(pt):                                            # ELK px (y-down) -> tikz cm (y-up)
+        return (pt[0] * scale, (H - pt[1]) * scale)
+
+    def ps(pt):
+        return f"({pt[0]:.2f},{pt[1]:.2f})"
+
+    body = []
+    for i, r in enumerate(recs):
+        route = R.get(f"c{i}") or [P[r["nodes"][0]], P[r["nodes"][1]]]
+        pts = [T(q) for q in route]
+        base, label = _ck_component(r)
+        opt = base + (f", l={{{_ck_sanitize(label)}}}" if label else "")
+        if len(pts) == 2:
+            body.append(f"\\draw {ps(pts[0])} to[{opt}] {ps(pts[1])};")
+            continue
+        seg = [math.dist(pts[j], pts[j + 1]) for j in range(len(pts) - 1)]   # component on middle segment
+        half, acc, k = sum(seg) / 2, 0.0, 0
+        for j, l in enumerate(seg):
+            if acc + l >= half:
+                k = j; break
+            acc += l
+        if k > 0:
+            body.append("\\draw " + " -- ".join(ps(p) for p in pts[:k + 1]) + ";")
+        body.append(f"\\draw {ps(pts[k])} to[{opt}] {ps(pts[k + 1])};")
+        if k + 1 < len(pts) - 1:
+            body.append("\\draw " + " -- ".join(ps(p) for p in pts[k + 1:]) + ";")
+    deg = collections.Counter(n for r in recs for n in r["nodes"])
+    for n, xy in P.items():
+        pt = ps(T(xy))
+        if n == gnd:
+            body.append(f"\\draw {pt} node[ground]{{}};")
+        elif deg[n] >= 3:
+            body.append(f"\\draw {pt} node[circ]{{}};")
+    return "\\begin{circuitikz}\n" + "\n".join(body) + "\n\\end{circuitikz}"
 
 
-def _lcapy_hinted(recs, gnd="0"):
-    """2D circuitikz layout: the clean comb/ladder where the topology allows it (series/parallel), else
-    ELK orthogonal placement for meshes, else a networkx layered grid (if node/elkjs is unavailable).
-    None only if none apply -> caller falls back to the plain one-line netlist."""
-    return _lcapy_comb(recs, gnd) or _lcapy_elk(recs, gnd) or _lcapy_grid(recs, gnd)
-
-
-def export_lcapy(params):
-    """Regenerate the netlist from the live config, translate to lcapy, and return the circuitikz
-    .tex source + a compiled PDF (base64). Degrades gracefully when lcapy or pdflatex are unavailable."""
-    import tempfile, base64, warnings
-    write_config(params); write_spec(params); emit_netlist()
-    parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
-    sim_params = _read_sim_params()
-    recs = _lcapy_records(parsed, sim_params)
-    plain = "\n".join(r["line"] + _lcapy_attrs(r) for r in recs)
-    hinted = _lcapy_hinted(recs)                              # 2D ladder hints, or None
-    try:
-        from lcapy import Circuit
-    except Exception:
-        return {"ok": False, "lcapy_netlist": plain,
-                "error": "lcapy not installed. Run:  python3 -m pip install --break-system-packages lcapy"}
+def _compile_circuitikz(tikz):
+    """Compile a circuitikz picture to (full_tex, pdf_bytes|None, png_bytes|None) via pdflatex (+ pdf->png).
+    Degrades gracefully: returns the .tex even if pdflatex/converters are missing."""
+    import tempfile
+    import subprocess
+    tex = ("\\documentclass[border=4pt]{standalone}\n\\usepackage{circuitikz}\n"
+           "\\usepackage{textcomp}\n\\begin{document}\n" + tikz + "\n\\end{document}\n")
     d = tempfile.mkdtemp()
-
-    def render(netlist):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            c = Circuit(netlist)
-            c.draw(os.path.join(d, "c.schtex"))
-            tex = open(os.path.join(d, "c.schtex")).read()
-            pdf_b64 = warn = None
-            try:
-                c.draw(os.path.join(d, "c.pdf"))
-                pdf_b64 = base64.b64encode(open(os.path.join(d, "c.pdf"), "rb").read()).decode()
-            except Exception as pe:
-                warn = "PDF compile failed (tex still available): " + str(pe)[:200]
-        return tex, pdf_b64, warn
-
-    # Prefer the 2D-hinted layout; if lcapy can't place it, fall back to the plain one-line netlist.
-    for netlist in ([hinted, plain] if hinted else [plain]):
+    with open(os.path.join(d, "c.tex"), "w") as f:
+        f.write(tex)
+    try:
+        subprocess.run(["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "c.tex"],
+                       cwd=d, capture_output=True, timeout=60)
+    except Exception:
+        return tex, None, None
+    pdfp = os.path.join(d, "c.pdf")
+    if not os.path.exists(pdfp):
+        return tex, None, None
+    pdf = open(pdfp, "rb").read()
+    png, pngp = None, os.path.join(d, "c.png")
+    for cmd in (["sips", "-s", "format", "png", pdfp, "--out", pngp],
+                ["pdftoppm", "-png", "-r", "150", "-singlefile", pdfp, os.path.join(d, "c")]):
         try:
-            tex, pdf_b64, warn = render(netlist)
-            return {"ok": True, "tex": tex, "pdf_b64": pdf_b64, "warn": warn, "lcapy_netlist": netlist}
-        except Exception as e:
-            last = e
-    return {"ok": False, "lcapy_netlist": plain,
-            "error": "lcapy could not lay out this circuit: " + str(last)[:300]}
+            subprocess.run(cmd, cwd=d, capture_output=True, timeout=30)
+            if os.path.exists(pngp):
+                png = open(pngp, "rb").read(); break
+        except Exception:
+            continue
+    return tex, pdf, png
 
 
 def lcapy_schematic_png(parsed, params):
-    """Render the current circuit to an lcapy PNG data-URI for the inline live view -- the SAME lcapy
-    render used by the LaTeX/PDF export, so inline and export are consistent. 2D-hinted (comb for
-    series/parallel, layered grid for meshes), falling back to the plain one-line netlist only if lcapy
-    can't place it. Returns None when lcapy/pdflatex are unavailable."""
-    import tempfile, base64, warnings
+    """Inline schematic as a PNG data-URI: ELK layout -> circuitikz -> pdflatex -> png (the same render
+    as the export). Returns None if node/elkjs/pdflatex are unavailable."""
+    import base64
     recs = _lcapy_records(parsed, params)
-    if not recs:
+    tikz = _circuitikz(recs) if recs else None
+    if tikz is None:
         return None
-    plain = "\n".join(r["line"] + _lcapy_attrs(r) for r in recs)
-    hinted = _lcapy_hinted(recs)
-    try:
-        from lcapy import Circuit
-    except Exception:
-        return None
-    d = tempfile.mkdtemp()
-    for netlist in ([hinted, plain] if hinted else [plain]):
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                Circuit(netlist).draw(os.path.join(d, "c.png"), dpi=150)
-            b64 = base64.b64encode(open(os.path.join(d, "c.png"), "rb").read()).decode()
-            return "data:image/png;base64," + b64
-        except Exception:
-            continue
-    return None
+    _, _, png = _compile_circuitikz(tikz)
+    return "data:image/png;base64," + base64.b64encode(png).decode() if png else None
+
+
+def export_lcapy(params):
+    """Regenerate the netlist from the live config and export the schematic (ELK layout + circuitikz):
+    the standalone .tex + a compiled PDF (base64). Degrades gracefully when the layout/toolchain is
+    unavailable."""
+    import base64
+    write_config(params); write_spec(params); emit_netlist()
+    parsed = parse_netlist(os.path.join(HERE, "wr_circuit.cir"))
+    recs = _lcapy_records(parsed, _read_sim_params())
+    tikz = _circuitikz(recs) if recs else None
+    if tikz is None:
+        return {"ok": False, "error": "schematic layout unavailable -- needs node + elkjs (run 'npm install')."}
+    tex, pdf, _png = _compile_circuitikz(tikz)
+    return {"ok": True, "tex": tex,
+            "pdf_b64": base64.b64encode(pdf).decode() if pdf else None,
+            "warn": None if pdf else "PDF compile failed (pdflatex missing?) -- .tex still available."}
 
 
 def graph_to_spec(graph):

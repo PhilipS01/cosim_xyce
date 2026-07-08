@@ -2,15 +2,12 @@
 # The solver itself is C++ (built with `make`); these are only for the studio UI.
 #
 #   python3 -m pip install -r requirements.txt
-#
-# lcapy additionally needs a LaTeX toolchain (pdflatex + circuitikz) for the PDF
-# export; without it the "Export LaTeX/PDF" button still returns the .tex source.
 
 numpy
 matplotlib
-lcapy
-networkx   # fallback mesh layout if node/elkjs is unavailable (primary is ELK -- see below)
 
-# Schematic mesh layout (primary) uses ELK via elkjs, a Node package -- NOT pip:
-#   npm install          (reads package.json; elk_layout.js requires it)
-# Without node/elkjs the schematic falls back to the networkx grid above.
+# The schematic renderer is NOT a Python package. It uses:
+#   - ELK (orthogonal layout) via elkjs, a Node package:  npm install   (see package.json)
+#   - circuitikz + pdflatex (a LaTeX toolchain) to compile the schematic to PDF/PNG.
+# Without node/elkjs there is no schematic; without pdflatex the "Export LaTeX/PDF"
+# button still returns the .tex source.
