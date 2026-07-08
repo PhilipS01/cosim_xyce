@@ -619,9 +619,24 @@ def _lcapy_elk(recs, gnd="0", port="p"):
         return None
     if len(raw) != len(nodes):
         return None
-    xs = sorted(raw, key=lambda n: raw[n][0]); col = {n: i for i, n in enumerate(xs)}
-    ys = sorted(raw, key=lambda n: raw[n][1]); row = {n: len(ys) - 1 - i for i, n in enumerate(ys)}
-    return _lcapy_emit_positioned(recs, {n: (col[n], row[n]) for n in raw}, gnd)
+    # Compress ELK's continuous coords to a small integer grid, PRESERVING its alignment: a new grid
+    # index starts only when the gap to the previous coordinate exceeds a tolerance, so nodes ELK aligned
+    # (same x or y) keep the same column/row (-> direct wires, not L-routes). Row is inverted so the port
+    # (ELK's first layer) sits on top.
+    def compress(coord):
+        vals = sorted({coord(n) for n in raw})
+        gaps = [b - a for a, b in zip(vals, vals[1:]) if b - a > 1e-9]
+        tol = 0.4 * min(gaps) if gaps else 1.0                # < the smallest real gap -> no chaining
+        idx, c, prev = {}, 0, None
+        for v in vals:
+            if prev is not None and v - prev > tol:
+                c += 1
+            idx[v] = c; prev = v
+        return {n: idx[coord(n)] for n in raw}
+    col = compress(lambda n: raw[n][0])
+    row = compress(lambda n: raw[n][1])
+    rmax = max(row.values())
+    return _lcapy_emit_positioned(recs, {n: (col[n], rmax - row[n]) for n in raw}, gnd)
 
 
 def _lcapy_hinted(recs, gnd="0"):
