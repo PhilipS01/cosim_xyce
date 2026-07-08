@@ -592,42 +592,43 @@ def _lcapy_grid(recs, gnd="0", port="p"):
     return _lcapy_emit_positioned(recs, pos, gnd)
 
 
-def _lcapy_spdt(recs, gnd="0", port="p"):
-    """Hand-tuned layout for the 2-way (SPDT) switch family (P4/P5): a wiper node (>= 2 switches) with its
-    common branch (the cap) going DOWN to ground, the two throws UP to their branches (source + short),
-    both rejoining at the port, and the interface (ammeter + field ROM) as a column on the RIGHT. Returns
-    a hinted netlist, or None if the circuit isn't this family (caller falls through to the generic grid)."""
-    import collections
-    sw = [r for r in recs if r["line"].split()[0].startswith("SW")]
-    cnt = collections.Counter(n for r in sw for n in r["nodes"])
-    wiper = next((n for n, c in cnt.items() if c >= 2 and n != gnd), None)
-    throws = list(dict.fromkeys(n for r in sw for n in r["nodes"] if n != wiper))
-    allnodes = {n for r in recs for n in r["nodes"]}
-    if wiper is None or len(throws) != 2 or port not in allnodes:
+def _lcapy_elk(recs, gnd="0", port="p"):
+    """Primary mesh layout: run the graph through ELK (Eclipse Layout Kernel, via elk_layout.js/elkjs) --
+    a professional orthogonal placement+routing engine built for netlist-shaped graphs -- then snap the
+    coordinates to an integer grid (col by x-rank, row by inverted y-rank so the port sits on top) and
+    emit via _lcapy_emit_positioned. Returns a hinted netlist, or None if node/elkjs is unavailable or the
+    layout fails (caller falls through to the networkx grid)."""
+    import json as _json
+    import subprocess
+    script = os.path.join(HERE, "elk_layout.js")
+    if not os.path.exists(script):
         return None
-
-    def branch_is_source(t):                                  # the throw whose branch to the port is a source
-        for r in recs:
-            if t in r["nodes"] and port in r["nodes"]:
-                return r["line"][:1] in "VI"
-        return False
-
-    throws.sort(key=lambda t: 0 if branch_is_source(t) else 1)   # source throw on top, short throw lower
-    vm = next((r for r in recs if r["line"].split()[0] == "Vmeas"), None)
-    nx_node = next((n for n in vm["nodes"] if n != port), None) if vm else None
-    pos = {wiper: (1, 1), throws[0]: (0, 3), throws[1]: (2, 1), port: (4, 3)}
-    if nx_node:
-        pos[nx_node] = (4, 1)
-    if any(n not in pos and n != gnd for n in allnodes):     # unexpected extra node -> bail to grid
+    nodes = sorted({n for r in recs for n in r["nodes"]})
+    edges = [r["nodes"] for r in recs]
+    payload = _json.dumps({"nodes": nodes, "edges": edges, "port": port, "gnd": gnd})
+    try:
+        out = subprocess.run(["node", script], input=payload, capture_output=True, text=True,
+                             cwd=HERE, timeout=20)
+    except Exception:
         return None
-    return _lcapy_emit_positioned(recs, pos, gnd)
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        raw = _json.loads(out.stdout)
+    except Exception:
+        return None
+    if len(raw) != len(nodes):
+        return None
+    xs = sorted(raw, key=lambda n: raw[n][0]); col = {n: i for i, n in enumerate(xs)}
+    ys = sorted(raw, key=lambda n: raw[n][1]); row = {n: len(ys) - 1 - i for i, n in enumerate(ys)}
+    return _lcapy_emit_positioned(recs, {n: (col[n], row[n]) for n in raw}, gnd)
 
 
 def _lcapy_hinted(recs, gnd="0"):
-    """2D circuitikz layout: the clean comb/ladder where the topology allows it (series/parallel), the
-    hand-tuned SPDT layout for the 2-way switch family, else a general layered grid embedding. None only
-    if none apply (e.g. networkx unavailable) -> caller falls back to the plain one-line netlist."""
-    return _lcapy_comb(recs, gnd) or _lcapy_spdt(recs, gnd) or _lcapy_grid(recs, gnd)
+    """2D circuitikz layout: the clean comb/ladder where the topology allows it (series/parallel), else
+    ELK orthogonal placement for meshes, else a networkx layered grid (if node/elkjs is unavailable).
+    None only if none apply -> caller falls back to the plain one-line netlist."""
+    return _lcapy_comb(recs, gnd) or _lcapy_elk(recs, gnd) or _lcapy_grid(recs, gnd)
 
 
 def export_lcapy(params):

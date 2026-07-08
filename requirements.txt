@@ -9,4 +9,8 @@
 numpy
 matplotlib
 lcapy
-networkx   # graph layout for the mesh (switch) lcapy grid embedding
+networkx   # fallback mesh layout if node/elkjs is unavailable (primary is ELK -- see below)
+
+# Schematic mesh layout (primary) uses ELK via elkjs, a Node package -- NOT pip:
+#   npm install          (reads package.json; elk_layout.js requires it)
+# Without node/elkjs the schematic falls back to the networkx grid above.

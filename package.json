@@ -1,0 +1,8 @@
+{
+  "name": "cosim-xyce-schematic",
+  "private": true,
+  "description": "elkjs powers elk_layout.js: orthogonal schematic placement fed to lcapy (sim_ui.py). Install with: npm install",
+  "dependencies": {
+    "elkjs": "^0.11.1"
+  }
+}

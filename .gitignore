@@ -30,3 +30,7 @@ __pycache__/
 
 # custom node-graph spec (user/run state; example seeded from DEFAULT_SPEC in sim_ui.py)
 circuit_spec.txt
+
+# node deps for the schematic layout (elkjs)
+node_modules/
+package-lock.json
