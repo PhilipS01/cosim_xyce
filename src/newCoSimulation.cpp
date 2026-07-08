@@ -619,8 +619,9 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
 }
 
 // Current-driven (Neumann) field solver. Reads the interface current I(t) (i_prev_k.pwl, circuit
-// output) and returns the field voltage V(t) = R_FEM*I + dlambda/dt in vf_prev_k.pwl for the circuit's
-// Bfield voltage source. reconstruct_mode:
+// output) and returns the field voltage V(t) = R_FEM*I + dlambda/dt in vf_prev_k.pwl -- this is the
+// V(vfprev) base of the circuit's matched-secant Bfield (the secant then Newton-linearises about the
+// previous current using the ROM impedance, and vanishes at convergence). reconstruct_mode:
 //   0 pointwise (default): V computed at every field-eval point from I(t) -- symmetric to the
 //      voltage-driven solver, needs only I0 (V_field_last_time unused); follows the current's curve.
 //   1 linear: replace the interior with a straight ramp from V_field_last_time (previous window end)
@@ -1136,29 +1137,25 @@ void WriteCircuitNetlist(const string& filename)
     }
 
     // Feste WR-Schnittstelle. Kopplungsrichtung per coupling_mode.
-    if (g_cfg.coupling_mode == 1) {
-        // Current-driven (Neumann): the field returns its voltage V_field (from the FEM, in
-        // vf_prev_k.pwl); the circuit's Bfield is a plain voltage source = V_field (no secant, no
-        // Lrom/t_floor amplifier). The circuit's I(Vmeas) is read by the driver and fed to the FEM.
-        out << "* === WR INTERFACE (current-driven): field voltage source, ammeter ===\n";
-        out << "* Bfield = V_field, the field's own constitutive voltage, computed by the FEM (dummy)\n";
-        out << "* solver from the interface current I(Vmeas) and returned in vf_prev_k.pwl:\n";
-        out << "*   V_field = R_FEM*I(Vmeas) + dlambda/dt,  lambda(I) = L_FEM*I (linear) or the\n";
-        out << "*   saturation flux L_FEM*I_sat*atan(I/I_sat).  (No circuit-side secant here -- that is\n";
-        out << "*   the voltage-driven Thevenin form; current-driven moves it into the FEM solver.)\n";
-        out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
-        out << "Vmeas p nx 0\n";
-        out << "Bfield nx 0 V = { V(vfprev) }\n\n";
-    } else {
-        // Voltage-driven (Dirichlet): THEVENIN matched-secant field ROM (default).
-        out << "* === WR INTERFACE (voltage-driven): prev waveforms, ammeter, matched-secant Bfield ===\n";
-        out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
-        out << "VIprev iprev  0 PWL FILE \"i_prev_k.pwl\"\n";
-        out << "Vmeas p nx 0\n";
-        out << "Bfield nx 0 V = {\n";
-        out << "+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))\n";
-        out << "+ }\n\n";
-    }
+    // Both coupling directions use the SAME matched-secant Bfield (Thevenin field ROM). The device
+    // lines are identical; only the meaning of the two PWL channels differs (set by the FEM solver +
+    // ReadXyceResults resample target):
+    //   voltage-driven: vf_prev = V(p) [ReadXyce], i_prev = I_field [FEM];   secant infers V(p).
+    //   current-driven: vf_prev = V_field [FEM],  i_prev = I(Vmeas) [ReadXyce]; secant is a Newton
+    //     linearisation of V_field about the previous current: V = V_field_prev + (dV_field/dI)*(I - I_prev),
+    //     with the ROM impedance Rrom + Lrom/dt as the Jacobian estimate (vanishes at convergence).
+    if (g_cfg.coupling_mode == 1)
+        out << "* === WR INTERFACE (current-driven): matched-secant Bfield "
+               "(vf_prev = V_field from FEM, i_prev = I(Vmeas)) ===\n";
+    else
+        out << "* === WR INTERFACE (voltage-driven): matched-secant Bfield "
+               "(vf_prev = V(p), i_prev = I_field from FEM) ===\n";
+    out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
+    out << "VIprev iprev  0 PWL FILE \"i_prev_k.pwl\"\n";
+    out << "Vmeas p nx 0\n";
+    out << "Bfield nx 0 V = {\n";
+    out << "+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))\n";
+    out << "+ }\n\n";
 
     out << ".INCLUDE restart.inc\n";
     out << ".print tran V(p) V(nx) I(Vmeas)\n";
