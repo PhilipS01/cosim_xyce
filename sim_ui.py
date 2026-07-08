@@ -39,7 +39,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PARAMS = [
     # The circuit side (source + passives + topology) is authored in the circuit-netlist text panel,
     # not here -- see the "Circuit netlist" box. Only field/coupling/timing/solver knobs live here.
-    ("frequency",                       "Reference freq f (Hz, timing)", 50.0,    "float", (1, 200, 1)),
     ("L_ROM",                           "L_ROM (H)",                    1.44e-7,  "float", None),
     ("R_ROM",                           "R_ROM (Ohm)",                  4.59e-4,  "float", None),
     ("L_FEM",                           "L_FEM (H, 'true' field)",      1.6e-7,   "float", None),
@@ -78,11 +77,11 @@ SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
 # side is a simplified spec: reserved nodes p=port, 0=gnd; one element/line (VSIN/ISIN/VPULSE/R/L/C and
 # SW name a b tclose topen [Ron Roff trise]).
 PRESETS = {
-    "P1: Sine V + RL": {"time_mode": 0, "coupling_mode": 0, "frequency": 50.0,
+    "P1: Sine V + RL": {"time_mode": 0, "coupling_mode": 0,
                         "circuit_spec": "VSIN Bemf s 0 1 50\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
     # Bare current source directly on the port: series R/L/C are meaningless for a current drive
     # (the current is forced regardless) and an ideal I-source in series with L is degenerate.
-    "P2: Sine I (bare)": {"time_mode": 0, "coupling_mode": 1, "frequency": 50.0,
+    "P2: Sine I (bare)": {"time_mode": 0, "coupling_mode": 1,
                           "circuit_spec": "ISIN Bemf 0 p 1 50\n"},
     # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters (WRmaxSteps=40)
     "P3: Step/ramp V + RL": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
@@ -100,7 +99,7 @@ PRESETS = {
         "circuit_spec": "VDC Vemf p a 1\nC Csw w 0 1e-6\n"
                         "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w p 6e-3 1e30 10 1e9 1e-5\n"},
     "P6: 2-way switch (AC vs R)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
-        "coupling_mode": 0, "WRmaxSteps": 40, "frequency": 50.0,
+        "coupling_mode": 0, "WRmaxSteps": 40,
         "circuit_spec": "VSIN Bemf p bac 1 50\nR Rload p br 1e4\n"
                         "SW ac bac 0 0 6e-3 1e-3 1e9 1e-5\nSW rd br 0 6e-3 1e30 1e-3 1e9 1e-5\n"},
 }
@@ -113,7 +112,6 @@ PRESETS = {
 # matches the current control values (OR-of-ANDs). Keys absent here are always visible. The custom
 # spec box + SVG editor are handled separately in JS (visible only when circuit_kind == 4).
 VISIBLE_WHEN = {
-    "frequency":                       [{"time_mode": [0]}],   # only drives the 'source periods' duration
     "N_periods":                       [{"time_mode": [0]}],
     "N_field_steps_per_source_period": [{"time_mode": [0]}],
     "t_end":            [{"time_mode": [1]}],
