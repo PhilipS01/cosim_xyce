@@ -513,20 +513,24 @@ def _circuitikz(recs, gnd="0", port="p"):
         pts = [T(q) for q in route]
         base, label = _ck_component(r)
         opt = base + (f", l={{{_ck_sanitize(label)}}}" if label else "")
-        if len(pts) == 2:
-            body.append(f"\\draw {ps(pts[0])} to[{opt}] {ps(pts[1])};")
-            continue
-        seg = [math.dist(pts[j], pts[j + 1]) for j in range(len(pts) - 1)]   # component on middle segment
-        half, acc, k = sum(seg) / 2, 0.0, 0
-        for j, l in enumerate(seg):
-            if acc + l >= half:
-                k = j; break
-            acc += l
-        if k > 0:
-            body.append("\\draw " + " -- ".join(ps(p) for p in pts[:k + 1]) + ";")
-        body.append(f"\\draw {ps(pts[k])} to[{opt}] {ps(pts[k + 1])};")
-        if k + 1 < len(pts) - 1:
-            body.append("\\draw " + " -- ".join(ps(p) for p in pts[k + 1:]) + ";")
+        # Place the component on its LONGEST straight segment (most room for the symbol + label),
+        # centred at a fixed drawn length with plain wires filling the rest of the route.
+        seg = [math.dist(pts[j], pts[j + 1]) for j in range(len(pts) - 1)]
+        k = max(range(len(seg)), key=lambda j: seg[j])
+        a, b = pts[k], pts[k + 1]
+        L = seg[k] or 1e-9
+        ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+        cl = min(L, 1.0)                                  # component drawn length (cm)
+        mx, my = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        c0 = (mx - ux * cl / 2, my - uy * cl / 2)
+        c1 = (mx + ux * cl / 2, my + uy * cl / 2)
+        pre = pts[:k + 1] + [c0]
+        post = [c1] + pts[k + 1:]
+        if len(pre) >= 2:
+            body.append("\\draw " + " -- ".join(ps(p) for p in pre) + ";")
+        body.append(f"\\draw {ps(c0)} to[{opt}] {ps(c1)};")
+        if len(post) >= 2:
+            body.append("\\draw " + " -- ".join(ps(p) for p in post) + ";")
     deg = collections.Counter(n for r in recs for n in r["nodes"])
     for n, xy in P.items():
         pt = ps(T(xy))
