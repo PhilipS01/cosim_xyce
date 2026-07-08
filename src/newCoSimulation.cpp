@@ -1141,6 +1141,11 @@ void WriteCircuitNetlist(const string& filename)
         // vf_prev_k.pwl); the circuit's Bfield is a plain voltage source = V_field (no secant, no
         // Lrom/t_floor amplifier). The circuit's I(Vmeas) is read by the driver and fed to the FEM.
         out << "* === WR INTERFACE (current-driven): field voltage source, ammeter ===\n";
+        out << "* Bfield = V_field, the field's own constitutive voltage, computed by the FEM (dummy)\n";
+        out << "* solver from the interface current I(Vmeas) and returned in vf_prev_k.pwl:\n";
+        out << "*   V_field = R_FEM*I(Vmeas) + dlambda/dt,  lambda(I) = L_FEM*I (linear) or the\n";
+        out << "*   saturation flux L_FEM*I_sat*atan(I/I_sat).  (No circuit-side secant here -- that is\n";
+        out << "*   the voltage-driven Thevenin form; current-driven moves it into the FEM solver.)\n";
         out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
         out << "Vmeas p nx 0\n";
         out << "Bfield nx 0 V = { V(vfprev) }\n\n";
