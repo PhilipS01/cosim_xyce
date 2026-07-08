@@ -92,14 +92,16 @@ PRESETS = {
     # Switch circuits (SW = time-gated resistor, closed during [tclose, topen)). NOTE C/Ron/times are
     # numerical-survival defaults (C small enough for WR to contract; the cap<->coil freewheel needs a
     # damped closed switch Ron~10 or its ~undamped LC ring dt-collapses) -- tune to your field.
+    # 2-way (SPDT) switch: wiper w throws between the source branch (node a) and a short branch (node b),
+    # both rejoining at the port p; cap w->0. Freewheel path is w-b-short-p (electrically w->p; tiny R).
     "P4: 2-way switch (sine U, C)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
         "coupling_mode": 0, "WRmaxSteps": 40,
-        "circuit_spec": "VSIN Bemf p a 1 50\nC Csw w 0 1e-6\n"
-                        "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w p 6e-3 1e30 10 1e9 1e-5\n"},
+        "circuit_spec": "VSIN Bemf a p 1 50\nC Csw w 0 1e-6\n"
+                        "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w b 6e-3 1e30 10 1e9 1e-5\nR shrt b p 1e-6\n"},
     "P5: 2-way switch (DC U, C)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
         "coupling_mode": 0, "WRmaxSteps": 40,
-        "circuit_spec": "VDC Vemf p a 1\nC Csw w 0 1e-6\n"
-                        "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w p 6e-3 1e30 10 1e9 1e-5\n"},
+        "circuit_spec": "VDC Vemf a p 1\nC Csw w 0 1e-6\n"
+                        "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w b 6e-3 1e30 10 1e9 1e-5\nR shrt b p 1e-6\n"},
     "P6: 2-way switch (AC vs R)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
         "coupling_mode": 0, "WRmaxSteps": 40,
         "circuit_spec": "VSIN Bemf p bac 1 50\nR Rload p br 1e4\n"
@@ -515,13 +517,51 @@ def _lcapy_comb(recs, gnd="0"):
     return "\n".join(out)
 
 
+def _lcapy_emit_positioned(recs, pos, gnd="0"):
+    """Emit circuitikz hints from an integer {node:(col,row)} placement. An axis-aligned edge is a direct
+    component; a diagonal edge is L-routed (component on one leg + a wire on the other via a helper node)
+    with the corner chosen to avoid landing on another node; a grounded element goes down to its OWN
+    ground copy + symbol (grounds decoupled, no shared-node routing). Every loop becomes a rectilinear
+    polygon lcapy can place."""
+    occupied = set(pos.values())
+    out, hk, gk = [], [0], [0]
+
+    def attr(rec, d, length):
+        s = f"{d}={max(int(round(length)), 1)}"
+        if rec.get("label"):
+            s += f", l={{{rec['label']}}}"
+        return s
+
+    for r in recs:
+        toks = r["line"].split(); dev = toks[0]; tail = toks[3:]
+        a, b = r["nodes"]
+        if a == gnd or b == gnd:                              # grounded -> own ground copy below
+            live = b if a == gnd else a
+            gk[0] += 1; gc = f"{gnd}g{gk[0]}"
+            out.append(" ".join([dev, live, gc] + tail) + "; " + attr(r, "down", 1))
+            out.append(f"W {gc} {gc}s; down=0.3, ground")
+            continue
+        ca, ra = pos[a]; cb, rb = pos[b]
+        if ra == rb and ca != cb:                             # horizontal
+            out.append(" ".join([dev, a, b] + tail) + "; " + attr(r, "right" if cb > ca else "left", abs(cb - ca)))
+        elif ca == cb and ra != rb:                           # vertical
+            out.append(" ".join([dev, a, b] + tail) + "; " + attr(r, "up" if rb > ra else "down", abs(rb - ra)))
+        else:                                                 # diagonal -> L-route, corner off other nodes
+            hk[0] += 1; h = f"_h{hk[0]}"
+            horiz_first = (cb, ra) not in occupied or (ca, rb) in occupied
+            if horiz_first:
+                out.append(" ".join([dev, a, h] + tail) + "; " + attr(r, "right" if cb > ca else "left", abs(cb - ca)))
+                out.append(f"W {h} {b}; {'up' if rb > ra else 'down'}={max(abs(rb - ra), 1)}")
+            else:
+                out.append(" ".join([dev, a, h] + tail) + "; " + attr(r, "up" if rb > ra else "down", abs(rb - ra)))
+                out.append(f"W {h} {b}; {'right' if cb > ca else 'left'}={max(abs(cb - ca), 1)}")
+    return "\n".join(out)
+
+
 def _lcapy_grid(recs, gnd="0", port="p"):
-    """General fallback layout for topologies the comb can't handle (meshes: switches). Place the nodes
-    on an integer grid with a LAYERED embedding (row = graph distance from the port so the port sits at
-    the top; column = barycentre ordering within a layer to reduce crossings), then emit each element in
-    circuitikz hints: an axis-aligned edge is a direct component; a diagonal edge is L-routed (component
-    on one leg + a wire on the other via a helper node) so every loop becomes a rectilinear polygon lcapy
-    can place. Uses networkx for the graph; returns a hinted netlist string, or None if unavailable."""
+    """General fallback layout for meshes the comb can't handle. Layered embedding (row = graph distance
+    from the port so the port sits on top; column = barycentre ordering to reduce crossings) via networkx,
+    then _lcapy_emit_positioned. Returns a hinted netlist string, or None if networkx is unavailable."""
     try:
         import networkx as nx
     except Exception:
@@ -536,7 +576,6 @@ def _lcapy_grid(recs, gnd="0", port="p"):
     layer = nx.single_source_shortest_path_length(G, root)
     maxd = max(layer.values()) if layer else 0
     layer = {n: layer.get(n, maxd) for n in G}
-    row = {n: maxd - layer[n] for n in G}                     # port (layer 0) at the top row
     by_layer = {}
     for n, l in layer.items():
         by_layer.setdefault(l, []).append(n)
@@ -546,40 +585,49 @@ def _lcapy_grid(recs, gnd="0", port="p"):
             col[n] = 2 * i
     for _ in range(6):                                        # barycentre sweeps to reduce crossings
         for l in by_layer:
-            bary = sorted(((np.mean([col[x] for x in G[n] if x != n] or [col[n]]), n)
-                           for n in by_layer[l]))
+            bary = sorted(((np.mean([col[x] for x in G[n] if x != n] or [col[n]]), n) for n in by_layer[l]))
             for i, (_, n) in enumerate(bary):
                 col[n] = 2 * i
+    pos = {n: (col[n], maxd - layer[n]) for n in G}           # port (layer 0) at the top row
+    return _lcapy_emit_positioned(recs, pos, gnd)
 
-    def attr(rec, d, length):
-        s = f"{d}={max(int(length), 1)}"
-        if rec.get("label"):
-            s += f", l={{{rec['label']}}}"
-        return s
 
-    out, hk = [], [0]
-    for r in recs:
-        toks = r["line"].split(); dev = toks[0]; tail = toks[3:]
-        a, b = r["nodes"]; ca, ra = col[a], row[a]; cb, rb = col[b], row[b]
-        if ra == rb and ca != cb:                             # horizontal
-            out.append(" ".join([dev, a, b] + tail) + "; " + attr(r, "right" if cb > ca else "left", abs(cb - ca)))
-        elif ca == cb and ra != rb:                           # vertical
-            out.append(" ".join([dev, a, b] + tail) + "; " + attr(r, "up" if rb > ra else "down", abs(rb - ra)))
-        else:                                                 # diagonal / collision -> L-route
-            hk[0] += 1; h = f"_h{hk[0]}"
-            dcol = (cb - ca) or 1                             # force a nonzero horizontal leg
-            out.append(" ".join([dev, a, h] + tail) + "; " + attr(r, "right" if dcol > 0 else "left", abs(dcol)))
-            out.append(f"W {h} {b}; {'up' if rb > ra else 'down'}={max(abs(rb - ra), 1)}")
-    if gnd in G:
-        out.append(f"W {gnd} {gnd}g; down=0.3, ground")
-    return "\n".join(out)
+def _lcapy_spdt(recs, gnd="0", port="p"):
+    """Hand-tuned layout for the 2-way (SPDT) switch family (P4/P5): a wiper node (>= 2 switches) with its
+    common branch (the cap) going DOWN to ground, the two throws UP to their branches (source + short),
+    both rejoining at the port, and the interface (ammeter + field ROM) as a column on the RIGHT. Returns
+    a hinted netlist, or None if the circuit isn't this family (caller falls through to the generic grid)."""
+    import collections
+    sw = [r for r in recs if r["line"].split()[0].startswith("SW")]
+    cnt = collections.Counter(n for r in sw for n in r["nodes"])
+    wiper = next((n for n, c in cnt.items() if c >= 2 and n != gnd), None)
+    throws = list(dict.fromkeys(n for r in sw for n in r["nodes"] if n != wiper))
+    allnodes = {n for r in recs for n in r["nodes"]}
+    if wiper is None or len(throws) != 2 or port not in allnodes:
+        return None
+
+    def branch_is_source(t):                                  # the throw whose branch to the port is a source
+        for r in recs:
+            if t in r["nodes"] and port in r["nodes"]:
+                return r["line"][:1] in "VI"
+        return False
+
+    throws.sort(key=lambda t: 0 if branch_is_source(t) else 1)   # source throw on top, short throw lower
+    vm = next((r for r in recs if r["line"].split()[0] == "Vmeas"), None)
+    nx_node = next((n for n in vm["nodes"] if n != port), None) if vm else None
+    pos = {wiper: (1, 1), throws[0]: (0, 3), throws[1]: (2, 1), port: (4, 3)}
+    if nx_node:
+        pos[nx_node] = (4, 1)
+    if any(n not in pos and n != gnd for n in allnodes):     # unexpected extra node -> bail to grid
+        return None
+    return _lcapy_emit_positioned(recs, pos, gnd)
 
 
 def _lcapy_hinted(recs, gnd="0"):
-    """2D circuitikz layout for the circuit: the clean comb/ladder where the topology allows it
-    (series/parallel), else a general layered grid embedding (meshes: switches). None only if neither
-    can place it (e.g. networkx unavailable) -> caller falls back to the plain one-line netlist."""
-    return _lcapy_comb(recs, gnd) or _lcapy_grid(recs, gnd)
+    """2D circuitikz layout: the clean comb/ladder where the topology allows it (series/parallel), the
+    hand-tuned SPDT layout for the 2-way switch family, else a general layered grid embedding. None only
+    if none apply (e.g. networkx unavailable) -> caller falls back to the plain one-line netlist."""
+    return _lcapy_comb(recs, gnd) or _lcapy_spdt(recs, gnd) or _lcapy_grid(recs, gnd)
 
 
 def export_lcapy(params):
