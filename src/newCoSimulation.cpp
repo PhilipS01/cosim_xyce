@@ -561,36 +561,54 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     //   → I_f = (V_p + L_FEM*I0/t_acc) / (R_FEM + L_FEM/t_acc)  für t_acc > 0
     //   → I_f = I_win_start                                     für t_acc = 0
     const double t_win_start = V_eval.t.front();
+    const double t_win_end   = V_eval.t.back();
 
-    Waveform current;
-    for (size_t j = 0; j < N; ++j) {
-        double I_j;
-        if (j == 0) {
-            // Singulärer Punkt t=0: Anfangsbedingung.
-            I_j = I_win_start;
-        } else {
-            // Akkumulierte Sekante: V_p = R*I_f + L*(I_f - I0)/t_acc
-            const double t_acc = V_eval.t[j] - t_win_start;
-            // Linear closed-form solution; also the Newton seed for the nonlinear case.
-            I_j = (V_eval.y[j] + L_FEM * I_win_start / t_acc)
-                / (R_FEM + L_FEM / t_acc);
-
-            if (saturating) {
-                // Implicit residual with the accumulated flux secant (same window-start
-                // reference as the linear case, so consistent with the Xyce Biface grid):
-                //   g(I) = R_FEM*I + (lambda(I) - lambda(I_win_start))/t_acc - V_p = 0
-                //   g'(I) = R_FEM + L(I)/t_acc
-                const double lam0 = flux(I_win_start);
-                for (int it = 0; it < 50; ++it) {
-                    const double g  = R_FEM * I_j + (flux(I_j) - lam0) / t_acc - V_eval.y[j];
-                    const double gp = R_FEM + L_dyn(I_j) / t_acc;
-                    const double dI = g / gp;
-                    I_j -= dI;
-                    if (std::fabs(dI) <= 1e-12 + 1e-10 * std::fabs(I_j)) break;
-                }
+    // Solve the constitutive relation V_p = R_FEM*I + (lambda(I) - lambda(I_ref))/dt for the field
+    // current I (linear closed form, then Newton if the core saturates). I_ref/dt select the flux
+    // secant: window-accumulated (I_ref = I_win_start, dt = t - t_win_start) exactly reproduces the
+    // Xyce Bfield model -> consistent WR fixpoint; local (I_ref = I_{j-1}, dt = t_j - t_{j-1}) is a
+    // BDF1 dummy-solver variant.
+    auto solve_I = [&](double V_p, double I_ref, double dt) -> double {
+        if (dt <= 0.0) return I_ref;                       // singular window start: initial condition
+        double I = (V_p + L_FEM * I_ref / dt) / (R_FEM + L_FEM / dt);
+        if (saturating) {
+            const double lam0 = flux(I_ref);
+            for (int it = 0; it < 50; ++it) {
+                const double g  = R_FEM * I + (flux(I) - lam0) / dt - V_p;
+                const double gp = R_FEM + L_dyn(I) / dt;
+                const double dI = g / gp;
+                I -= dI;
+                if (std::fabs(dI) <= 1e-12 + 1e-10 * std::fabs(I)) break;
             }
         }
-        current.push(V_eval.t[j], I_j);
+        return I;
+    };
+
+    // Field-current reconstruction within the window (reconstruct_mode; symmetric to the current-driven
+    // field-voltage reconstruction). Every mode CARRIES the window start = I_win_start (previous window's
+    // end current) -> C0-continuous seam, no solve there.
+    //   0 pointwise (secant, DEFAULT): I at each point via the accumulated window secant (matches Bfield).
+    //   1 linear : straight ramp from the carried start to the window-end current (ONE solve/window).
+    //   2 average: like 1 but start = 0.5*(carried + end).
+    //   3 pointwise (local BDF1): each point references the previous one (a dummy-solver variant).
+    Waveform current;
+    const unsigned mode = g_cfg.reconstruct_mode;
+    if (mode == 1 || mode == 2) {
+        const double I_end   = solve_I(V_eval.y[N - 1], I_win_start, t_win_end - t_win_start);
+        const double I_start = (mode == 2) ? 0.5 * (I_win_start + I_end) : I_win_start;
+        for (size_t j = 0; j < N; ++j) {
+            const double frac = (t_win_end > t_win_start)
+                              ? (V_eval.t[j] - t_win_start) / (t_win_end - t_win_start) : 0.0;
+            current.push(V_eval.t[j], I_start + frac * (I_end - I_start));
+        }
+    } else {
+        const bool local = (mode == 3);
+        current.push(t_win_start, I_win_start);            // window start = carried initial condition
+        for (size_t j = 1; j < N; ++j) {
+            const double I_ref = local ? current.y[j - 1] : I_win_start;
+            const double dt    = local ? (V_eval.t[j] - V_eval.t[j - 1]) : (V_eval.t[j] - t_win_start);
+            current.push(V_eval.t[j], solve_I(V_eval.y[j], I_ref, dt));
+        }
     }
 
     // This file is used by Xyce as V(iprev) in the next WR iteration.

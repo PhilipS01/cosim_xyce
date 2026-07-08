@@ -117,7 +117,6 @@ VISIBLE_WHEN = {
     "t_end":            [{"time_mode": [1]}],
     "N_field_windows":  [{"time_mode": [1]}],
     "I_sat": [{"nonlin_model": [1]}],
-    "reconstruct_mode": [{"coupling_mode": [1]}],
 }
 
 
@@ -147,21 +146,24 @@ HELP = {
         "<code>.tex</code>.</div>"
     ),
     "reconstruct_mode": (
-        "<div class='hh'>Field reconstruction (current-driven)</div>"
+        "<div class='hh'>Field reconstruction</div>"
+        "<div class='hn'>How the dummy field reconstructs its output waveform within a window &mdash; the "
+        "field <b>current</b> (voltage-driven) or the field <b>voltage</b> (current-driven).</div>"
         "<table>"
         "<tr><th>mode</th><th>reconstruction</th><th>solves/win</th><th>note</th></tr>"
-        "<tr><td>pointwise (secant)</td><td>V at each field point, accumulated secant</td>"
-        "<td>N_field_eval</td><td>curve-following; interior uses the dummy's finite difference</td></tr>"
+        "<tr><td>pointwise (secant)</td><td>value at each point, accumulated window secant</td>"
+        "<td>N_field_eval</td><td>curve-following; matches the Xyce Bfield secant exactly</td></tr>"
         "<tr><td>linear ramp</td><td>straight line carried-start &rarr; window-end</td>"
         "<td><b>1</b></td><td>cheapest; pure coupling reconstruction</td></tr>"
         "<tr><td>average</td><td>line, start = &frac12;(carried + end)</td>"
         "<td><b>1</b></td><td>linear + window-start damping (colleague)</td></tr>"
-        "<tr><td>pointwise (central)</td><td>V at each point, central difference</td>"
+        "<tr><td>pointwise (central)</td><td>local finite diff: central (current-driven V) / "
+        "BDF1 (voltage-driven I)</td>"
         "<td>N_field_eval</td><td>lowest raw RMS, but the derivative is a dummy artifact</td></tr>"
         "</table>"
-        "<div class='hn'>All modes carry the seam (C0-continuous). Accuracy is within ~1&ndash;2% "
-        "across modes; the extra solves buy little. Recommend <b>linear</b> / <b>average</b> "
-        "(1 field solve per window).</div>"
+        "<div class='hn'>Both coupling directions. All modes carry the seam (C0-continuous). Accuracy is "
+        "within ~1&ndash;2% across modes; the extra solves buy little. Recommend <b>linear</b> / "
+        "<b>average</b> (1 field solve per window).</div>"
     ),
     "coupling_mode": (
         "<div class='hh'>Coupling direction</div>"
