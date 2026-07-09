@@ -516,10 +516,11 @@ _MANUAL_LAYOUTS = {
     frozenset({"a", "b", "w", "p", "nx", "0"}): {
         "nets": {"w": (40, 120), "a": (160, 40), "b": (160, 200), "p": (300, 120),
                  "nx": (420, 120), "0": (330, 240)},
-        "routes": {frozenset({"w", "0"}): [(40, 120), (40, 240), (330, 240)],
+        # The cap (outer branch) taps the wiper on a short stub (x 40->10) then drops at x=10, so its
+        # drop doesn't run on top of fw's drop; drv (up) + fw (down) stay colinear on the x=40 wiper line.
+        "routes": {frozenset({"w", "0"}): [(40, 120), (10, 120), (10, 240), (330, 240)],
                    frozenset({"w", "a"}): [(40, 120), (40, 40), (160, 40)],
-                   # fw exits w on a short stub (x 40->70) so its drop doesn't overlap the cap's drop.
-                   frozenset({"w", "b"}): [(40, 120), (70, 120), (70, 200), (160, 200)],
+                   frozenset({"w", "b"}): [(40, 120), (40, 200), (160, 200)],
                    frozenset({"a", "p"}): [(160, 40), (300, 40), (300, 120)],
                    frozenset({"b", "p"}): [(160, 200), (300, 200), (300, 120)],
                    frozenset({"nx", "0"}): [(420, 120), (420, 240), (330, 240)]},
