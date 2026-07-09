@@ -518,20 +518,23 @@ _MANUAL_LAYOUTS = {
                  "nx": (420, 120), "0": (330, 240)},
         "routes": {frozenset({"w", "0"}): [(40, 120), (40, 240), (330, 240)],
                    frozenset({"w", "a"}): [(40, 120), (40, 40), (160, 40)],
-                   frozenset({"w", "b"}): [(40, 120), (40, 200), (160, 200)],
+                   # fw exits w on a short stub (x 40->70) so its drop doesn't overlap the cap's drop.
+                   frozenset({"w", "b"}): [(40, 120), (70, 120), (70, 200), (160, 200)],
                    frozenset({"a", "p"}): [(160, 40), (300, 40), (300, 120)],
                    frozenset({"b", "p"}): [(160, 200), (300, 200), (300, 120)],
                    frozenset({"nx", "0"}): [(420, 120), (420, 240), (330, 240)]},
         "size": (420, 240)},
     # P6: two parallel branches from port p to gnd -- (V + switch) and (R + switch) -- plus the
     # interface (ammeter + field ROM) as the third column. Top rail = p, bottom rail = gnd.
+    # Verticals are 140 (> the 120 top-rail reach) so each column's device (V / R / ammeter) lands on
+    # its vertical segment at the same height, not up on the top rail.
     frozenset({"p", "bac", "br", "nx", "0"}): {
-        "nets": {"p": (160, 0), "bac": (40, 120), "br": (160, 120), "nx": (280, 120), "0": (160, 240)},
-        "routes": {frozenset({"p", "bac"}): [(160, 0), (40, 0), (40, 120)],
-                   frozenset({"bac", "0"}): [(40, 120), (40, 240), (160, 240)],
-                   frozenset({"p", "nx"}): [(160, 0), (280, 0), (280, 120)],
-                   frozenset({"nx", "0"}): [(280, 120), (280, 240), (160, 240)]},
-        "size": (280, 240)},
+        "nets": {"p": (160, 0), "bac": (40, 140), "br": (160, 140), "nx": (280, 140), "0": (160, 260)},
+        "routes": {frozenset({"p", "bac"}): [(160, 0), (40, 0), (40, 140)],
+                   frozenset({"bac", "0"}): [(40, 140), (40, 260), (160, 260)],
+                   frozenset({"p", "nx"}): [(160, 0), (280, 0), (280, 140)],
+                   frozenset({"nx", "0"}): [(280, 140), (280, 260), (160, 260)]},
+        "size": (280, 260)},
 }
 
 
