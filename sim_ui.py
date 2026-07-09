@@ -491,12 +491,79 @@ def _elk_layout(recs, gnd="0", port="p"):
     return d if d.get("nets") else None
 
 
+# Hand-placed layouts for the built-in presets. ELK is a fine general fallback, but for the fixed
+# preset topologies a tuned by-hand placement reads far cleaner (source left / field ROM right,
+# orthogonal columns). Keyed by the preset's exact set of physical net names (which is stable per
+# preset and shared by P1/P3 and P4/P5 -- same topology, different source), so an edited/custom
+# circuit whose nets differ simply misses and falls back to ELK. Coordinates are in ELK's pixel
+# convention (y DOWN, ~40 px = 1 cm); `routes` are per-element orthogonal polylines keyed by the
+# element's unordered node pair (the component symbol lands on the polyline's longest segment).
+_MANUAL_LAYOUTS = {
+    # P1 / P3: source(left) - R - L - port; interface (ammeter over field ROM) on the right.
+    frozenset({"s", "cm0", "p", "nx", "0"}): {
+        "nets": {"s": (0, 0), "cm0": (120, 0), "p": (240, 0), "nx": (240, 120), "0": (120, 240)},
+        "routes": {frozenset({"s", "0"}): [(0, 0), (0, 240), (120, 240)],
+                   frozenset({"nx", "0"}): [(240, 120), (240, 240), (120, 240)]},
+        "size": (240, 240)},
+    # P2: bare current source(left) - port; interface on the right.
+    frozenset({"p", "nx", "0"}): {
+        "nets": {"p": (0, 0), "nx": (120, 0), "0": (60, 120)},
+        "routes": {frozenset({"0", "p"}): [(0, 0), (0, 120), (60, 120)],
+                   frozenset({"nx", "0"}): [(120, 0), (120, 120), (60, 120)]},
+        "size": (120, 120)},
+    # P4 / P5: SPDT wiper w (cap w->gnd) throws to source branch (a) / short branch (b), rejoining at
+    # port p; interface (ammeter -> field ROM) on the far right. Switch + branches left, field right.
+    frozenset({"a", "b", "w", "p", "nx", "0"}): {
+        "nets": {"w": (40, 120), "a": (160, 40), "b": (160, 200), "p": (300, 120),
+                 "nx": (420, 120), "0": (330, 240)},
+        "routes": {frozenset({"w", "0"}): [(40, 120), (40, 240), (330, 240)],
+                   frozenset({"w", "a"}): [(40, 120), (40, 40), (160, 40)],
+                   frozenset({"w", "b"}): [(40, 120), (40, 200), (160, 200)],
+                   frozenset({"a", "p"}): [(160, 40), (300, 40), (300, 120)],
+                   frozenset({"b", "p"}): [(160, 200), (300, 200), (300, 120)],
+                   frozenset({"nx", "0"}): [(420, 120), (420, 240), (330, 240)]},
+        "size": (420, 240)},
+    # P6: two parallel branches from port p to gnd -- (V + switch) and (R + switch) -- plus the
+    # interface (ammeter + field ROM) as the third column. Top rail = p, bottom rail = gnd.
+    frozenset({"p", "bac", "br", "nx", "0"}): {
+        "nets": {"p": (160, 0), "bac": (40, 120), "br": (160, 120), "nx": (280, 120), "0": (160, 240)},
+        "routes": {frozenset({"p", "bac"}): [(160, 0), (40, 0), (40, 120)],
+                   frozenset({"bac", "0"}): [(40, 120), (40, 240), (160, 240)],
+                   frozenset({"p", "nx"}): [(160, 0), (280, 0), (280, 120)],
+                   frozenset({"nx", "0"}): [(280, 120), (280, 240), (160, 240)]},
+        "size": (280, 240)},
+}
+
+
+def _manual_layout(recs):
+    """Hand-placed layout for a known preset topology, matched by its physical net-name set; returns
+    the same {nets, routes, size} shape as `_elk_layout`, or None (unknown/edited circuit -> ELK)."""
+    present = frozenset(n for r in recs for n in r["nodes"])
+    spec = _MANUAL_LAYOUTS.get(present)
+    if spec is None:
+        return None
+    P = spec["nets"]
+    if any(n not in P for r in recs for n in r["nodes"]):
+        return None
+    routes = {}
+    for i, r in enumerate(recs):
+        a, b = r["nodes"]
+        poly = spec["routes"].get(frozenset((a, b)))
+        if poly is None:
+            poly = [P[a], P[b]]                            # axis-aligned pair -> straight wire
+        elif list(poly[0]) != list(P[a]):
+            poly = poly[::-1]                              # orient a->b (keeps source polarity sane)
+        routes[f"c{i}"] = [list(pt) for pt in poly]
+    return {"nets": {k: list(v) for k, v in P.items()}, "routes": routes, "size": list(spec["size"])}
+
+
 def _circuitikz(recs, gnd="0", port="p"):
-    """Emit a circuitikz picture from the ELK layout: each element's symbol on its routed wire, plus
-    junction dots (nets with >=3 connections) and a ground symbol. Returns the tikz string, or None."""
+    """Emit a circuitikz picture from the layout (hand-placed for a known preset, else ELK): each
+    element's symbol on its routed wire, plus junction dots (nets with >=3 connections) and a ground
+    symbol. Returns the tikz string, or None."""
     import collections
     import math
-    lay = _elk_layout(recs, gnd, port)
+    lay = _manual_layout(recs) or _elk_layout(recs, gnd, port)
     if lay is None:
         return None
     P, R, H, scale = lay["nets"], lay["routes"], lay["size"][1], 1.0 / 40.0
