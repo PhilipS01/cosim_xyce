@@ -29,6 +29,8 @@ process.stdin.on('end', async () => {
       'elk.layered.spacing.edgeNodeBetweenLayers': '30',
       'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
     },
+    // Net nodes are ~point-sized so every wire on a net converges to the SAME coordinate -> clean
+    // orthogonal junctions (a 12x12 box would let routes hit different border points -> diagonal stubs).
     children: g.nets.map(id => ({ id, width: 1, height: 1, layoutOptions: nodeOpts(id) })),
     edges: g.components.map(c => ({ id: c.id, sources: [c.a], targets: [c.b] })),
   };
