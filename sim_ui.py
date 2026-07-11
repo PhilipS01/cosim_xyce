@@ -17,6 +17,7 @@ parses the .prn outputs, and renders plots as PNGs.
 
 import argparse
 import base64
+import csv
 import io
 import json
 import os
@@ -48,7 +49,7 @@ PARAMS = [
     ("I_sat",                           "I_sat saturation current (A)", 100.0,    "float", None),
     ("time_mode",                       "Run duration",                 0,        "choice",
         {0: "source periods", 1: "absolute end time"}),
-    ("t_end",                           "End time t_end (s)",           2.0e-2,   "float", None),
+    ("t_end",                           "Sim duration (s)",             2.0e-2,   "float", None),
     ("N_field_windows",                 "Field windows (total)",        50,       "int",   (1, 400, 1)),
     ("N_periods",                       "Number of source periods",     1,        "int",   (1, 10, 1)),
     ("N_field_steps_per_source_period", "Field steps / source period",  50,       "int",   (2, 200, 1)),
@@ -57,7 +58,7 @@ PARAMS = [
     ("WRmaxSteps",                      "WR max iterations",            20,       "int",   (1, 100, 1)),
     ("WR_tolerance",                    "WR tolerance",                 1.0e-3,   "float", None),
     ("wr_convergence_method",           "WR convergence metric",        1,        "choice",
-        {0: "waveform L1 (this code)", 1: "terminal scalar (reference)"}),
+        {0: "waveform L1", 1: "terminal scalar"}),
     ("coupling_mode",                   "Coupling direction",           0,        "choice",
         {0: "voltage-driven", 1: "current-driven"}),
     ("reconstruct_mode",                "Field reconstruction",         0,        "choice",
@@ -69,6 +70,8 @@ PARAMS = [
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
 KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}
 LABELS = {k: l for (k, l, _d, _kind, _s) in PARAMS}
+# choice params: {key: {code: human-readable label}}, used to export labels not raw codes
+CHOICES = {k: s for (k, _l, _d, kind, s) in PARAMS if kind == "choice"}
 # Numeric params are sweepable (a "choice" metric switch is not a continuum).
 SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
 
@@ -115,12 +118,12 @@ PRESETS = {
 # Conditional visibility: key -> list of AND-condition dicts; a control is shown iff ANY dict fully
 # matches the current control values (OR-of-ANDs). Keys absent here are always visible. The custom
 # spec box + SVG editor are handled separately in JS (visible only when circuit_kind == 4).
+# The properties grid forces absolute-end-time mode (time_mode=1, injected in collect()); "Sim duration"
+# = t_end. So the old time_mode-conditional rules are gone. What remains: N_field_eval_intervals only
+# matters for the pointwise reconstruction modes (0=secant, 3=central diff) -- linear/average force 1
+# solve/window and ignore it -- so it's shown only then.
 VISIBLE_WHEN = {
-    "N_periods":                       [{"time_mode": [0]}],
-    "N_field_steps_per_source_period": [{"time_mode": [0]}],
-    "t_end":            [{"time_mode": [1]}],
-    "N_field_windows":  [{"time_mode": [1]}],
-    "I_sat": [{"nonlin_model": [1]}],
+    "N_field_eval_intervals": [{"reconstruct_mode": [0, 3]}],
 }
 
 
@@ -128,17 +131,34 @@ VISIBLE_WHEN = {
 HELP = {
     "circuit_spec_edit": (
         "<div class='hh'>Circuit side (text)</div>"
-        "<div class='hn'>The circuit is authored here, not in the side panel. Presets seed it; edit and "
-        "<b>Apply &amp; render</b>. Nodes: <code>p</code>=port (field attaches here), <code>0</code>=ground; "
-        "reserved. One element per line:<br>"
-        "<code>R/L/C name a b value</code><br>"
-        "<code>VSIN/ISIN name a b amp freq</code> &middot; <code>VDC/IDC name a b value</code><br>"
-        "<code>VPULSE/IPULSE name a b v1 v2 td tr</code> &middot; <code>VPWL/IPWL name a b t1 v1 t2 v2 …</code><br>"
-        "<code>SW name a b tclose topen [Ron Roff trise]</code> &mdash; time-gated switch, closed during "
-        "[tclose, topen) (use a big topen e.g. <code>1e30</code> to stay closed to the end; Ron=10, "
-        "Roff=1e9, trise=1e-5 default).<br>The WR interface (<code>Vmeas</code> ammeter + <code>Bfield</code> "
-        "field ROM) and the <code>.INCLUDE</code>/<code>.print</code>/<code>.end</code> directives are "
-        "generated and shown locked around the editable box.</div>"
+        "<div class='hn'>The WR interface (<code>Vmeas</code> ammeter + <code>Bfield</code> field ROM) and "
+        "the <code>.INCLUDE</code>/<code>.print</code>/<code>.end</code> directives are generated and shown "
+        "locked around the editable box.</div>"
+        "<div class='hn'><b>Reserved nodes:</b> <code>p</code> = port (field attaches here) &middot; "
+        "<code>0</code> = ground.</div>"
+        "<table>"
+        "<tr><th>syntax (one element per line)</th><th>element</th><th>parameters</th></tr>"
+        "<tr><td><code>R/L/C name a b value</code></td><td>resistor / inductor / capacitor</td>"
+        "<td><code>name</code> label &middot; <code>a b</code> nodes &middot; <code>value</code> "
+        "&Omega; (R) / H (L) / F (C)</td></tr>"
+        "<tr><td><code>VSIN/ISIN name a b amp freq</code></td><td>sine source</td>"
+        "<td><code>a b</code> nodes (+&nbsp;&rarr;&nbsp;&minus;) &middot; <code>amp</code> amplitude (V/A) "
+        "&middot; <code>freq</code> frequency (Hz); waveform amp&middot;sin(2&pi;&middot;freq&middot;t)</td></tr>"
+        "<tr><td><code>VDC/IDC name a b value</code></td><td>DC source</td>"
+        "<td><code>a b</code> nodes &middot; <code>value</code> constant level (V/A)</td></tr>"
+        "<tr><td><code>VPULSE/IPULSE name a b v1 v2 td tr</code></td><td>pulse source</td>"
+        "<td><code>a b</code> nodes &middot; <code>v1</code> initial level &middot; <code>v2</code> pulsed "
+        "level &middot; <code>td</code> delay (s) &middot; <code>tr</code> rise time (s)</td></tr>"
+        "<tr><td><code>VPWL/IPWL name a b t1 v1 t2 v2 …</code></td><td>piecewise-linear source</td>"
+        "<td><code>a b</code> nodes &middot; <code>t1 v1 t2 v2 …</code> (time&nbsp;s, level&nbsp;V/A) "
+        "breakpoints, linearly interpolated between</td></tr>"
+        "<tr><td><code>SW name a b tclose topen [Ron Roff trise]</code></td>"
+        "<td>time-gated switch</td>"
+        "<td><code>a b</code> nodes &middot; <code>tclose</code> close time (s) &middot; <code>topen</code> "
+        "open time (s) &mdash; big topen (e.g. <code>1e30</code>) stays closed to the end &middot; "
+        "<code>Ron</code> closed R (=10) &middot; <code>Roff</code> open R (=1e9) &middot; "
+        "<code>trise</code> transition (=1e-5)</td></tr>"
+        "</table>"
     ),
     "lcapy_export": (
         "<div class='hh'>LaTeX / PDF export</div>"
@@ -166,6 +186,10 @@ HELP = {
         "BDF1 (voltage-driven I)</td>"
         "<td>N_field_eval</td><td>lowest raw RMS, but the derivative is a dummy artifact</td></tr>"
         "</table>"
+        "<div class='hn'><b>pointwise (secant)</b> with <code>FEM eval intervals / window = 1</code> "
+        "collapses to <b>linear ramp</b>: one interval leaves only the carried start and the window end, "
+        "so the accumulated secant is a single straight segment. Raise the eval intervals for it to actually "
+        "follow the curve.</div>"
         "<div class='hn'>Both coupling directions. All modes carry the seam (C0-continuous). Accuracy is "
         "within ~1&ndash;2% across modes; the extra solves buy little. Recommend <b>linear</b> / "
         "<b>average</b> (1 field solve per window).</div>"
@@ -190,6 +214,28 @@ HELP = {
         "matched-secant Bfield.<br>current-driven (Neumann): circuit sets I(Vmeas), field returns "
         "V_field; plain voltage source &mdash; removes the high-frequency window-start V(p) spike on "
         "current-source circuits.</div>"
+    ),
+    "wr_convergence_method": (
+        "<div class='hh'>WR convergence metric</div>"
+        "<div class='hn'>What must drop below <code>WR_tolerance</code> to accept a window and stop "
+        "iterating. <code>i</code> is the field-current waveform, k the WR iteration.</div>"
+        "<div class='hn'><b>waveform L1</b> &mdash; relative L1 norm of the iteration-to-iteration change "
+        "of the whole field-current waveform over the window (trapezoidal):"
+        "<div class='hf'>&epsilon; = "
+        "&int;|i<sup>(k)</sup>&minus;i<sup>(k&minus;1)</sup>|&nbsp;dt &nbsp;/&nbsp; "
+        "&int;|i<sup>(k)</sup>|&nbsp;dt</div>"
+        "Needs &ge;2 iterations (iteration&nbsp;1 returns sentinel 1.0). Whole-waveform, so it also catches "
+        "interior mismatch, not only the endpoints.</div>"
+        "<div class='hn'><b>terminal scalar</b> (reference port) &mdash; sum of four window-<i>end</i> "
+        "terminal residuals: transmission mismatch (field vs circuit) + iteration change of V and I:"
+        "<div class='hf'>&epsilon; = "
+        "&Delta;<sub>rel</sub>(I<sub>field</sub>,I<sub>circ</sub>) + "
+        "&Delta;<sub>rel</sub>(V<sub>field</sub>,V<sub>circ</sub>) + "
+        "&Delta;<sub>rel</sub>(I<sub>field</sub><sup>(k)</sup>,I<sub>field</sub><sup>(k&minus;1)</sup>) + "
+        "&Delta;<sub>rel</sub>(V<sub>field</sub><sup>(k)</sup>,V<sub>field</sub><sup>(k&minus;1)</sup>)</div>"
+        "Each &Delta;<sub>rel</sub>(a,b)=|a&minus;b| made relative (&divide;|a|) when |a|&gt;0.1, else "
+        "absolute. Converges from iteration&nbsp;1. Only the terminal scalars &mdash; cheaper, ignores the "
+        "waveform interior.</div>"
     ),
     "circuit_kind": (
         "<div class='hh'>Circuit topology</div>"
@@ -452,10 +498,19 @@ def _ck_component(rec):
         return "sV", "field ROM"
     if dev.startswith("SW"):
         return "nos", dev[2:]                             # normally-open switch (label = switch name)
+    line = rec["line"]
+    toks = line.split()
+    is_sin = "sin(" in line                                # AC (sinusoidal) vs DC source
     if not label:
-        toks = rec["line"].split()
-        label = toks[3] if len(toks) > 3 else ""
-    return {"V": "sV", "I": "sI", "R": "R", "L": "L", "C": "C"}.get(dev[0].upper(), "generic"), label
+        if "dc" in toks:                                  # DC source -> label its value, not "dc"
+            i = toks.index("dc")
+            label = toks[i + 1] if i + 1 < len(toks) else ""
+        else:
+            label = toks[3] if len(toks) > 3 else ""
+    # DC sources get the plain source symbol (V/I); sinusoidal sources the AC symbol (sV/sI).
+    sym = {"V": "sV" if is_sin else "V", "I": "sI" if is_sin else "I",
+           "R": "R", "L": "L", "C": "C"}.get(dev[0].upper(), "generic")
+    return sym, label
 
 
 def _ck_sanitize(s):
@@ -632,8 +687,9 @@ def _compile_circuitikz(tikz):
         return tex, None, None
     pdf = open(pdfp, "rb").read()
     png, pngp = None, os.path.join(d, "c.png")
-    for cmd in (["sips", "-s", "format", "png", pdfp, "--out", pngp],
-                ["pdftoppm", "-png", "-r", "150", "-singlefile", pdfp, os.path.join(d, "c")]):
+    # High-res raster: pdftoppm at 300 dpi first (crisp); sips fallback upscales to ~2400px wide.
+    for cmd in (["pdftoppm", "-png", "-r", "300", "-singlefile", pdfp, os.path.join(d, "c")],
+                ["sips", "-s", "format", "png", "--resampleWidth", "2400", pdfp, "--out", pngp]):
         try:
             subprocess.run(cmd, cwd=d, capture_output=True, timeout=30)
             if os.path.exists(pngp):
@@ -839,6 +895,90 @@ def scalar_summary(data):
         s["all_converged"] = bool(np.all(wr["conv"] >= 1.0))
         s["worst_WR_error"] = float(np.max(wr["err"]))
     return s
+
+
+def _save_data_uri_png(uri, dest):
+    """Decode a ``data:image/png;base64,...`` URI to a PNG file. Return True on write."""
+    if not uri or "base64," not in uri:
+        return False
+    b64 = uri.split("base64,", 1)[1]
+    with open(dest, "wb") as f:
+        f.write(base64.b64decode(b64))
+    return True
+
+
+def export_run_csv(path, params, summary, plots=None):
+    """Append one row (all input params + all result metrics) to a CSV file.
+
+    Params get a ``param_`` prefix, result metrics a ``result_`` prefix, so the
+    two namespaces never collide. If the file already exists, the row is
+    appended; if new columns appear across runs the whole file is rewritten with
+    the unioned header so it stays valid.
+
+    Any plots (name -> data-URI PNG) are written as ``<stem>_<stamp>_<name>.png``
+    next to the CSV, and their filenames recorded in ``plot_<name>`` columns so
+    each row points at its own images. Returns the absolute CSV path written.
+
+    path    -- destination CSV path (created if missing).
+    params  -- the flat parameter dict used for the run (the /run body).
+    summary -- scalar_summary(...) plus solver_seconds etc.
+    plots   -- optional {name: data-URI PNG} to dump alongside the CSV.
+    """
+    path = os.path.abspath(os.path.expanduser(path))
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    def flat(v):
+        # keep CSV cells scalar; JSON-encode anything nested
+        if isinstance(v, (dict, list, tuple)):
+            return json.dumps(v)
+        return v
+
+    row = {"run_time": time.strftime("%Y-%m-%d %H:%M:%S")}
+    for k, v in (params or {}).items():
+        if k in CHOICES:  # export the human-readable label, not the raw 0/1/2 code
+            try:
+                v = CHOICES[k].get(int(round(float(v))), v)
+            except (TypeError, ValueError):
+                pass
+        row["param_" + str(k)] = flat(v)
+    for k, v in (summary or {}).items():
+        row["result_" + str(k)] = flat(v)
+
+    # dump plot PNGs into a <stem>_plots/ subdir beside the CSV, to avoid clutter;
+    # the CSV records the relative path so links resolve from the CSV's location
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    plotdir = stem + "_plots"
+    if plots:
+        os.makedirs(os.path.join(d, plotdir) if d else plotdir, exist_ok=True)
+    for name, uri in (plots or {}).items():
+        fn = "{}_{}.png".format(stamp, name)
+        rel = os.path.join(plotdir, fn)
+        if _save_data_uri_png(uri, os.path.join(d, rel) if d else rel):
+            row["plot_" + str(name)] = rel
+
+    existing = []
+    fieldnames = []
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, newline="") as f:
+            rd = csv.DictReader(f)
+            fieldnames = list(rd.fieldnames or [])
+            existing = list(rd)
+
+    # union of old header + this row's keys, preserving old order then appending new
+    for k in row:
+        if k not in fieldnames:
+            fieldnames.append(k)
+
+    with open(path, "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        wr.writeheader()
+        for r in existing:
+            wr.writerow(r)
+        wr.writerow(row)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -1169,7 +1309,7 @@ class Handler(BaseHTTPRequestHandler):
             }))
 
     def do_POST(self):
-        if self.path not in ("/run", "/sweep", "/netlist", "/export"):
+        if self.path not in ("/run", "/sweep", "/netlist", "/export", "/export_csv"):
             self._send(404, json.dumps({"error": "unknown endpoint"}))
             return
         n = int(self.headers.get("Content-Length", 0))
@@ -1183,6 +1323,18 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/export":
             try:
                 self._send(200, json.dumps(export_lcapy(body)))
+            except Exception as e:
+                self._send(200, json.dumps({
+                    "ok": False, "error": str(e),
+                    "trace": traceback.format_exc()[-2000:],
+                }))
+            return
+        if self.path == "/export_csv":
+            try:
+                out = export_run_csv(body.get("path") or "results.csv",
+                                     body.get("params", {}), body.get("summary", {}),
+                                     body.get("plots", {}))
+                self._send(200, json.dumps({"ok": True, "path": out}))
             except Exception as e:
                 self._send(200, json.dumps({
                     "ok": False, "error": str(e),
@@ -1253,48 +1405,54 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # Frontend
 # ---------------------------------------------------------------------------
+# Properties layout: explicit rows (each an equal-column grid). time_mode is NOT shown -- the grid is
+# absolute-end-time only ("Sim duration" = t_end) and collect() injects time_mode=1. Params not placed
+# in a row but still consumed by the config (N_field_windows, N_periods, I_sat) are emitted as hidden
+# inputs so presets/reset/collect keep working.
+_PROP_ROWS = [
+    ["coupling_mode", "reconstruct_mode", "N_field_eval_intervals",
+     "N_field_steps_per_source_period", "N_xyce_coupling_intervals"],
+    ["t_end", "wr_convergence_method", "WRmaxSteps", "WR_tolerance", "interface_form"],
+    ["R_ROM", "L_ROM", "R_FEM", "L_FEM", "nonlin_model"],
+]
+_PROP_HIDDEN = ["N_field_windows", "N_periods", "I_sat"]  # config-only; time_mode injected in JS
+
+
 def _controls_html():
     # Seed the form from the actual saved sim_config.txt (fall back to factory defaults),
     # so the studio opens on the current working setup, not a blank/trivial config.
     initial = {**DEFAULTS, **read_config()}
-    # (The circuit preset "library" lives in the circuit-netlist panel, not here.)
-    rows = []
-    for k, label, default, kind, slider in PARAMS:
+    spec = {k: (k, l, d, kind, s) for (k, l, d, kind, s) in PARAMS}
+
+    def ctl(k):
+        _k, label, default, kind, slider = spec[k]
         default = initial.get(k, default)
         help_icon = f'<span class="help" data-help="{k}">?</span>' if k in HELP else ''
         if kind == "choice":
             opts = "".join(
                 f'<option value="{val}"{" selected" if val == default else ""}>{text}</option>'
-                for val, text in slider.items()  # for "choice", 5th field is the options dict
+                for val, text in slider.items()
             )
-            rows.append(f"""
-        <div class="ctl" id="ctl_{k}">
-          <label for="f_{k}">{label}{help_icon}</label>
-          <div class="inputs">
-            <select id="f_{k}" data-key="{k}" class="choice">{opts}</select>
-          </div>
-        </div>""")
-            continue
-        step = "any" if kind == "float" else "1"
-        slider_html = ""
-        if slider:
-            mn, mx, st = slider
-            slider_html = (
-                f'<input type="range" min="{mn}" max="{mx}" step="{st}" '
-                f'value="{default}" data-key="{k}" class="slider" '
-                f'oninput="syncFromSlider(this)">'
-            )
-        rows.append(f"""
-        <div class="ctl" id="ctl_{k}">
-          <label for="f_{k}">{label}{help_icon}</label>
-          <div class="inputs">
-            <input type="number" id="f_{k}" step="{step}" value="{default}"
-                   data-key="{k}" oninput="syncFromBox(this)">
-            {slider_html}
-          </div>
-        </div>""")
-    # The circuit spec is edited in the circuit box (right panel), not here.
-    return "\n".join(rows)
+            inner = f'<select id="f_{k}" data-key="{k}" class="choice">{opts}</select>'
+        else:
+            step = "any" if kind == "float" else "1"
+            inner = (f'<input type="number" id="f_{k}" step="{step}" value="{default}" '
+                     f'data-key="{k}" oninput="syncFromBox(this)">')
+        return (f'<div class="ctl" id="ctl_{k}"><label for="f_{k}">{label}{help_icon}</label>'
+                f'<div class="inputs">{inner}</div></div>')
+
+    out = []
+    for row in _PROP_ROWS:
+        cells = "\n".join(ctl(k) for k in row)
+        out.append(f'<div class="prop-row" style="grid-template-columns:'
+                   f'repeat({len(row)},minmax(0,1fr))">\n{cells}\n</div>')
+    # config-only params: hidden number boxes (still collected + settable by presets/reset)
+    hidden = "".join(
+        f'<input type="number" id="f_{k}" value="{initial.get(k, spec[k][2])}" data-key="{k}" hidden>'
+        for k in _PROP_HIDDEN
+    )
+    out.append(f'<div style="display:none">{hidden}</div>')
+    return "\n".join(out)
 
 
 def _sweep_options_html():
@@ -1309,191 +1467,276 @@ INDEX_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WR Co-Simulation Studio</title>
 <style>
-  :root { --bg:#0f1115; --panel:#181b22; --fg:#e6e6e6; --muted:#9aa4b2;
-          --accent:#4f9dff; --ok:#39d98a; --err:#ff6b6b; }
-  * { box-sizing: border-box; }
-  body { margin:0; font:14px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;
-         background:var(--bg); color:var(--fg); }
-  header { padding:14px 20px; background:var(--panel); border-bottom:1px solid #262b35;
-           display:flex; align-items:center; gap:16px; }
-  header h1 { font-size:16px; margin:0; font-weight:600; }
-  header .sub { color:var(--muted); font-size:12px; }
-  .wrap { display:flex; gap:16px; padding:16px; align-items:flex-start; }
-  .panel { background:var(--panel); border:1px solid #262b35; border-radius:10px; padding:16px; }
-  #controls { width:360px; flex:0 0 360px; position:sticky; top:16px; max-height:calc(100vh - 32px); overflow:auto; }
-  #results { flex:1; min-width:0; }
-  .ctl { margin-bottom:12px; }
-  .ctl label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
+  /* --- flat white theme; single accent (#3a0ca3) reserved for primary actions only --- */
+  :root { --bg:#ffffff; --fg:#1a1a1a; --muted:#6f6f6f; --line:#e2e2e2;
+          --line-strong:#cfcfcf; --field:#fafafa; --accent:#3a0ca3;
+          --ok:#1a7f37; --err:#b3261e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+         background:var(--bg); color:var(--fg); -webkit-font-smoothing:antialiased; }
+  a { color:var(--accent); }
+
+  /* header: thin, quiet, one full-width rule under it */
+  header { padding:22px 0; border-bottom:1px solid var(--line); }
+  .head-in { max-width:1180px; margin:0 auto; padding:0 40px;
+             display:flex; align-items:baseline; gap:16px; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.02em; }
+  header .sub { color:var(--muted); font-size:12px; letter-spacing:.01em; }
+
+  main { max-width:1180px; margin:0 auto; padding:0 40px 80px; }
+
+  /* sections: flat, separated only by a long thin rule */
+  section { padding:34px 0; border-bottom:1px solid var(--line); }
+  .sec-hd { display:flex; align-items:center; justify-content:space-between; gap:16px;
+            margin-bottom:20px; }
+  .sec-hd h2 { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.14em;
+               color:var(--muted); margin:0; }
+  .sec-hd .hd-tools { display:flex; align-items:center; gap:14px; }
+
+  /* controls: label above input, flat field with thin border, no radius */
+  .ctl label { display:block; color:var(--muted); font-size:11px; margin-bottom:5px;
+               letter-spacing:.01em; }
   .inputs { display:flex; align-items:center; gap:8px; }
-  .inputs input[type=number] { width:120px; background:#0d0f14; color:var(--fg);
-       border:1px solid #2c333f; border-radius:6px; padding:6px 8px; font-family:ui-monospace,monospace; }
-  .inputs select.choice { flex:1; background:#0d0f14; color:var(--fg);
-       border:1px solid #2c333f; border-radius:6px; padding:6px 8px; }
-  .slider { flex:1; }
-  .btns { display:flex; gap:10px; margin-top:8px; }
-  .mini { font-size:11px; color:var(--muted); align-self:center; font-family:ui-monospace,monospace; }
-  button { background:var(--accent); color:#06122a; border:0; border-radius:8px;
-           padding:10px 16px; font-weight:600; cursor:pointer; }
-  button.secondary { background:#2c333f; color:var(--fg); }
-  button:disabled { opacity:.5; cursor:default; }
-  #status { margin:10px 0; font-size:13px; min-height:18px; }
-  #status.ok { color:var(--ok); } #status.err { color:var(--err); }
-  .plot { width:100%; border-radius:8px; background:#fff; margin-bottom:14px; }
-  #p_circuit { background:#0f1115; border:1px solid #262b35; }
-  .summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:14px; }
-  .card { background:#0d0f14; border:1px solid #2c333f; border-radius:8px; padding:10px 12px; }
-  .card .k { color:var(--muted); font-size:11px; } .card .v { font-size:16px; font-family:ui-monospace,monospace; }
-  .card.cost { border-color:var(--accent); background:#10243f; } .card.cost .v { color:var(--accent); }
-  pre#log { background:#0d0f14; border:1px solid #2c333f; border-radius:8px; padding:10px;
-            color:var(--muted); font-size:11.5px; max-height:220px; overflow:auto; white-space:pre-wrap; }
-  details summary { cursor:pointer; color:var(--muted); margin-bottom:8px; }
-  .sweepbox { margin-top:16px; padding-top:14px; border-top:1px solid #2c333f; }
-  .sweephd { font-weight:600; font-size:13px; margin-bottom:10px; color:var(--accent); }
-  .sub2 { font-size:12px; min-height:16px; margin-top:6px; }
-  .sub2.ok { color:var(--ok); } .sub2.err { color:var(--err); }
-  .note { color:var(--muted); font-size:11px; margin-top:6px; }
-  table.sweep { width:100%; border-collapse:collapse; font-size:11.5px;
-                font-family:ui-monospace,monospace; margin-bottom:14px; }
-  table.sweep th, table.sweep td { border:1px solid #2c333f; padding:4px 7px; text-align:right; }
-  table.sweep th { color:var(--muted); font-weight:600; background:#0d0f14; }
-  table.sweep tr.bad td { color:var(--err); }
-  #circuitBox { margin-bottom:16px; padding-bottom:14px; border-bottom:1px solid #2c333f; }
-  .secthd { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
-  .secthd span { font-weight:600; font-size:13px; }
-  button.small { padding:5px 10px; font-size:12px; }
-  table.netlist { width:100%; border-collapse:collapse; font-size:12px;
-                  font-family:ui-monospace,monospace; margin-bottom:6px; }
-  table.netlist th, table.netlist td { border:1px solid #2c333f; padding:4px 8px; text-align:left; }
-  table.netlist th { color:var(--muted); font-weight:600; background:#0d0f14; }
-  table.netlist td.nm { color:var(--accent); }
-  /* --- circuit preset library + spec editor + inline schematic view --- */
-  .library { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px;
-             padding:8px 10px; background:#12151b; border:1px solid #2c333f; border-radius:8px; }
-  .library .lib-lbl { color:var(--muted); font-size:12px; font-weight:600; }
-  .library button { padding:5px 10px; font-size:12px; background:#22305a; color:#cfe0ff;
-                    border:1px solid #33436e; border-radius:6px; cursor:pointer; }
-  .library button:hover { filter:brightness(1.2); }
-  .cedit { display:flex; gap:14px; margin-bottom:12px; align-items:flex-start; flex-wrap:wrap; }
-  .cedit-l, .cedit-r { flex:1; min-width:280px; }
-  .cedit-hd { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px;
-              font-weight:600; margin-bottom:6px; }
-  .cedit-hd button { margin-left:auto; }
-  #f_circuit_spec { width:100%; min-height:120px; background:#0d0f14; color:#e6e6e6;
-       border:1px solid var(--accent); border-radius:0; padding:8px; resize:vertical;
-       font-family:ui-monospace,monospace; font-size:12px; line-height:1.5; display:block; }
-  pre.locked { margin:0; padding:6px 8px; background:#12151b; color:#7f8895;
-       border:1px solid #2c333f; font-family:ui-monospace,monospace; font-size:11px; line-height:1.5;
-       white-space:pre-wrap; overflow-x:auto; }
-  #lockHead { border-radius:6px 6px 0 0; border-bottom:none; }
-  #lockTail { border-radius:0 0 6px 6px; border-top:none; }
-  .cedit-r img { width:100%; border-radius:8px; background:#fff; display:block; }
+  .ctl.disabled { opacity:.4; }
+  input:disabled, select:disabled { cursor:not-allowed; background:var(--line); color:var(--muted); }
+  input[type=number], select.choice, input[type=text] {
+       width:100%; background:var(--field); color:var(--fg);
+       border:1px solid var(--line-strong); border-radius:0; padding:7px 9px;
+       font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; }
+  select.choice { font-family:inherit; }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); }
+  .hd-tools input.pathin { width:220px; padding:5px 8px; font-size:12px; }
+  .hd-tools button, .hd-tools input.pathin { flex-shrink:0; }
+  #csvStatus { max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  /* properties: explicit equal-column rows (grid cols set inline per row) */
+  .prop-rows { display:flex; flex-direction:column; gap:18px; }
+  .prop-row { display:grid; gap:16px 22px; align-items:start; }
+  /* the convergence-study sweep block still uses a plain auto-fill grid */
+  .properties { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
+                gap:16px 22px; }
+
+  /* buttons: flat, square. accent only on the primary run button */
+  .btns { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  button { background:var(--bg); color:var(--fg); border:1px solid var(--line-strong);
+           border-radius:0; padding:9px 18px; font-size:13px; font-weight:500; cursor:pointer;
+           letter-spacing:.01em; transition:background .12s,border-color .12s; }
+  button:hover { border-color:var(--fg); }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  button.primary:hover { background:#2e0982; border-color:#2e0982; }
+  button.small { padding:5px 11px; font-size:12px; }
+  button:disabled { opacity:.45; cursor:default; }
+
+  .mini { font-size:11px; color:var(--muted); font-family:ui-monospace,monospace; }
+  .note { color:var(--muted); font-size:11px; margin-top:8px; line-height:1.5; }
   .note.warn { color:var(--err); }
-  /* --- hover help tooltip --- */
+  #status, .sub2 { font-size:12.5px; min-height:16px; }
+  #status { margin-top:14px; }
+  #status.ok, .sub2.ok { color:var(--ok); }
+  #status.err, .sub2.err { color:var(--err); }
+
+  /* native collapsibles for preset library + convergence study */
+  details.fold { border:1px solid var(--line); margin-top:4px; }
+  details.fold > summary { cursor:pointer; list-style:none; padding:10px 14px;
+       font-size:11px; text-transform:uppercase; letter-spacing:.12em; color:var(--muted);
+       background:var(--field); user-select:none; }
+  details.fold > summary::-webkit-details-marker { display:none; }
+  details.fold > summary::before { content:"+ "; color:var(--accent); font-weight:600; }
+  details.fold[open] > summary::before { content:"– "; }
+  details.fold > .fold-body { padding:16px 14px; }
+  details.plain > summary { cursor:pointer; color:var(--muted); font-size:12px; margin-top:6px; }
+
+  /* circuit section: input (left) + schematic (right) */
+  .cedit { display:flex; gap:28px; align-items:flex-start; flex-wrap:wrap; }
+  .cedit-l, .cedit-r { flex:1; min-width:300px; }
+  /* right column is capped to the textarea height (set in JS); schematic fills the remainder */
+  .cedit-r { display:flex; flex-direction:column; min-height:0; }
+  #schemWrap { flex:1 1 auto; min-height:0; display:flex; }
+  .cedit-hd { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:11px;
+              text-transform:uppercase; letter-spacing:.1em; margin-bottom:8px; }
+  .cedit-hd button { margin-left:auto; }
+  #f_circuit_spec { width:100%; min-height:240px; height:240px; background:var(--field); color:var(--fg);
+       border:1px solid var(--line-strong); border-radius:0; padding:9px; resize:vertical;
+       font-family:ui-monospace,monospace; font-size:12px; line-height:1.6; display:block; }
+  pre.locked { margin:0; padding:7px 9px; background:#f3f3f3; color:#8a8a8a;
+       border:1px solid var(--line); font-family:ui-monospace,monospace; font-size:11px;
+       line-height:1.6; white-space:pre-wrap; overflow-x:auto; }
+  #lockHead { border-bottom:none; }
+  #lockTail { border-top:none; }
+  .cedit-r img { width:100%; height:100%; object-fit:contain; object-position:center top;
+                 border:1px solid var(--line); background:#fff; display:block; }
+
+  /* preset library chips */
+  .library { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .library button { padding:5px 12px; font-size:12px; }
+
+  /* result summary cards: flat, thin border; cost card marked with the accent */
+  .summary { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+             gap:0; border:1px solid var(--line); border-bottom:none; margin-bottom:24px; }
+  .card { border-bottom:1px solid var(--line); border-right:1px solid var(--line); padding:12px 14px; }
+  .card .k { color:var(--muted); font-size:10.5px; text-transform:uppercase; letter-spacing:.08em; }
+  .card .v { font-size:16px; font-family:ui-monospace,monospace; margin-top:3px; }
+  .card.cost .v { color:var(--accent); font-weight:600; }
+
+  /* plots: two per row, click to enlarge */
+  .plots { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px; }
+  .plot { width:100%; background:#fff; border:1px solid var(--line); display:none;
+          cursor:zoom-in; }
+  .plot.wide { grid-column:1 / -1; }
+
+  pre#log { background:var(--field); border:1px solid var(--line); border-radius:0; padding:12px;
+            color:var(--muted); font-size:11.5px; max-height:240px; overflow:auto; white-space:pre-wrap; }
+
+  table.sweep, table.netlist { width:100%; border-collapse:collapse; font-size:12px;
+                font-family:ui-monospace,monospace; margin-bottom:12px; }
+  table.sweep th, table.sweep td { border:1px solid var(--line); padding:5px 8px; text-align:right; }
+  table.netlist th, table.netlist td { border:1px solid var(--line); padding:5px 9px; text-align:left; }
+  table.sweep th, table.netlist th { color:var(--muted); font-weight:600; background:var(--field);
+                font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  table.sweep tr.bad td { color:var(--err); }
+  table.netlist td.nm { color:var(--accent); }
+
+  /* lightbox for enlarged plots */
+  #lightbox { display:none; position:fixed; inset:0; z-index:200; background:rgba(255,255,255,.94);
+              align-items:center; justify-content:center; cursor:zoom-out; padding:40px; }
+  #lightbox.on { display:flex; }
+  #lightbox img { max-width:96vw; max-height:92vh; border:1px solid var(--line-strong); background:#fff; }
+
+  /* hover help tooltip */
   .help { display:inline-block; margin-left:6px; width:14px; height:14px; border-radius:50%;
-          background:#2c333f; color:var(--muted); font-size:10px; line-height:14px; text-align:center;
+          background:#ececec; color:var(--muted); font-size:10px; line-height:14px; text-align:center;
           cursor:help; user-select:none; }
-  #helpTip { display:none; position:fixed; z-index:100; width:540px; max-width:72vw;
-             background:#0d0f14; border:1px solid #3a4351; border-radius:8px; padding:10px 12px;
-             box-shadow:0 8px 24px rgba(0,0,0,.55); color:var(--fg); font-size:11.5px; line-height:1.45; }
+  #helpTip { display:none; position:fixed; z-index:210; width:540px; max-width:72vw;
+             background:#fff; border:1px solid var(--line-strong); border-radius:0; padding:12px 14px;
+             box-shadow:0 10px 30px rgba(0,0,0,.14); color:var(--fg); font-size:11.5px; line-height:1.5; }
   #helpTip .hh { font-weight:600; margin-bottom:6px; color:var(--accent); }
   #helpTip .hn { color:var(--muted); margin-top:6px; }
+  #helpTip .hf { color:var(--fg); font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+       font-size:12px; margin:5px 0; padding:5px 9px; background:var(--field);
+       border-left:2px solid var(--accent); overflow-x:auto; }
   #helpTip table { border-collapse:collapse; width:100%; }
-  #helpTip th, #helpTip td { border:1px solid #2c333f; padding:3px 7px; text-align:left; vertical-align:top; }
-  #helpTip th { color:var(--muted); background:#12151b; font-weight:600; }
+  #helpTip th, #helpTip td { border:1px solid var(--line); padding:4px 7px; text-align:left; vertical-align:top; }
+  #helpTip th { color:var(--muted); background:var(--field); font-weight:600; }
 </style></head>
 <body>
 <header>
-  <h1>WR Co-Simulation Studio</h1>
-  <span class="sub">voltage-driven field model &middot; Xyce + dummy FEM &middot; waveform relaxation</span>
+  <div class="head-in">
+    <h1>WR Co-Simulation Studio</h1>
+    <span class="sub">voltage-driven field model &middot; Xyce + dummy FEM &middot; waveform relaxation</span>
+  </div>
 </header>
-<div class="wrap">
-  <div class="panel" id="controls">
-    __CONTROLS__
+<main>
+
+  <!-- 1. Circuit input + schematic -->
+  <section id="circuitBox">
+    <div class="sec-hd">
+      <h2>Circuit side<span class="help" data-help="circuit_spec_edit">?</span></h2>
+      <div class="hd-tools">
+        <span class="mini" id="exportStatus"></span>
+        <button class="small primary" onclick="applySpec()">Apply &amp; render</button>
+        <button class="small" onclick="loadCircuit()">Refresh</button>
+        <button class="small" onclick="exportCircuit()">Export LaTeX/PDF<span class="help" data-help="lcapy_export">?</span></button>
+      </div>
+    </div>
+    <div class="cedit">
+      <div class="cedit-l">
+        <pre class="locked" id="lockHead"></pre>
+        <textarea id="f_circuit_spec" spellcheck="false">__SPEC_SEED__</textarea>
+        <pre class="locked" id="lockTail"></pre>
+      </div>
+      <div class="cedit-r">
+        <details class="fold" id="libFold" style="margin-top:0">
+          <summary>Preset library</summary>
+          <div class="fold-body">
+            <div class="library" id="library"><span id="libButtons"></span></div>
+          </div>
+        </details>
+        <div class="cedit-hd" style="margin-top:8px">Schematic <span class="mini">(lcapy)</span></div>
+        <div id="schemWrap"><img id="p_circuit" alt="circuit schematic"></div>
+        <div class="note" id="schemNote"></div>
+      </div>
+    </div>
+    <div id="netlistTable" style="margin-top:8px"></div>
+    <details class="plain"><summary>Full raw netlist + directives</summary><pre id="netlistRaw"></pre></details>
+  </section>
+
+  <!-- 2. Properties -->
+  <section>
+    <div class="sec-hd"><h2>Properties</h2></div>
+    <div class="prop-rows">
+      __CONTROLS__
+    </div>
+  </section>
+
+  <!-- 3. Actions -->
+  <section>
+    <div class="sec-hd"><h2>Run</h2></div>
     <div class="btns">
-      <button id="runBtn" onclick="run()">Run simulation</button>
-      <button class="secondary" onclick="resetDefaults()">Reset</button>
+      <button id="runBtn" class="primary" onclick="run()">Run simulation</button>
+      <button onclick="resetDefaults()">Reset</button>
     </div>
     <div id="status"></div>
+    <details class="fold" style="margin-top:20px">
+      <summary>Convergence study (parameter sweep)</summary>
+      <div class="fold-body">
+        <div class="properties" style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr))">
+          <div class="ctl">
+            <label for="sw_key">Sweep parameter</label>
+            <div class="inputs"><select id="sw_key" class="choice">__SWEEP_OPTS__</select></div>
+          </div>
+          <div class="ctl">
+            <label for="sw_min">Min</label>
+            <div class="inputs"><input type="number" id="sw_min" step="any" value="0"></div>
+          </div>
+          <div class="ctl">
+            <label for="sw_max">Max</label>
+            <div class="inputs"><input type="number" id="sw_max" step="any" value="0.1"></div>
+          </div>
+          <div class="ctl">
+            <label for="sw_steps">Steps</label>
+            <div class="inputs"><input type="number" id="sw_steps" step="1" value="8"></div>
+          </div>
+          <div class="ctl">
+            <label for="sw_scale">Spacing</label>
+            <div class="inputs">
+              <select id="sw_scale" class="choice">
+                <option value="linear">linear</option>
+                <option value="log">log (positive only)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="btns" style="margin-top:16px"><button id="sweepBtn" onclick="runSweep()">Run sweep</button></div>
+        <div id="sweepStatus" class="sub2" style="margin-top:10px"></div>
+        <div class="note">Holds all other fields at their current values and runs
+          the solver once per swept value, plotting metrics vs the parameter.</div>
+      </div>
+    </details>
+  </section>
 
-    <div class="sweepbox">
-      <div class="sweephd">Convergence study (parameter sweep)</div>
-      <div class="ctl">
-        <label for="sw_key">Sweep parameter</label>
-        <div class="inputs"><select id="sw_key" class="choice">__SWEEP_OPTS__</select></div>
-      </div>
-      <div class="ctl">
-        <label>Range (min, max, steps)</label>
-        <div class="inputs">
-          <input type="number" id="sw_min" step="any" value="0" title="min">
-          <input type="number" id="sw_max" step="any" value="0.1" title="max">
-          <input type="number" id="sw_steps" step="1" value="8" title="steps" style="width:70px">
-        </div>
-      </div>
-      <div class="ctl">
-        <label for="sw_scale">Spacing</label>
-        <div class="inputs">
-          <select id="sw_scale" class="choice">
-            <option value="linear">linear</option>
-            <option value="log">log (positive only)</option>
-          </select>
-        </div>
-      </div>
-      <div class="btns">
-        <button id="sweepBtn" onclick="runSweep()">Run sweep</button>
-      </div>
-      <div id="sweepStatus" class="sub2"></div>
-      <div class="note">Holds all other fields at their current values and runs
-        the solver once per swept value, plotting metrics vs the parameter.</div>
-    </div>
-  </div>
-  <div class="panel" id="results">
-    <div id="circuitBox">
-      <div class="secthd">
-        <span>Circuit netlist (<code>wr_circuit.cir</code>)</span>
-        <div class="btns">
-          <button class="secondary small" id="toggleCircuitBtn" onclick="toggleCircuit()">Hide</button>
-          <button class="secondary small" onclick="loadCircuit()">Refresh</button>
-          <button class="secondary small" onclick="exportCircuit()">Export LaTeX/PDF<span class="help" data-help="lcapy_export">?</span></button>
-          <span class="mini" id="exportStatus"></span>
-        </div>
-      </div>
-      <div id="circuitContent">
-        <div class="library" id="library">
-          <span class="lib-lbl">Library:</span>
-          <span id="libButtons"></span>
-        </div>
-        <div class="cedit">
-          <div class="cedit-l">
-            <div class="cedit-hd">Circuit side<span class="help" data-help="circuit_spec_edit">?</span>
-              <button class="small" onclick="applySpec()">Apply &amp; render</button></div>
-            <pre class="locked" id="lockHead"></pre>
-            <textarea id="f_circuit_spec" spellcheck="false">__SPEC_SEED__</textarea>
-            <pre class="locked" id="lockTail"></pre>
-            <div class="note">Only the <b>circuit side</b> (white box) is editable — the WR interface
-              (<code>Vmeas</code>, <code>Bfield</code>) and directives are generated and locked. Reserved
-              nodes <code>p</code>=port, <code>0</code>=gnd. One element/line: <code>R/L/C name a b val</code>,
-              <code>{V,I}SIN name a b amp f</code>, <code>{V,I}DC name a b val</code>,
-              <code>{V,I}PULSE name a b v1 v2 td tr</code>, <code>{V,I}PWL name a b t1 v1 …</code>.</div>
-          </div>
-          <div class="cedit-r">
-            <div class="cedit-hd">Schematic <span class="mini">(lcapy)</span></div>
-            <img id="p_circuit" alt="circuit schematic">
-            <div class="note" id="schemNote"></div>
-          </div>
-        </div>
-        <div id="netlistTable"></div>
-        <details><summary>Full raw netlist + directives</summary><pre id="netlistRaw"></pre></details>
+  <!-- 4. Results -->
+  <section style="border-bottom:none">
+    <div class="sec-hd">
+      <h2>Results</h2>
+      <div class="hd-tools">
+        <span class="mini" id="csvStatus"></span>
+        <input type="text" id="csvPath" class="pathin" placeholder="results.csv" value="results.csv" spellcheck="false">
+        <button class="small" onclick="exportCsv()">Export CSV</button>
       </div>
     </div>
     <div class="summary" id="summary"></div>
-    <img class="plot" id="p_voltage" hidden>
-    <img class="plot" id="p_current" hidden>
-    <img class="plot" id="p_wr" hidden>
-    <img class="plot" id="p_sweep" hidden>
+    <div class="plots">
+      <img class="plot" id="p_voltage" onclick="enlarge(this)">
+      <img class="plot" id="p_current" onclick="enlarge(this)">
+      <img class="plot wide" id="p_wr" onclick="enlarge(this)">
+      <img class="plot wide" id="p_sweep" onclick="enlarge(this)">
+    </div>
     <div id="sweepTable"></div>
-    <details><summary>Solver log</summary><pre id="log"></pre></details>
-  </div>
-</div>
+    <details class="plain"><summary>Solver log</summary><pre id="log"></pre></details>
+  </section>
+
+</main>
+<div id="lightbox" onclick="this.classList.remove('on')"><img id="lightboxImg"></div>
 <div id="helpTip"></div>
 <script>
 const DEFAULTS = __DEFAULTS__;
@@ -1514,8 +1757,14 @@ function helpHide(){ document.getElementById('helpTip').style.display='none'; }
 function ctlVal(k){ const el=document.getElementById('f_'+k); return el?Math.round(parseFloat(el.value)):NaN; }
 function condMatch(cond){ return cond.some(d => Object.keys(d).every(k => d[k].includes(ctlVal(k)))); }
 function applyVisibility(){
-  for(const k in VISIBLE_WHEN){ const box=document.getElementById('ctl_'+k);
-    if(box) box.style.display = condMatch(VISIBLE_WHEN[k]) ? '' : 'none'; }
+  for(const k in VISIBLE_WHEN){
+    const on = condMatch(VISIBLE_WHEN[k]);
+    const box = document.getElementById('ctl_'+k);
+    if(box){
+      box.classList.toggle('disabled', !on);   // dim, but stay in place (no reflow)
+      box.querySelectorAll('input,select').forEach(el => el.disabled = !on);
+    }
+  }
 }
 
 function buildLibrary(){
@@ -1559,6 +1808,7 @@ function collect(){
   });
   const ta = document.getElementById('f_circuit_spec');
   if (ta) p['circuit_spec'] = ta.value;   // custom node-graph spec (circuit_kind=custom)
+  p['time_mode'] = 1;   // properties grid is absolute-end-time only ("Sim duration" = t_end)
   return p;
 }
 function resetDefaults(){
@@ -1574,7 +1824,7 @@ function setStatus(msg, cls){
 }
 function showSummary(sum){
   const el = document.getElementById('summary'); el.innerHTML = '';
-  const fmt = v => (typeof v === 'number') ? (Math.abs(v)<1e-3||Math.abs(v)>=1e5 ? v.toExponential(4) : v.toPrecision(6)) : String(v);
+  const fmt = v => (typeof v === 'number') ? (Number.isInteger(v) ? String(v) : (Math.abs(v)<1e-3||Math.abs(v)>=1e5 ? v.toExponential(4) : v.toPrecision(6))) : String(v);
   const order = ['solver_seconds','total_xyce_solves','sec_per_xyce_solve','windows','max_WR_iterations','worst_WR_error','all_converged','final_time_s','final_V_field','final_I_field'];
   const labels = {solver_seconds:'solver time (s)', total_xyce_solves:'Xyce solves', sec_per_xyce_solve:'s / Xyce solve', final_time_s:'final time (s)', final_V_field:'final V_field', final_I_field:'final I_field', max_WR_iterations:'max WR iters', worst_WR_error:'worst WR error', all_converged:'all converged'};
   for (const k of order){ if (k in sum){
@@ -1584,20 +1834,40 @@ function showSummary(sum){
     el.appendChild(c);
   }}
 }
-function setPlot(id, src){ const im = document.getElementById(id); if(src){ im.src=src; im.hidden=false; } else { im.hidden=true; } }
+function setPlot(id, src){ const im = document.getElementById(id);
+  if(src){ im.src=src; im.style.display='block'; } else { im.removeAttribute('src'); im.style.display='none'; } }
+function enlarge(im){ if(!im.src) return;
+  document.getElementById('lightboxImg').src = im.src;
+  document.getElementById('lightbox').classList.add('on'); }
+
+// Cap the right column (preset library + schematic) to the full circuit-side block height
+// (locked head + editable input + locked tail): the schematic (flex:1) shrinks when the preset
+// library expands, and tracks manual textarea resize.
+function syncSchemHeight(){
+  const l=document.querySelector('.cedit-l');
+  const r=document.querySelector('.cedit-r');
+  if(!l || !r) return;
+  // l.offsetHeight omits the locked-tail <pre>'s bottom padding (baseline quirk); add it back from
+  // the computed style so this stays correct if the padding ever changes (was a hard-coded +7).
+  const tail=document.getElementById('lockTail');
+  const pad=tail ? parseFloat(getComputedStyle(tail).paddingBottom)||0 : 0;
+  r.style.height = (l.offsetHeight + pad) + 'px';
+}
 
 async function run(){
   const btn = document.getElementById('runBtn'); btn.disabled = true;
   setStatus('Running solver (Xyce + FEM + WR)...', '');
+  const sent = collect();
   try {
     const res = await fetch('/run', {method:'POST', headers:{'Content-Type':'application/json'},
-                                     body: JSON.stringify(collect())});
+                                     body: JSON.stringify(sent)});
     const j = await res.json();
     document.getElementById('log').textContent = (j.log||'') + (j.stderr? '\\n--- stderr ---\\n'+j.stderr : '') + (j.trace? '\\n'+j.trace : '');
     const tsec = (typeof j.solver_seconds === 'number') ? j.solver_seconds.toFixed(2)+' s' : '';
     if (!j.ok){ setStatus('Error: '+(j.error||'unknown')+(tsec?' (after '+tsec+')':''), 'err'); }
     else {
       setStatus('Done in '+tsec+'.', 'ok');
+      lastRun = {params: sent, summary: j.summary||{}, plots: j.plots||{}};
       showSummary(j.summary||{});
       setPlot('p_voltage', j.plots.voltage);
       setPlot('p_current', j.plots.current);
@@ -1606,6 +1876,21 @@ async function run(){
     }
   } catch(e){ setStatus('Request failed: '+e, 'err'); }
   finally { btn.disabled = false; }
+}
+
+let lastRun = null;
+async function exportCsv(){
+  const st = document.getElementById('csvStatus');
+  if (!lastRun){ st.textContent = 'Run a simulation first.'; return; }
+  const path = (document.getElementById('csvPath').value||'').trim();
+  if (!path){ st.textContent = 'Enter a path.'; return; }
+  st.textContent = 'Saving...';
+  try {
+    const res = await fetch('/export_csv', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: path, params: lastRun.params, summary: lastRun.summary, plots: lastRun.plots})});
+    const j = await res.json();
+    st.textContent = j.ok ? ('Saved to '+j.path) : ('Error: '+(j.error||'unknown'));
+  } catch(e){ st.textContent = 'Failed: '+e; }
 }
 
 function setSweepStatus(msg, cls){
@@ -1695,6 +1980,7 @@ async function loadCircuit(){
       document.getElementById('lockHead').textContent = j.locked_head || '';
       document.getElementById('lockTail').textContent = j.locked_tail || '';
       showNetlist(j);
+      syncSchemHeight();  // locked text just changed the left-block height -> recap the schematic
     }
   } catch(e){ /* leave circuit box empty on failure */ }
 }
@@ -1721,12 +2007,22 @@ async function exportCircuit(){
 }
 
 window.addEventListener('load', ()=>{
-  const ctrls=document.getElementById('controls');
+  const ctrls=document.querySelector('.prop-rows');   // (was '#controls', removed in the redesign)
   if(ctrls){ ctrls.addEventListener('input', applyVisibility); ctrls.addEventListener('change', applyVisibility); }
   // Help hover is document-wide now (help icons live in both the controls and the circuit box).
   document.addEventListener('mouseover', e=>{ if(e.target.classList.contains('help')) helpShow(e.target); });
   document.addEventListener('mouseout',  e=>{ if(e.target.classList.contains('help')) helpHide(); });
   buildLibrary(); applyVisibility(); loadCircuit();
+  // Keep the schematic column capped to the full circuit-side (left) block height. Observe the block
+  // itself so ANY height change resyncs: async locked-text fill, web-font reflow, or manual resize --
+  // this fixes the wrong height on first paint (previously only fixed by a window resize).
+  const l=document.querySelector('.cedit-l');
+  if(l && window.ResizeObserver){ new ResizeObserver(syncSchemHeight).observe(l); }
+  const lf=document.getElementById('libFold');
+  if(lf){ lf.addEventListener('toggle', syncSchemHeight); }
+  window.addEventListener('resize', syncSchemHeight);
+  if(document.fonts && document.fonts.ready){ document.fonts.ready.then(syncSchemHeight); }
+  syncSchemHeight();
 });
 </script>
 </body></html>
