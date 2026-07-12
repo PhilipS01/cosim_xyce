@@ -188,12 +188,21 @@ HELP = {
         "<div class='hn'>Speeds up multi-point sweeps roughly linearly until you saturate cores or "
         "memory. Set to <code>1</code> for a serial run (lowest memory / easiest to read logs).</div>"
     ),
+    "sweep_export": (
+        "<div class='hh'>Export sweep</div>"
+        "<div class='hn'>Writes the whole sweep to CSV: one row per run (run index, one column per "
+        "swept parameter, then the result metrics). Also writes <code>&lt;stem&gt;_iters.csv</code> "
+        "(WR iterations per window, one row per run) and the current plots (with reference lines) into "
+        "<code>&lt;stem&gt;_plots/</code>.</div>"
+        "<div class='hn'>Server-side path, relative to where the studio runs. Overwrites an existing file.</div>"
+    ),
     "sweep_vlines": (
         "<div class='hh'>Reference lines</div>"
         "<div class='hn'>Comma-separated values drawn as dashed vertical lines on the sweep plots "
-        "(handy for marking a crossover). Each entry is arithmetic over the current config "
-        "parameters &mdash; e.g. <code>R_series+L_series</code>, <code>R_ROM</code>, or a plain number "
-        "like <code>0.01</code>.</div>"
+        "(handy for marking a crossover). Each entry is arithmetic over the config parameters "
+        "(<code>R_ROM</code>, <code>L_ROM</code>, &hellip;) <b>and your circuit-spec R/L/C element "
+        "names</b> &mdash; e.g. <code>Rs+Ls</code> (series R + L above), <code>R_ROM</code>, or a plain "
+        "number like <code>0.01</code>.</div>"
         "<div class='hn'>Positioned where the x-axis parameter equals the value (interpolated); entries "
         "outside the swept range are skipped. On the WR-iterations heatmap and line plots the line marks "
         "that x-location; on grid heatmaps it's drawn on the first (x) parameter axis.</div>"
@@ -1088,6 +1097,52 @@ def export_run_csv(path, params, summary, plots=None):
     return path
 
 
+def export_sweep_csv(path, keys, rows, plots=None):
+    """Write a whole parameter sweep: one CSV row per swept point (run index,
+    one column per swept parameter, then the result metrics). Also writes a
+    companion '<stem>_iters.csv' (WR iterations per window: one row per run) and
+    dumps any plot PNGs into '<stem>_plots/'. Returns (csv_path, [written files])."""
+    metric_cols = ["ok", "max_WR_iterations", "mean_WR_iterations", "total_xyce_solves",
+                   "worst_WR_error", "all_converged", "solver_seconds",
+                   "final_I_field", "final_V_field", "final_time_s", "windows", "error"]
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+    header = ["index"] + list(keys) + metric_cols
+    with open(path, "w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(header)
+        for i, r in enumerate(rows):
+            vals = r.get("vals") or {keys[0]: r.get("value")}
+            wr.writerow([i] + [vals.get(k) for k in keys] + [r.get(c) for c in metric_cols])
+    written = [os.path.abspath(path)]
+
+    # Per-window WR iterations: rows = run index, columns = window 1..W (ragged -> blank).
+    wmax = max((len(r.get("wr_nit") or []) for r in rows), default=0)
+    if wmax:
+        ipath = os.path.splitext(path)[0] + "_iters.csv"
+        with open(ipath, "w", newline="") as f:
+            wr = csv.writer(f)
+            wr.writerow(["index"] + list(keys) + [f"w{w+1}" for w in range(wmax)])
+            for i, r in enumerate(rows):
+                vals = r.get("vals") or {keys[0]: r.get("value")}
+                nit = r.get("wr_nit") or []
+                wr.writerow([i] + [vals.get(k) for k in keys] +
+                            [nit[w] if w < len(nit) else "" for w in range(wmax)])
+        written.append(os.path.abspath(ipath))
+
+    if plots:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        plotdir = os.path.join(d, stem + "_plots") if d else (stem + "_plots")
+        os.makedirs(plotdir, exist_ok=True)
+        for name, uri in plots.items():
+            dest = os.path.join(plotdir, f"{name}.png")
+            if _save_data_uri_png(uri, dest):
+                written.append(os.path.abspath(dest))
+    return os.path.abspath(path), written
+
+
 # ---------------------------------------------------------------------------
 # Parameter sweep / convergence study
 # ---------------------------------------------------------------------------
@@ -1124,21 +1179,39 @@ def _all_config_numeric():
     return d
 
 
-def eval_vlines(exprs, params):
-    """Turn reference-line expressions into [(value, label), ...].
+def _spec_element_values(spec):
+    """Map R/L/C element names in a circuit spec to their numeric value, so
+    reference-line expressions can name real circuit elements (e.g. Rs, Ls).
+    Line form: '<TYPE> <name> <nodeA> <nodeB> <value> ...'; only R/L/C keep a
+    plain scalar value in that slot. `spec` = the circuit-spec text (or None)."""
+    d = {}
+    if not spec:
+        spec = read_spec()
+    for line in (spec or "").splitlines():
+        s = line.split("#", 1)[0].strip()
+        if not s:
+            continue
+        parts = s.split()
+        if len(parts) >= 5 and parts[0] in ("R", "L", "C"):
+            try:
+                d[parts[1]] = float(parts[4])
+            except ValueError:
+                pass
+    return d
 
-    Each expression is evaluated as arithmetic over the current parameter values
-    (config keys like R_series, L_series, R_ROM used as variables) plus a few math
-    helpers. Non-numeric / failing expressions are skipped. `exprs` may be a list
-    or a comma/newline separated string. The original text becomes the line label."""
-    if not exprs:
-        return []
-    if isinstance(exprs, str):
-        exprs = re.split(r"[,\n]", exprs)
+
+# Last completed sweep, kept so Results-section reference lines can be re-drawn
+# without re-solving: {"keys","rows","mode","free_keys","params"}.
+_LAST_SWEEP = {}
+
+
+def _vline_env(params):
+    """Build the evaluation namespace for reference-line expressions:
+    sim_config.txt numerics, then circuit-spec R/L/C element values by name
+    (e.g. Rs, Ls), then the live params (highest precedence), plus math helpers."""
     env = {"__builtins__": {}}
-    # All numeric keys from sim_config.txt (incl. ones not in the UI form, e.g.
-    # R_series/L_series), then override with the live params sent by the client.
     src = dict(_all_config_numeric())
+    src.update(_spec_element_values((params or {}).get("circuit_spec")))
     src.update(params or {})
     for k, v in src.items():
         try:
@@ -1146,16 +1219,42 @@ def eval_vlines(exprs, params):
         except (TypeError, ValueError):
             pass
     env.update(abs=abs, min=min, max=max, sqrt=math.sqrt, pi=math.pi)
+    return env
+
+
+def _split_exprs(exprs):
+    if not exprs:
+        return []
+    if isinstance(exprs, str):
+        exprs = re.split(r"[,\n]", exprs)
+    return [str(e).strip() for e in exprs if str(e).strip()]
+
+
+def eval_vlines(exprs, params):
+    """Turn reference-line expressions into [(value, label), ...]. Each expression
+    is evaluated as arithmetic over the config params + circuit-spec element names
+    (see _vline_env). Non-numeric / failing expressions are skipped; the original
+    text becomes the line label."""
+    env = _vline_env(params)
     out = []
-    for raw in exprs:
-        s = str(raw).strip()
-        if not s:
-            continue
+    for s in _split_exprs(exprs):
         try:
-            val = float(eval(s, env))       # arithmetic only: builtins stripped
+            out.append((float(eval(s, env)), s))   # arithmetic only: builtins stripped
         except Exception:
             continue
-        out.append((val, s))
+    return out
+
+
+def eval_vlines_report(exprs, params):
+    """Like eval_vlines but reports every expression's outcome for live feedback:
+    [{expr, ok, value} | {expr, ok:False, error}]."""
+    env = _vline_env(params)
+    out = []
+    for s in _split_exprs(exprs):
+        try:
+            out.append({"expr": s, "ok": True, "value": float(eval(s, env))})
+        except Exception as e:
+            out.append({"expr": s, "ok": False, "error": type(e).__name__})
     return out
 
 
@@ -1780,13 +1879,48 @@ class Handler(BaseHTTPRequestHandler):
             }))
 
     def do_POST(self):
-        if self.path not in ("/run", "/sweep", "/netlist", "/export", "/export_csv"):
+        if self.path not in ("/run", "/sweep", "/netlist", "/export", "/export_csv",
+                             "/eval_vlines", "/sweep_replot", "/sweep_export"):
             self._send(404, json.dumps({"error": "unknown endpoint"}))
             return
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
         if self.path == "/sweep":
             self._handle_sweep(body)
+            return
+        if self.path == "/eval_vlines":
+            self._send(200, json.dumps({"results": eval_vlines_report(
+                body.get("vlines"), body.get("params", {}))}))
+            return
+        if self.path == "/sweep_replot":
+            # Re-render the last sweep's plots with new reference lines (no re-solve).
+            s = _LAST_SWEEP
+            if not s:
+                self._send(200, json.dumps({"ok": False, "error": "run a sweep first"}))
+                return
+            vl_eval = eval_vlines(body.get("vlines"), s["params"])
+            self._send(200, json.dumps({
+                "ok": True,
+                "plots": make_sweep_plots(s["keys"], s["rows"], s["mode"],
+                                          s["free_keys"], vl_eval),
+                "results": eval_vlines_report(body.get("vlines"), s["params"]),
+            }))
+            return
+        if self.path == "/sweep_export":
+            s = _LAST_SWEEP
+            if not s:
+                self._send(200, json.dumps({"ok": False, "error": "run a sweep first"}))
+                return
+            try:
+                vl_eval = eval_vlines(body.get("vlines"), s["params"])
+                plots = make_sweep_plots(s["keys"], s["rows"], s["mode"],
+                                         s["free_keys"], vl_eval)
+                csv_path, files = export_sweep_csv(body.get("path") or "sweep.csv",
+                                                   s["keys"], s["rows"], plots)
+                self._send(200, json.dumps({"ok": True, "path": csv_path, "files": files}))
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e),
+                                            "trace": traceback.format_exc()[-2000:]}))
             return
         if self.path == "/netlist":
             self._handle_netlist(body)
@@ -1871,6 +2005,11 @@ class Handler(BaseHTTPRequestHandler):
             rows = run_sweep(base, keys, points, workers)
             total = round(time.perf_counter() - t0, 3)
             n_ok = sum(1 for r in rows if r.get("ok"))
+            # Keep the result so reference lines can be re-drawn (Results section)
+            # without re-solving. rows/keys are plain JSON-friendly data.
+            global _LAST_SWEEP
+            _LAST_SWEEP = {"keys": keys, "rows": rows, "mode": mode,
+                           "free_keys": free_keys, "params": base}
             self._send(200, json.dumps({
                 "ok": n_ok > 0,
                 "sweep_key": keys[0],
@@ -2267,12 +2406,6 @@ INDEX_HTML = """<!doctype html>
           <input type="number" id="sw_jobs" min="1" step="1" value="0" placeholder="auto"
                  style="width:70px" title="Parallel solver processes (0 = auto / all cores)">
         </div>
-        <div class="btns" style="margin-top:12px;align-items:center;gap:10px">
-          <label for="sw_vlines" style="color:var(--muted);font-size:11px;white-space:nowrap">Reference line(s)
-            <span class="help" data-help="sweep_vlines">?</span></label>
-          <input type="text" id="sw_vlines" spellcheck="false" placeholder="e.g. R_series+L_series, 0.01"
-                 style="flex:1;min-width:200px;font-family:ui-monospace,monospace">
-        </div>
         <div id="sweepStatus" class="sub2" style="margin-top:10px"></div>
         <div class="note" id="sweepNote"></div>
       </div>
@@ -2324,6 +2457,21 @@ INDEX_HTML = """<!doctype html>
       <img class="plot" id="p_probe_i" onclick="enlarge(this)">
       <img class="plot wide" id="p_sweep" onclick="enlarge(this)">
       <img class="plot wide" id="p_sweep_iters" onclick="enlarge(this)">
+    </div>
+    <div id="vlineBar" style="display:none">
+      <div class="btns" style="margin-top:12px;align-items:center;gap:10px">
+        <label for="sw_vlines" style="color:var(--muted);font-size:11px;white-space:nowrap">Reference line(s)
+          <span class="help" data-help="sweep_vlines">?</span></label>
+        <input type="text" id="sw_vlines" spellcheck="false" placeholder="e.g. Rs+Ls, R_ROM, 0.01"
+               style="flex:1;min-width:200px;max-width:360px;font-family:ui-monospace,monospace"
+               oninput="vlinePreview()">
+        <span id="sw_vlines_val" class="sub2" style="font-family:ui-monospace,monospace;white-space:nowrap"></span>
+      </div>
+      <div class="btns" style="margin-top:10px;align-items:center;gap:10px">
+        <span class="mini" id="sweepCsvStatus"></span>
+        <input type="text" id="sweepCsvPath" class="pathin" placeholder="sweep.csv" value="sweep.csv" spellcheck="false">
+        <button class="small" onclick="exportSweep()">Export sweep<span class="help" data-help="sweep_export">?</span></button>
+      </div>
     </div>
     <div id="sweepTable" style="margin-top:16px"></div>
     <details class="plain"><summary>Solver log</summary><pre id="log"></pre></details>
@@ -2663,6 +2811,45 @@ function collectSweepSpecs(mode){
     };
   });
 }
+async function exportSweep(){
+  const st = document.getElementById('sweepCsvStatus');
+  const path = (document.getElementById('sweepCsvPath').value || '').trim();
+  if (!path){ st.textContent = 'Enter a path.'; return; }
+  const vlines = (document.getElementById('sw_vlines').value || '').trim();
+  st.textContent = 'Saving...';
+  try {
+    const res = await fetch('/sweep_export', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: path, vlines: vlines})});
+    const j = await res.json();
+    st.textContent = j.ok ? ('Saved '+(j.files ? j.files.length : 1)+' file(s): '+j.path)
+                          : ('Error: '+(j.error||'unknown'));
+  } catch(e){ st.textContent = 'Failed: '+e; }
+}
+
+let vlineDeb = null;
+function showVlineVals(results){
+  const out = document.getElementById('sw_vlines_val');
+  out.innerHTML = (results && results.length) ? ('= ' + results.map(r =>
+    r.ok ? '<span style="color:var(--ok)">'+fmtCell(r.value)+'</span>'
+         : '<span style="color:var(--err)">'+r.error+'</span>').join(', ')) : '';
+}
+function vlinePreview(){
+  clearTimeout(vlineDeb);
+  vlineDeb = setTimeout(async () => {
+    const raw = (document.getElementById('sw_vlines').value || '').trim();
+    try {
+      // Re-draw the stored sweep's plots with the new reference lines (no re-solve).
+      const res = await fetch('/sweep_replot', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({vlines: raw})});
+      const j = await res.json();
+      if (j.ok){
+        setPlot('p_sweep', j.plots ? j.plots.sweep : null);
+        setPlot('p_sweep_iters', j.plots ? j.plots.iters : null);
+        showVlineVals(j.results);
+      }
+    } catch(e){ /* leave plots as-is */ }
+  }, 200);
+}
 async function runSweep(){
   const btn = document.getElementById('sweepBtn'); btn.disabled = true;
   const mode = document.getElementById('sw_mode').value;
@@ -2688,6 +2875,7 @@ async function runSweep(){
       setPlot('p_sweep', j.plots ? j.plots.sweep : null);
       setPlot('p_sweep_iters', j.plots ? j.plots.iters : null);
       showSweepTable(j.table);
+      document.getElementById('vlineBar').style.display = '';   // enable post-processing lines
     }
   } catch(e){ setSweepStatus('Request failed: '+e, 'err'); }
   finally { btn.disabled = false; }
