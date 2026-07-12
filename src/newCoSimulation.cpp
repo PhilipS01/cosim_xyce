@@ -14,6 +14,58 @@
 // Global tunable configuration (defaults defined in SimConfig). Overwritten by LoadConfig.
 SimConfig g_cfg;
 
+// User-requested output probes (Xyce print tokens, e.g. "V(a)", "I(Rr1)"). See Header.h.
+std::vector<std::string> g_probes;
+
+// Load probe tokens from probes.txt (one per line; '#'/blank ignored). Missing file -> no probes.
+void LoadProbes(const string& filename)
+{
+    g_probes.clear();
+    ifstream in(filename);
+    if (!in) return;
+    string line;
+    while (getline(in, line)) {
+        const size_t hash = line.find('#');
+        if (hash != string::npos) line = line.substr(0, hash);
+        // trim
+        size_t a = line.find_first_not_of(" \t\r\n");
+        if (a == string::npos) continue;
+        size_t b = line.find_last_not_of(" \t\r\n");
+        string tok = line.substr(a, b - a + 1);
+        if (!tok.empty()) g_probes.push_back(tok);
+    }
+}
+
+// Read a Xyce .prn and append its probe columns to the probe output file. The Xyce output
+// columns are: Index TIME V(P) V(NX) I(VMEAS) <probe1> ... <probeN>; we copy TIME + the N
+// trailing probe columns, re-indexed. skip_first_point drops the first row (shared window edge).
+void appendProbeColumns(const string& xyce_prn, FILE* out, size_t n_probes,
+                        unsigned long& global_index, bool skip_first_point)
+{
+    if (!out || n_probes == 0) return;
+    FILE* f = fopen(xyce_prn.c_str(), "r");
+    if (!f) return;
+    char line[4096];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return; }  // header
+    const size_t ncol = 5 + n_probes;      // index,time,V(p),V(nx),I(Vmeas),probes...
+    std::vector<double> v(ncol);
+    bool first = true;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "End", 3) == 0) break;
+        istringstream iss(line);
+        size_t got = 0;
+        for (; got < ncol; ++got) { if (!(iss >> v[got])) break; }
+        if (got < ncol) continue;          // malformed / short row
+        if (first && skip_first_point) { first = false; continue; }
+        first = false;
+        fprintf(out, "%-10lu %-17.8e", global_index++, v[1]);   // index, time
+        for (size_t k = 0; k < n_probes; ++k) fprintf(out, " %-17.8e", v[5 + k]);
+        fprintf(out, "\n");
+    }
+    fclose(f);
+    fflush(out);
+}
+
 bool LoadConfig(const string& filename)
 {
     ifstream in(filename);
@@ -270,9 +322,20 @@ void MasterProcess()
     fprintf(file_WR_error, "   Time, WR_TotalRelErr, N_iterations, Converged \n");
     fflush(file_WR_error);
 
+    // Optional user-probe output: one column per probe token (see LoadProbes/g_probes).
+    FILE* file_Probes = nullptr;
+    if (!g_probes.empty()) {
+        file_Probes = fopen("Probes_solution.prn", "w");
+        fprintf(file_Probes, "Index       TIME");
+        for (const string& pr : g_probes) fprintf(file_Probes, "              %s", pr.c_str());
+        fprintf(file_Probes, "\n");
+        fflush(file_Probes);
+    }
+
     unsigned long global_field_index = 0;
     unsigned long global_field_waveform_index = 0;
     unsigned long global_circuit_index = 0;
+    unsigned long global_probe_index = 0;
 
     // All tunable parameters come from g_cfg (loaded from sim_config.txt; see SimConfig).
     // The impedance values (L_ROM, R_ROM) are a reduced-order model of the field domain used
@@ -458,6 +521,11 @@ void MasterProcess()
             const bool skip_first_point = (step_field > 1);
             appendCircuitWaveformXyceStyle(file_Circuit, circuit_sol, 0.0, global_circuit_index, skip_first_point);
 
+            // user probes: copy the extra .print columns of the converged Xyce solve for this window
+            if (file_Probes)
+                appendProbeColumns("wr_circuit.cir.prn", file_Probes, g_probes.size(),
+                                   global_probe_index, skip_first_point);
+
             // auch die Feld-WAVEFORMS (also nicht nur Endpunkte) speichern wir im Xyce Format ab
             // dafür lesen wir die konvergierten Waveforms ein (letzte Iteration)
             Waveform vf_conv = readPWLFile("vf_prev_k.pwl"); // port voltage V(p) from Xyce (coupling grid)
@@ -509,6 +577,7 @@ void MasterProcess()
     fclose(file_Field);
     fclose(file_WR_error);
     fclose(file_Field_waveform);
+    if (file_Probes) { fprintf(file_Probes, "End\n"); fclose(file_Probes); }
 
 }
 
@@ -1010,6 +1079,27 @@ static void emitCustomTopology(ofstream& out)
             const char dev = (type == "VPULSE") ? 'V' : 'I';
             out << dev << tok[1] << " " << tok[2] << " " << tok[3] << " PULSE("
                 << tok[4] << " " << tok[5] << " " << tok[6] << " " << tok[7] << " 0 1e30 1e30)\n";
+        } else if (type == "VPWM" || type == "IPWM") {
+            // Repeating PWM pulse train: <name> <a> <b> v1 v2 freq duty.
+            // Emitted as a periodic Xyce PULSE: high (v2) for duty*period each period.
+            need(8);
+            const char dev = (type == "VPWM") ? 'V' : 'I';
+            double freq = std::strtod(tok[6].c_str(), nullptr);
+            double duty = std::strtod(tok[7].c_str(), nullptr);
+            if (!(freq > 0.0))
+                throw runtime_error("emitCustomTopology: circuit_spec.txt line " + to_string(lineno)
+                                    + " (" + type + "): PWM freq must be > 0.");
+            if (duty < 0.0) duty = 0.0;
+            if (duty > 1.0) duty = 1.0;
+            const double per  = 1.0 / freq;
+            const double edge = per * 1e-3;          // small but nonzero rise/fall
+            double pw = duty * per;                   // high (v2) width
+            if (pw < edge)       pw = edge;           // keep 0 < pw < per for Xyce
+            if (pw > per - edge) pw = per - edge;
+            std::ostringstream ss; ss.setf(std::ios::scientific); ss.precision(9);
+            ss << dev << tok[1] << " " << tok[2] << " " << tok[3] << " PULSE("
+               << tok[4] << " " << tok[5] << " 0 " << edge << " " << edge << " " << pw << " " << per << ")";
+            out << ss.str() << "\n";
         } else if (type == "VPWL" || type == "IPWL") {
             // Piecewise-linear (multi-step) source: <name> <a> <b> t1 v1 t2 v2 ... (>=1 pair).
             need(6);
@@ -1071,6 +1161,8 @@ static void emitCustomTopology(ofstream& out)
 // geschrieben (konfig-konstant). Die WR-Schnittstelle (Vmeas/Bfield) ist fix und unveraendert.
 void WriteCircuitNetlist(const string& filename)
 {
+    LoadProbes("probes.txt");   // populate g_probes for the .print line (both `emit` and solve paths)
+
     ofstream out(filename);
     if (!out) {
         throw runtime_error("WriteCircuitNetlist: could not open " + filename);
@@ -1178,7 +1270,9 @@ void WriteCircuitNetlist(const string& filename)
     }
 
     out << ".INCLUDE restart.inc\n";
-    out << ".print tran V(p) V(nx) I(Vmeas)\n";
+    out << ".print tran V(p) V(nx) I(Vmeas)";
+    for (const string& pr : g_probes) out << " " << pr;    // user probes -> extra trailing columns
+    out << "\n";
     out << ".end\n";
 }
 

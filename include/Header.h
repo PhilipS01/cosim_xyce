@@ -3,6 +3,7 @@
 
 
 #include <string>
+#include <vector>
 #include <time.h>
 #include <stdio.h>
 #include <math.h>
@@ -10,7 +11,7 @@
 #include <cstdlib>
 #include <cassert>
 #include <cstring>
-using namespace std; 
+using namespace std;
 
 #define PRINT( X )   cout<< #X << " =  " << X << flush <<  endl
 
@@ -125,6 +126,17 @@ extern SimConfig g_cfg;
 // Parse key=value lines (also accepts "key value"); '#' starts a comment; unknown keys
 // are ignored; missing file leaves all defaults. Returns true if the file was opened.
 bool LoadConfig(const string& filename);
+
+// User-requested output probes: fully-resolved Xyce print tokens like "V(a)" or "I(Rr1)".
+// Populated by LoadProbes() from probes.txt (one token per line; '#'/blank ignored). Appended
+// to the netlist's ".print tran" and captured per converged window into Probes_solution.prn.
+extern std::vector<std::string> g_probes;
+void LoadProbes(const string& filename);
+
+// Append the probe columns (everything after V(p) V(nx) I(Vmeas)) of a Xyce .prn to the probe
+// output file, prefixed by a running index + time. n_probes = g_probes.size().
+void appendProbeColumns(const string& xyce_prn, FILE* out, size_t n_probes,
+                        unsigned long& global_index, bool skip_first_point);
 
 
 void MasterProcess();
