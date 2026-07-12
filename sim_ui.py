@@ -2468,9 +2468,9 @@ INDEX_HTML = """<!doctype html>
         <span id="sw_vlines_val" class="sub2" style="font-family:ui-monospace,monospace;white-space:nowrap"></span>
       </div>
       <div class="btns" style="margin-top:10px;align-items:center;gap:10px">
-        <span class="mini" id="sweepCsvStatus"></span>
         <input type="text" id="sweepCsvPath" class="pathin" placeholder="sweep.csv" value="sweep.csv" spellcheck="false">
         <button class="small" onclick="exportSweep()">Export sweep<span class="help" data-help="sweep_export">?</span></button>
+        <span class="mini" id="sweepCsvStatus"></span>
       </div>
     </div>
     <div id="sweepTable" style="margin-top:16px"></div>
