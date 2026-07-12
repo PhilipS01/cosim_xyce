@@ -21,6 +21,7 @@ import csv
 import io
 import itertools
 import json
+import math
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -186,6 +187,16 @@ HELP = {
         "(all CPU cores). Capped to the number of points.</div>"
         "<div class='hn'>Speeds up multi-point sweeps roughly linearly until you saturate cores or "
         "memory. Set to <code>1</code> for a serial run (lowest memory / easiest to read logs).</div>"
+    ),
+    "sweep_vlines": (
+        "<div class='hh'>Reference lines</div>"
+        "<div class='hn'>Comma-separated values drawn as dashed vertical lines on the sweep plots "
+        "(handy for marking a crossover). Each entry is arithmetic over the current config "
+        "parameters &mdash; e.g. <code>R_series+L_series</code>, <code>R_ROM</code>, or a plain number "
+        "like <code>0.01</code>.</div>"
+        "<div class='hn'>Positioned where the x-axis parameter equals the value (interpolated); entries "
+        "outside the swept range are skipped. On the WR-iterations heatmap and line plots the line marks "
+        "that x-location; on grid heatmaps it's drawn on the first (x) parameter axis.</div>"
     ),
     "lcapy_export": (
         "<div class='hh'>LaTeX / PDF export</div>"
@@ -1094,6 +1105,60 @@ def sweep_values(lo, hi, steps, scale, kind):
     return [float(v) for v in vals]
 
 
+def _all_config_numeric():
+    """Every numeric key=value in sim_config.txt (not just UI-known keys), so
+    reference-line expressions can name any config parameter."""
+    d = {}
+    path = os.path.join(HERE, "sim_config.txt")
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                s = line.split("#", 1)[0].strip()
+                if "=" not in s:
+                    continue
+                k, v = (x.strip() for x in s.split("=", 1))
+                try:
+                    d[k] = float(v)
+                except ValueError:
+                    pass
+    return d
+
+
+def eval_vlines(exprs, params):
+    """Turn reference-line expressions into [(value, label), ...].
+
+    Each expression is evaluated as arithmetic over the current parameter values
+    (config keys like R_series, L_series, R_ROM used as variables) plus a few math
+    helpers. Non-numeric / failing expressions are skipped. `exprs` may be a list
+    or a comma/newline separated string. The original text becomes the line label."""
+    if not exprs:
+        return []
+    if isinstance(exprs, str):
+        exprs = re.split(r"[,\n]", exprs)
+    env = {"__builtins__": {}}
+    # All numeric keys from sim_config.txt (incl. ones not in the UI form, e.g.
+    # R_series/L_series), then override with the live params sent by the client.
+    src = dict(_all_config_numeric())
+    src.update(params or {})
+    for k, v in src.items():
+        try:
+            env[k] = float(v)
+        except (TypeError, ValueError):
+            pass
+    env.update(abs=abs, min=min, max=max, sqrt=math.sqrt, pi=math.pi)
+    out = []
+    for raw in exprs:
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            val = float(eval(s, env))       # arithmetic only: builtins stripped
+        except Exception:
+            continue
+        out.append((val, s))
+    return out
+
+
 def build_sweep_points(specs, mode):
     """Turn a list of per-parameter sweep specs into (keys, points).
 
@@ -1203,27 +1268,28 @@ def run_sweep(base_params, keys, points, workers=None):
     return rows
 
 
-def make_sweep_plots(keys, rows, mode="single", free_keys=None):
+def make_sweep_plots(keys, rows, mode="single", free_keys=None, vlines=None):
     """Convergence-study figure. Dispatches on the sweep shape:
       single / parallel -> 2x2 metric-vs-parameter line plots.
       grid              -> 2x2 metric heatmaps over the two swept parameters.
-    `keys` may be a single string (legacy) or a list of parameter names."""
+    `keys` may be a single string (legacy) or a list of parameter names.
+    `vlines` = list of (value, label) reference lines drawn on the x-axis."""
     if isinstance(keys, str):
         keys = [keys]
     # Dimensionality is set by the INDEPENDENT (free) parameters; percentage-linked
     # ones track a base and add no axis.
     dims = list(free_keys) if free_keys else list(keys)
     if mode == "grid" and len(dims) == 2:
-        out = _make_grid_plots(dims[0], dims[1], rows)
+        out = _make_grid_plots(dims[0], dims[1], rows, vlines)
     elif mode == "grid" and len(dims) > 2:
-        out = _make_index_plots(dims, rows)   # >2D: heatmap not meaningful
+        out = _make_index_plots(dims, rows, vlines)   # >2D: heatmap not meaningful
     else:
-        out = _make_line_plots(keys, rows, mode)
-    out.update(_make_iters_heatmap(dims, rows, mode))  # WR-iterations-per-window colormap
+        out = _make_line_plots(keys, rows, mode, vlines)
+    out.update(_make_iters_heatmap(dims, rows, mode, vlines))  # WR-iterations-per-window colormap
     return out
 
 
-def _make_line_plots(keys, rows, mode):
+def _make_line_plots(keys, rows, mode, vlines=None):
     """2x2 metric-vs-swept-parameter figure (single or parallel/lock-step)."""
     key = keys[0]
     ok = [r for r in rows if r.get("ok")]
@@ -1282,12 +1348,14 @@ def _make_line_plots(keys, rows, mode):
     a2.tick_params(axis="y", labelcolor="tab:gray")
     ax.set_title("Final interface values"); setx(ax)
 
+    for ax in axes.flat:   # x-axis is the parameter value -> value is a data coordinate
+        _draw_vlines(ax, vlines, data_x=True)
     fig.suptitle(f"Convergence study: sweep of {title_label}", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     return {"sweep": _png(fig)}
 
 
-def _make_grid_plots(kx, ky, rows):
+def _make_grid_plots(kx, ky, rows, vlines=None):
     """2x2 heatmaps of key metrics over a 2-parameter grid (all combinations)."""
     ok = [r for r in rows if r.get("ok")]
     if not ok:
@@ -1336,19 +1404,22 @@ def _make_grid_plots(kx, ky, rows):
         fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04)
         ax.set_title(title, fontsize=10)
         ax.set_xlabel(lx); ax.set_ylabel(ly)
+        _draw_vlines(ax, vlines, data_x=True)   # x-axis is kx in real units
 
     fig.suptitle(f"Grid sweep: {LABELS.get(kx, kx)}  x  {LABELS.get(ky, ky)}", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     return {"sweep": _png(fig)}
 
 
-def _make_index_plots(keys, rows):
+def _make_index_plots(keys, rows, vlines=None):
     """Fallback for a >2-parameter grid: metrics vs flat run index (a heatmap
     needs 2 axes). The table carries the full parameter tuple per run."""
     ok = [r for r in rows if r.get("ok")]
     if not ok:
         return {}
     x = np.arange(len(ok), dtype=float)
+    # x is run index -> map a reference value via the first swept param's per-run values
+    colvals = [r["vals"][keys[0]] for r in ok] if keys else None
 
     def col(name):
         return np.array([r.get(name, np.nan) for r in ok], dtype=float)
@@ -1374,13 +1445,26 @@ def _make_index_plots(keys, rows):
 
     for ax in axes.flat:
         ax.set_xlabel("run index")
+        _draw_vlines(ax, vlines, colvals=colvals)
     combo = " x ".join(LABELS.get(k, k) for k in keys)
     fig.suptitle(f"Grid sweep: {combo}  ({len(ok)} runs) -- see table for parameter tuples", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     return {"sweep": _png(fig)}
 
 
-def _make_iters_heatmap(dims, rows, mode):
+def _xpos_for_value(colvals, value):
+    """Map a parameter value to a fractional column position (centres at k+0.5),
+    by interpolating against the per-column parameter values. None if out of range."""
+    xp = np.asarray(colvals, dtype=float)
+    centers = np.arange(len(xp)) + 0.5
+    order = np.argsort(xp)
+    xs, cs = xp[order], centers[order]
+    if not (xs.min() <= value <= xs.max()):
+        return None
+    return float(np.interp(value, xs, cs))
+
+
+def _make_iters_heatmap(dims, rows, mode, vlines=None):
     """Colormap of WR iterations per window: y = window index, x = swept point
     (one column per run), colour = iterations that window took to converge.
     Reveals which windows are hard and how difficulty shifts with the parameter."""
@@ -1410,15 +1494,44 @@ def _make_iters_heatmap(dims, rows, mode):
                         cmap="viridis", vmin=1, vmax=max(2, vmax), shading="flat")
     cbar = fig.colorbar(pcm, ax=ax)
     cbar.set_label("WR iterations")
-    ax.set_xticks(np.arange(ncol) + 0.5)
-    ax.set_xticklabels(xlabels, rotation=45 if (one and ncol > 6) else 0,
-                       ha="right" if (one and ncol > 6) else "center", fontsize=9)
+    # Thin ticks to at most ~15 so dense sweeps stay readable.
+    MAXTICKS = 15
+    step = max(1, int(np.ceil(ncol / MAXTICKS)))
+    tick_idx = list(range(0, ncol, step))
+    dense = one and len(tick_idx) > 6
+    ax.set_xticks([i + 0.5 for i in tick_idx])
+    ax.set_xticklabels([xlabels[i] for i in tick_idx],
+                       rotation=45 if dense else 0,
+                       ha="right" if dense else "center", fontsize=9)
+    # Optional user reference lines (drawn where the x-axis parameter hits the value).
+    colvals = [r["vals"][dims[0]] for r in ok] if dims else None
+    _draw_vlines(ax, vlines, colvals=colvals)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("window")
     ax.invert_yaxis()   # window 1 at top, time flowing downward
     ax.set_title("WR iterations per window", fontsize=12)
     fig.tight_layout()
     return {"iters": _png(fig)}
+
+
+def _draw_vlines(ax, vlines, colvals=None, data_x=False):
+    """Draw user reference lines. If data_x, `value` is an x-data coordinate
+    (axis already in parameter units); otherwise interpolate to a column position
+    using per-column `colvals`. `vlines` = list of (value, label)."""
+    if not vlines:
+        return
+    for value, label in vlines:
+        if data_x:
+            xpos = value
+        else:
+            if not colvals:
+                continue
+            xpos = _xpos_for_value(colvals, value)
+            if xpos is None:
+                continue
+        ax.axvline(xpos, color="#e63946", lw=1.6, ls="--", zorder=5)
+        ax.text(xpos, 1.005, label, transform=ax.get_xaxis_transform(),
+                color="#e63946", fontsize=8, rotation=90, va="bottom", ha="center")
 
 
 def sweep_table(keys, rows):
@@ -1751,6 +1864,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(keylist) != len(set(keylist)):
                 raise ValueError("each swept parameter must be distinct")
             keys, points, free_keys = build_sweep_points(specs, mode)
+            vlines = eval_vlines(body.get("vlines"), base)
             workers = int(body.get("workers") or 0) or None
             workers_used = max(1, min(workers or (os.cpu_count() or 1), len(points) or 1))
             t0 = time.perf_counter()
@@ -1766,7 +1880,7 @@ class Handler(BaseHTTPRequestHandler):
                 "n_ok": n_ok,
                 "workers": workers_used,
                 "sweep_seconds": total,
-                "plots": make_sweep_plots(keys, rows, mode, free_keys),
+                "plots": make_sweep_plots(keys, rows, mode, free_keys, vlines),
                 "table": sweep_table(keys, rows),
             }))
         except Exception as e:
@@ -2152,6 +2266,12 @@ INDEX_HTML = """<!doctype html>
             <span class="help" data-help="sweep_jobs">?</span></label>
           <input type="number" id="sw_jobs" min="1" step="1" value="0" placeholder="auto"
                  style="width:70px" title="Parallel solver processes (0 = auto / all cores)">
+        </div>
+        <div class="btns" style="margin-top:12px;align-items:center;gap:10px">
+          <label for="sw_vlines" style="color:var(--muted);font-size:11px;white-space:nowrap">Reference line(s)
+            <span class="help" data-help="sweep_vlines">?</span></label>
+          <input type="text" id="sw_vlines" spellcheck="false" placeholder="e.g. R_series+L_series, 0.01"
+                 style="flex:1;min-width:200px;font-family:ui-monospace,monospace">
         </div>
         <div id="sweepStatus" class="sub2" style="margin-top:10px"></div>
         <div class="note" id="sweepNote"></div>
@@ -2554,9 +2674,10 @@ async function runSweep(){
   }
   const label = keys.join((mode === 'grid' && keys.length > 1) ? ' x ' : ' + ');
   const jobs = parseInt(document.getElementById('sw_jobs').value, 10) || 0;
+  const vlines = (document.getElementById('sw_vlines').value || '').trim();
   setSweepStatus('Running sweep of '+label+'...', '');
   try {
-    const payload = { params: collect(), mode: mode, specs: specs, workers: jobs };
+    const payload = { params: collect(), mode: mode, specs: specs, workers: jobs, vlines: vlines };
     const res = await fetch('/sweep', {method:'POST', headers:{'Content-Type':'application/json'},
                                        body: JSON.stringify(payload)});
     const j = await res.json();
