@@ -34,8 +34,7 @@ python3 sim_ui.py sweep --param L_FEM --min 1e-7 --max 1e-5 --steps 8 --scale lo
 
 ## What it does
 
-1. You set parameters in the left panel, author the circuit, and click
-   **Run simulation**.
+1. You set properties, author the circuit, and click **Run simulation**.
 2. The backend writes `sim_config.txt`, `circuit_spec.txt`, `probes.txt`, runs
    `./main`, parses the `.prn` outputs, and renders three plots server-side as
    PNGs (fully offline — no internet/CDN needed):
@@ -77,7 +76,7 @@ The fixed WR interface (`Vmeas`, the matched-secant `Bfield` source, and the PWL
 feedback files `vf_prev_k.pwl` / `i_prev_k.pwl`) is appended automatically after
 the user circuit.
 
-## Parameters (left panel → `sim_config.txt`)
+## Parameters (Properties section → `sim_config.txt`)
 
 | Key | Meaning |
 |-----|---------|
@@ -92,7 +91,7 @@ the user circuit.
 | `WRmaxSteps`, `WR_tolerance` | WR iteration cap and tolerance |
 | `wr_convergence_method` | `0` = waveform-L1 of the field current, `1` = terminal-scalar metric |
 | `coupling_mode` | `0` = voltage-driven (circuit sets `V(p)`, field returns `I`), `1` = current-driven (circuit sets `I(Vmeas)`, field returns `V_field`) |
-| `reconstruct_mode` | field reconstruction within a window: `0` pointwise (secant), `1` linear ramp, `2` average (linear+const), `3` pointwise (central diff) |
+| `reconstruct_mode` | field reconstruction within a window: `0` pointwise (secant), `1` linear ramp |
 | `interface_form` | WR interface stamping: `0` = Thevenin (V source), `1` = Norton (I source) — algebraic duals, same terminal fixpoint |
 | `use_t_floor` | `1` = guard the window-start `1/0` in `Z` with `t_floor`, `0` = bare `dt` (test) |
 | `t_floor_frac` | `t_floor = t_floor_frac · t_window` (window-scaled secant-denominator floor) |
@@ -154,8 +153,8 @@ unknown keys ignored; missing keys keep defaults). Run the solver directly:
   coupling strengthens (vs the trivial one-way `R=L=0` ~2-iteration case).
 - **ROM/field mismatch** — set `L_FEM`/`R_FEM` ≠ `L_ROM`/`R_ROM` and watch the WR
   error grow and the iteration count rise (the ROM no longer matches the field).
-- **Coupling direction** — flip `coupling_mode`; current-driven suits
-  current-source circuits (no window-start `V(p)` spike).
+- **Coupling direction** — flip `coupling_mode`; current-driven suits voltage-source-like
+  ROMs.
 - **Field reconstruction** — raise `N_field_eval_intervals` above `1` and change
   `reconstruct_mode` to alter the field-current waveform and cost.
 - **Saturation** — `nonlin_model=1`, then sweep `I_sat` (log) down toward the
@@ -165,3 +164,5 @@ unknown keys ignored; missing keys keep defaults). Run the solver directly:
   terminal fixpoint, different interior `V(p)` waveform and timestepping).
 - Lower `WR_tolerance` → more WR iterations per window; toggle
   `wr_convergence_method` between waveform-L1 and terminal-scalar and compare.
+- **t_floor** – guards the window-start impedance by limiting the secant denominator. Find a sweet-spot. Choice is problem-dependant (source frequency, impedances of field/circuit, etc.)
+- and many more dependencies

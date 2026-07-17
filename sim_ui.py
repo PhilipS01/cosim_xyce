@@ -63,8 +63,7 @@ PARAMS = [
     ("coupling_mode",                   "Coupling direction",           0,        "choice",
         {0: "voltage-driven", 1: "current-driven"}),
     ("reconstruct_mode",                "Field reconstruction",         0,        "choice",
-        {0: "pointwise (secant)", 1: "linear ramp", 2: "average (linear+const)",
-         3: "pointwise (central diff)"}),
+        {0: "pointwise (secant)", 1: "linear ramp"}),
     ("interface_form",                  "Interface stamping",           0,        "choice",
         {0: "Thevenin (V source)", 1: "Norton (I source)"}),
     ("use_t_floor",                     "Secant t_floor",               1,        "choice",
@@ -125,10 +124,12 @@ PRESETS = {
 # matches the current control values (OR-of-ANDs). Keys absent here are always visible. The circuit
 # side is always the custom node-graph spec (circuit_spec.txt); the run is absolute-end-time only
 # ("Sim duration" = t_end). What remains conditional: N_field_eval_intervals only matters for the
-# pointwise reconstruction modes (0=secant, 3=central diff) -- linear/average force 1 solve/window
-# and ignore it -- so it's shown only then.
+# pointwise-secant reconstruction (0) -- linear (1) forces 1 solve/window and ignores it -- so it's
+# shown only then. t_floor_frac only matters when the secant t_floor guard is on (use_t_floor=1);
+# with bare dt (0) the floor is irrelevant.
 VISIBLE_WHEN = {
-    "N_field_eval_intervals": [{"reconstruct_mode": [0, 3]}],
+    "N_field_eval_intervals": [{"reconstruct_mode": [0]}],
+    "t_floor_frac":           [{"use_t_floor": [1]}],
 }
 
 
@@ -217,6 +218,14 @@ HELP = {
         "<code>elkjs</code> (<code>npm install</code>) for the layout and <code>pdflatex</code>+"
         "<code>circuitikz</code> for the PDF; without pdflatex you still get the <code>.tex</code>.</div>"
     ),
+    "window_width": (
+        "<div class='hh'>WR window width</div>"
+        "<div class='hn'>Width of one waveform-relaxation time window (s). <b>Derived</b>, not a config "
+        "key: <code>width = t_end / N_field_windows</code>. Two-way linked &mdash; edit the width and the "
+        "window count is set to <code>round(t_end / width)</code> (&ge;1), then the width snaps to the true "
+        "<code>t_end / N</code> (it may not divide evenly). Narrower windows = more windows = more "
+        "checkpoint/restart seams but easier per-window WR convergence.</div>"
+    ),
     "reconstruct_mode": (
         "<div class='hh'>Field reconstruction</div>"
         "<div class='hn'>How the dummy field reconstructs its output waveform within a window &mdash; the "
@@ -227,19 +236,14 @@ HELP = {
         "<td>N_field_eval</td><td>curve-following; matches the Xyce Bfield secant exactly</td></tr>"
         "<tr><td>linear ramp</td><td>straight line carried-start &rarr; window-end</td>"
         "<td><b>1</b></td><td>cheapest; pure coupling reconstruction</td></tr>"
-        "<tr><td>average</td><td>line, start = &frac12;(carried + end)</td>"
-        "<td><b>1</b></td><td>linear + window-start damping (colleague)</td></tr>"
-        "<tr><td>pointwise (central)</td><td>local finite diff: central (current-driven V) / "
-        "BDF1 (voltage-driven I)</td>"
-        "<td>N_field_eval</td><td>lowest raw RMS, but the derivative is a dummy artifact</td></tr>"
         "</table>"
         "<div class='hn'><b>pointwise (secant)</b> with <code>FEM eval intervals / window = 1</code> "
         "collapses to <b>linear ramp</b>: one interval leaves only the carried start and the window end, "
         "so the accumulated secant is a single straight segment. Raise the eval intervals for it to actually "
         "follow the curve.</div>"
-        "<div class='hn'>Both coupling directions. All modes carry the seam (C0-continuous). Accuracy is "
-        "within ~1&ndash;2% across modes; the extra solves buy little. Recommend <b>linear</b> / "
-        "<b>average</b> (1 field solve per window).</div>"
+        "<div class='hn'>Both coupling directions. Both modes carry the seam (C0-continuous). Accuracy is "
+        "within ~1&ndash;2% between them; the extra solves buy little. Recommend <b>linear</b> "
+        "(1 field solve per window).</div>"
     ),
     "interface_form": (
         "<div class='hh'>Interface stamping (Thevenin vs Norton)</div>"
@@ -2009,16 +2013,21 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # Frontend
 # ---------------------------------------------------------------------------
-# Properties layout: explicit rows (each an equal-column grid). The run is absolute-end-time only
-# ("Sim duration" = t_end). Params not placed in a row but still consumed by the config
-# (N_field_windows, I_sat) are emitted as hidden inputs so presets/reset/collect keep working.
-_PROP_ROWS = [
-    ["coupling_mode", "reconstruct_mode", "N_field_eval_intervals", "N_xyce_samples"],
-    ["t_end", "wr_convergence_method", "WRmaxSteps", "WR_tolerance", "interface_form"],
-    ["use_t_floor", "t_floor_frac", "seam_average"],
-    ["R_ROM", "L_ROM", "R_FEM", "L_FEM", "nonlin_model"],
+# Properties layout: controls are split into labeled groups to cut the "wall of inputs". Each group is a
+# collapsible <details class="fold"> whose body holds one or more equal-column rows (grid). The two common
+# groups start open; the rest start folded (open=False). The run is absolute-end-time only ("Sim duration"
+# = t_end). window_width is a UI-only derived control (not a config key): WR window width = t_end /
+# N_field_windows, two-way linked with N_field_windows via linkWindows() (not collected -- no data-key).
+#   group := (title, open_by_default, [rows]);  row := [control keys laid out equal-width]
+_PROP_GROUPS = [
+    ("Run & windows",      True,  [["t_end", "N_field_windows", "__arrow__", "window_width"]]),
+    ("Coupling",           True,  [["coupling_mode", "N_xyce_samples",
+                                    "reconstruct_mode", "N_field_eval_intervals"]]),
+    ("WR iteration",       False, [["wr_convergence_method", "WRmaxSteps", "WR_tolerance"]]),
+    ("Interface & secant", False, [["use_t_floor", "t_floor_frac", "interface_form", "seam_average"]]),
+    ("Field / ROM model",  False, [["R_ROM", "L_ROM", "R_FEM", "L_FEM", "nonlin_model"]]),
 ]
-_PROP_HIDDEN = ["N_field_windows", "I_sat"]  # config-only
+_PROP_HIDDEN = ["I_sat"]  # config-only (emitted as a hidden input so presets/reset/collect keep working)
 
 
 def _controls_html():
@@ -2028,6 +2037,19 @@ def _controls_html():
     spec = {k: (k, l, d, kind, s) for (k, l, d, kind, s) in PARAMS}
 
     def ctl(k):
+        # Decorative "linked" arrow between N_field_windows and window_width (not a control).
+        if k == "__arrow__":
+            return ('<div class="link-arrow" aria-hidden="true" '
+                    'title="linked: WR window width = t_end / N_field_windows">&harr;</div>')
+        # Synthetic UI-only control: WR window width (s), derived from t_end / N_field_windows and
+        # two-way linked with N_field_windows. No data-key -> not collected into the config.
+        if k == "window_width":
+            help_icon = '<span class="help" data-help="window_width">?</span>' if "window_width" in HELP else ''
+            inner = ('<input type="number" id="f_window_width" step="any" '
+                     'onchange="linkWindows(\'width\')">')
+            return ('<div class="ctl" id="ctl_window_width">'
+                    f'<label for="f_window_width">WR window width (s){help_icon}</label>'
+                    f'<div class="inputs">{inner}</div></div>')
         _k, label, default, kind, slider = spec[k]
         default = initial.get(k, default)
         help_icon = f'<span class="help" data-help="{k}">?</span>' if k in HELP else ''
@@ -2039,16 +2061,31 @@ def _controls_html():
             inner = f'<select id="f_{k}" data-key="{k}" class="choice">{opts}</select>'
         else:
             step = "any" if kind == "float" else "1"
+            # t_end / N_field_windows drive the linked window-width box live.
+            extra = ""
+            if k == "t_end":
+                extra = "; linkWindows('tend')"
+            elif k == "N_field_windows":
+                extra = "; linkWindows('N')"
             inner = (f'<input type="number" id="f_{k}" step="{step}" value="{default}" '
-                     f'data-key="{k}" oninput="syncFromBox(this)">')
+                     f'data-key="{k}" oninput="syncFromBox(this){extra}">')
         return (f'<div class="ctl" id="ctl_{k}"><label for="f_{k}">{label}{help_icon}</label>'
                 f'<div class="inputs">{inner}</div></div>')
 
-    out = []
-    for row in _PROP_ROWS:
+    def row_html(row):
         cells = "\n".join(ctl(k) for k in row)
-        out.append(f'<div class="prop-row" style="grid-template-columns:'
-                   f'repeat({len(row)},minmax(0,1fr))">\n{cells}\n</div>')
+        # arrow cell is a narrow auto column; real controls share the remaining width equally
+        cols = " ".join("auto" if k == "__arrow__" else "minmax(0,1fr)" for k in row)
+        return f'<div class="prop-row" style="grid-template-columns:{cols}">\n{cells}\n</div>'
+
+    out = []
+    for title, is_open, rows in _PROP_GROUPS:
+        body = "\n".join(row_html(r) for r in rows)
+        out.append(
+            f'<details class="fold propgrp"{" open" if is_open else ""}>'
+            f'<summary>{title.replace("&", "&amp;")}</summary>'
+            f'<div class="fold-body">\n{body}\n</div></details>'
+        )
     # config-only params: hidden number boxes (still collected + settable by presets/reset)
     hidden = "".join(
         f'<input type="number" id="f_{k}" value="{initial.get(k, spec[k][2])}" data-key="{k}" hidden>'
@@ -2123,9 +2160,15 @@ INDEX_HTML = """<!doctype html>
   .hd-tools button, .hd-tools input.pathin { flex-shrink:0; }
   #csvStatus { max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
-  /* properties: explicit equal-column rows (grid cols set inline per row) */
-  .prop-rows { display:flex; flex-direction:column; gap:18px; }
+  /* properties: labeled collapsible groups (details.fold), each body an equal-column row grid */
+  .prop-rows { display:flex; flex-direction:column; gap:10px; }
   .prop-row { display:grid; gap:16px 22px; align-items:start; }
+  .propgrp { margin-top:0; }                       /* group = details.fold */
+  .propgrp > .fold-body { display:flex; flex-direction:column; gap:16px; }
+  /* "linked" arrow between N_field_windows and WR window width; sits in a narrow auto column,
+     bottom-aligned with the input boxes (row is align-items:start) */
+  .link-arrow { align-self:end; display:flex; align-items:center; justify-content:center;
+                height:36px; color:var(--muted); font-size:19px; user-select:none; }
   /* the convergence-study sweep block still uses a plain auto-fill grid */
   .properties { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
                 gap:16px 22px; }
@@ -2533,6 +2576,7 @@ function applyPreset(name){
   }
   setStatus('Loaded: '+name, '');
   applyVisibility();
+  linkWindows('N');
   loadCircuit();
 }
 
@@ -2543,6 +2587,25 @@ function syncFromSlider(el){
 function syncFromBox(el){
   const sl = document.querySelector('.slider[data-key="'+el.dataset.key+'"]');
   if (sl) sl.value = el.value;
+}
+// WR window discretization: window width = t_end / N_field_windows, two-way linked.
+//   src 'width' -> derive N_field_windows = round(t_end/width) (>=1), then snap the width box to the
+//                  true t_end/N (width may not divide t_end evenly).
+//   src 'tend'/'N' (or init) -> just refresh the width box from the current t_end and N.
+function linkWindows(src){
+  const teEl=document.getElementById('f_t_end');
+  const nEl=document.getElementById('f_N_field_windows');
+  const wEl=document.getElementById('f_window_width');
+  if(!teEl||!nEl||!wEl) return;
+  const te=parseFloat(teEl.value);
+  if(src==='width'){
+    const w=parseFloat(wEl.value);
+    if(isFinite(te)&&te>0&&isFinite(w)&&w>0) nEl.value=Math.max(1, Math.round(te/w));
+  }
+  let n=Math.round(parseFloat(nEl.value));
+  if(!isFinite(n)||n<1) n=1;
+  nEl.value=n;                                  // keep the count integer/valid
+  if(isFinite(te)&&te>0) wEl.value=(te/n).toExponential(3);
 }
 function collect(){
   const p = {};
@@ -2564,6 +2627,7 @@ function resetDefaults(){
   }
   setStatus('Reset to defaults.', '');
   applyVisibility();
+  linkWindows('N');
 }
 function setStatus(msg, cls){
   const s = document.getElementById('status'); s.textContent = msg; s.className = cls;
@@ -3376,7 +3440,7 @@ window.addEventListener('load', ()=>{
   // Help hover is document-wide now (help icons live in both the controls and the circuit box).
   document.addEventListener('mouseover', e=>{ if(e.target.classList.contains('help')) helpShow(e.target); });
   document.addEventListener('mouseout',  e=>{ if(e.target.classList.contains('help')) helpHide(); });
-  buildLibrary(); applyVisibility(); loadCircuit();
+  buildLibrary(); applyVisibility(); linkWindows('N'); loadCircuit();
   // PWL editor: chips under the spec + modal SVG interaction wiring.
   pwlRenderButtons();
   addSweepParam('R_ROM'); updateSweepMode();   // seed one sweep-parameter row

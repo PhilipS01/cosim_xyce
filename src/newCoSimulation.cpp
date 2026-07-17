@@ -641,29 +641,23 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     };
 
     // Field-current reconstruction within the window (reconstruct_mode; symmetric to the current-driven
-    // field-voltage reconstruction). Every mode CARRIES the window start = I_win_start (previous window's
+    // field-voltage reconstruction). Both modes CARRY the window start = I_win_start (previous window's
     // end current) -> C0-continuous seam, no solve there.
     //   0 pointwise (secant, DEFAULT): I at each point via the accumulated window secant (matches Bfield).
     //   1 linear : straight ramp from the carried start to the window-end current (ONE solve/window).
-    //   2 average: like 1 but start = 0.5*(carried + end).
-    //   3 pointwise (local BDF1): each point references the previous one (a dummy-solver variant).
     Waveform current;
-    const unsigned mode = g_cfg.reconstruct_mode;
-    if (mode == 1 || mode == 2) {
-        const double I_end   = solve_I(V_eval.y[N - 1], I_win_start, t_win_end - t_win_start);
-        const double I_start = (mode == 2) ? 0.5 * (I_win_start + I_end) : I_win_start;
+    if (g_cfg.reconstruct_mode == 1) {
+        const double I_end = solve_I(V_eval.y[N - 1], I_win_start, t_win_end - t_win_start);
         for (size_t j = 0; j < N; ++j) {
             const double frac = (t_win_end > t_win_start)
                               ? (V_eval.t[j] - t_win_start) / (t_win_end - t_win_start) : 0.0;
-            current.push(V_eval.t[j], I_start + frac * (I_end - I_start));
+            current.push(V_eval.t[j], I_win_start + frac * (I_end - I_win_start));
         }
     } else {
-        const bool local = (mode == 3);
         current.push(t_win_start, I_win_start);            // window start = carried initial condition
         for (size_t j = 1; j < N; ++j) {
-            const double I_ref = local ? current.y[j - 1] : I_win_start;
-            const double dt    = local ? (V_eval.t[j] - V_eval.t[j - 1]) : (V_eval.t[j] - t_win_start);
-            current.push(V_eval.t[j], solve_I(V_eval.y[j], I_ref, dt));
+            const double dt = V_eval.t[j] - t_win_start;
+            current.push(V_eval.t[j], solve_I(V_eval.y[j], I_win_start, dt));
         }
     }
 
@@ -683,8 +677,7 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
 //   0 pointwise (default): V computed at every field-eval point from I(t) -- symmetric to the
 //      voltage-driven solver, needs only I0 (V_field_last_time unused); follows the current's curve.
 //   1 linear: replace the interior with a straight ramp from V_field_last_time (previous window end)
-//      to this window's end value (the colleague's 2-point reconstruction; uses V0).
-//   2 average: 0.5*(linear + const) -- window-start raised to 0.5*(V_field_last_time + V_end); uses V0.
+//      to this window's end value (the 2-point reconstruction; uses V0).
 void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_time,
                                         unsigned N_field_eval_intervals)
 {
@@ -712,10 +705,8 @@ void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_
 
     // The window START field voltage is the carried previous-window END value (V_field_last_time):
     // reused -> the seam is C0-continuous by construction AND no solve is spent there. reconstruct_mode:
-    //   1 linear / 2 average: ONE new evaluation (the window end), straight-line interior => 1 solve/window.
-    //   0 secant / 3 central: pointwise interior (N solves), start still carried for seam continuity.
-    // The window-end derivative uses a LOCAL backward difference on the FINE interface current (accurate,
-    // no window-secant drift; the fine current is the circuit's output, costs no FEM solve).
+    //   1 linear: ONE new evaluation (the window end), straight-line interior => 1 solve/window.
+    //   0 secant: pointwise interior (N solves), start still carried for seam continuity.
     const double I_end  = I_eval.y.back();
     const double dt_win = t_end - t_win_start;
     // Window-end field voltage via the accumulated window secant.
@@ -727,26 +718,17 @@ void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_
     const double V_start_win = V_field_last_time;
 
     Waveform vfield;
-    if (g_cfg.reconstruct_mode == 1 || g_cfg.reconstruct_mode == 2) {
-        // 1 solve/window: carried start (or its average with the end), straight line to the end.
-        const double V_start = (g_cfg.reconstruct_mode == 2)
-                               ? 0.5 * (V_start_win + V_end) : V_start_win;
+    if (g_cfg.reconstruct_mode == 1) {
+        // 1 solve/window: carried start, straight line to the end.
         for (size_t j = 0; j < N; ++j) {
             const double frac = (dt_win > 0.0) ? (I_eval.t[j] - t_win_start) / dt_win : 0.0;
-            vfield.push(I_eval.t[j], V_start + frac * (V_end - V_start));
+            vfield.push(I_eval.t[j], V_start_win + frac * (V_end - V_start_win));
         }
     } else {
-        // pointwise (0 secant / 3 central): start carried (reuse the seam), interior/end computed.
-        const bool use_central = (g_cfg.reconstruct_mode == 3);
+        // pointwise (0 secant): start carried (reuse the seam), interior/end computed.
         vfield.push(t_win_start, V_start_win);
         for (size_t j = 1; j < N; ++j) {
-            double dl_dt;
-            if (use_central) {
-                if (j + 1 == N) dl_dt = dlam(I_eval.y[j], I_eval.y[j - 1]) / (I_eval.t[j] - I_eval.t[j - 1]);
-                else            dl_dt = dlam(I_eval.y[j + 1], I_eval.y[j - 1]) / (I_eval.t[j + 1] - I_eval.t[j - 1]);
-            } else {
-                dl_dt = dlam(I_eval.y[j], I_win_start) / (I_eval.t[j] - t_win_start);
-            }
+            const double dl_dt = dlam(I_eval.y[j], I_win_start) / (I_eval.t[j] - t_win_start);
             vfield.push(I_eval.t[j], R_FEM * I_eval.y[j] + dl_dt);
         }
     }

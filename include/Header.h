@@ -61,12 +61,10 @@ struct SimConfig
     //   1 = current-driven: circuit sets I(Vmeas), field returns V_field; Bfield = plain V source.
     // Current-driven suits current-source circuits (no Lrom/t_floor secant -> no window-start spike).
     unsigned coupling_mode = 0;
-    // Field-voltage reconstruction within a window (current-driven mode). Every mode CARRIES the
+    // Field-voltage reconstruction within a window (current-driven mode). Both modes CARRY the
     // window start = the previous window's end V_field (reused -> C0-continuous seam, no solve there):
     //   0 = pointwise (default, secant): interior V from the accumulated secant (N field solves).
     //   1 = linear: straight ramp carried-start -> window-end value (ONE field solve / window).
-    //   2 = average: like 1 but start = 0.5*(carried + end) (ONE solve; colleague's blend).
-    //   3 = central-diff pointwise: interior V via local central difference (N solves; no window-start lag).
     // The window-end value uses the accumulated window secant (I_end - I0)/dt_win.
     unsigned reconstruct_mode = 0;
     // WR interface stamping (orthogonal to coupling_mode): how the field ROM's linearised V-I law
@@ -118,7 +116,7 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
 
 // Current-driven (Neumann) field solver: reads the interface current waveform I(t) from i_prev_k.pwl,
 // computes the field voltage V_field(t) = R_FEM*I + L_FEM*dI/dt (+ saturation) on the field-eval grid,
-// optionally blends linear+const (reconstruct_mode), and writes it to vf_prev_k.pwl for the circuit's
+// pointwise-secant or linear per reconstruct_mode, and writes it to vf_prev_k.pwl for the circuit's
 // Bfield voltage source. V_field_last_time = the field voltage carried from the previous window end.
 void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_time,
                                         unsigned N_field_eval_intervals);
