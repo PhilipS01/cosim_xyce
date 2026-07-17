@@ -35,56 +35,11 @@ struct SimConfig
     // field/ROM model mismatch that the WR iteration must resolve.
     unsigned nonlin_model = 0;
     double I_sat = 100.0;
-    // Circuit source on the hot node `s`. Selects the device WriteCircuitNetlist emits:
-    //   0 = sinusoidal VOLTAGE source  (Bemf s 0 V={amp*sin(2*pi*f*t)})  -- default / legacy
-    //   1 = sinusoidal CURRENT source  (Bemf 0 s I={amp*sin(2*pi*f*t)})
-    //   2 = step/ramp VOLTAGE source   (Vemf s 0 PULSE(v_init v_final delay rise ...))
-    unsigned source_kind = 0;
-    // Sinusoidal source (kinds 0,1): amplitude is Volts (kind 0) or Amps (kind 1).
-    double frequency = 50.0;
-    double amplitude = 1.0;
-    // Step/ramp voltage source (kind 2): initial/final level, onset delay, and ramp (rise) time.
-    double step_v_initial = 0.0;
-    double step_v_final   = 1.0;
-    double step_delay     = 0.0;
-    double step_rise      = 1.0e-4;
-    // Series R/L/C on the source->port path (only nonzero elements are emitted; all-zero => s==p).
-    // Rs = Ls = 0 reproduces the one-way toy (port voltage == source voltage).
-    double R_series = 0.0;
-    double L_series = 0.0;
-    double C_series = 0.0;
-
-    // --- Switch topologies (increment 2). circuit_kind selects the whole circuit side:
-    //   0 = simple source (source_kind + series R/L/C above) -- increment 1, default.
-    //   1 = #4 two-way switch, sine U, cap C: drive [0,t1) -> freewheel [t1,inf). (open = pre-t0 state)
-    //   2 = #5 two-way switch, DC U, cap C:   drive [0,t1) -> freewheel [t1,inf).
-    //   3 = #6 two-way switch, AC V_AC vs R:    AC-drive [0,t1) -> R-damp [t1,inf).
-    // The field/interface (Vmeas, Bfield) is unchanged; the switch side attaches at port p.
-    unsigned circuit_kind = 0;
-    // Switch realization: 0 = behavioral resistor R={IF(t..,Ron,Roff)}; 1 = native Xyce S + .MODEL SW.
-    unsigned switch_backend = 0;
-    // Fixed throw instant (absolute time): drive -> freewheel at t1.
-    double switch_t1 = 6.0e-3;
-    // Switch-circuit passives: C for #4/#5 (F), R for #6 (Ohm).
-    double switch_C = 1.0e-3;
-    double switch_R = 1.0e4;
-    // Closed / open switch resistances (behavioral gate levels and native SW model RON/ROFF).
-    double switch_Ron  = 1.0e-3;
-    double switch_Roff = 1.0e9;
-    // Switch transition (rise/fall) time. A finite ramp (not an instantaneous jump) is essential:
-    // an abrupt throw disconnects an ideal branch carrying inductive field current -> voltage kick
-    // -> Xyce dt-collapse at the switch instant. The gate ramps over switch_trise at each edge.
-    double switch_trise = 1.0e-5;
-    // Time stepping / run duration.
-    //   time_mode = 0 (source periods): duration = N_periods / frequency, N_steps_field =
-    //               N_field_steps_per_source_period * N_periods  (meaningful for sinusoidal sources).
-    //   time_mode = 1 (absolute end time): duration = t_end, N_steps_field = N_field_windows
-    //               (for step/switch/custom sources that have no "period").
-    unsigned time_mode = 0;
-    double   t_end = 2.0e-2;
+    // Run duration (absolute end time): the run spans [0, t_end], split into N_field_windows equal
+    // WR windows (dt_field = t_end / N_field_windows). The circuit side (source + passives + switches)
+    // is authored as a custom node-graph in circuit_spec.txt, not in this config.
+    double t_end = 2.0e-2;
     unsigned N_field_windows = 50;
-    unsigned N_periods = 1;
-    unsigned N_field_steps_per_source_period = 50;
     // Coupling-grid resolutions
     unsigned N_field_eval_intervals = 1;
     // How finely the Xyce solution is sampled: sets the .tran print cadence dt_print = t_window /
@@ -206,14 +161,14 @@ void appendFieldWaveformXyceStyle(FILE* file, const Waveform& vf, const Waveform
 
 void RunXyce(const string& filename);
 
-// Generates the full circuit netlist (wr_circuit.cir) from g_cfg: source (source_kind)
-// + series R/L/C chain source->port p + fixed WR interface (Vmeas, Bfield) + includes. Called
-// ONCE before the window loop (and in emit mode); the topology is window-invariant.
-// The per-window variable quantities stay in sim_params.inc/restart.inc. Written inline (no .INCLUDE
-// of the elements) so the UI netlist parser (does not follow .INCLUDEs) can draw the circuit.
+// Generates the full circuit netlist (wr_circuit.cir) from the custom node-graph in circuit_spec.txt
+// + the fixed WR interface (Vmeas, Bfield) + includes. Called ONCE before the window loop (and in
+// emit mode); the topology is window-invariant. The per-window variable quantities stay in
+// sim_params.inc/restart.inc. Written inline (no .INCLUDE of the elements) so the UI netlist parser
+// (does not follow .INCLUDEs) can draw the circuit.
 void WriteCircuitNetlist(const string& filename);
 
-void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double r_series, double l_series, const unsigned N_xyce_samples);
+void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, const unsigned N_xyce_samples);
 
 // Generates restart.inc (included by wr_circuit.cir): the window-specific
 // .OPTIONS RESTART and .tran line. Window 1 (first_window=true): fresh UIC transient

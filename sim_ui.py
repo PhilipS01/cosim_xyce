@@ -52,12 +52,8 @@ PARAMS = [
     ("nonlin_model",                    "FEM nonlinearity",             0,        "choice",
         {0: "linear", 1: "magnetic saturation"}),
     ("I_sat",                           "I_sat saturation current (A)", 100.0,    "float", None),
-    ("time_mode",                       "Run duration",                 0,        "choice",
-        {0: "source periods", 1: "absolute end time"}),
     ("t_end",                           "Sim duration (s)",             2.0e-2,   "float", None),
     ("N_field_windows",                 "Field windows (total)",        50,       "int",   (1, 400, 1)),
-    ("N_periods",                       "Number of source periods",     1,        "int",   (1, 10, 1)),
-    ("N_field_steps_per_source_period", "Field steps / source period",  50,       "int",   (2, 200, 1)),
     ("N_field_eval_intervals",          "FEM eval intervals / window",  1,        "int",   (1, 64, 1)),
     ("N_xyce_samples",                  "Xyce solution samples",        100,      "int",   (1, 400, 1)),
     ("WRmaxSteps",                      "WR max iterations",            20,       "int",   (1, 100, 1)),
@@ -92,14 +88,14 @@ SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
 # side is a simplified spec: reserved nodes p=port, 0=gnd; one element/line (VSIN/ISIN/VPULSE/R/L/C and
 # SW name a b tclose topen [Ron Roff trise]).
 PRESETS = {
-    "P1: Sine V + RL": {"time_mode": 0, "coupling_mode": 0,
+    "P1: Sine V + RL": {"coupling_mode": 0,
                         "circuit_spec": "VSIN Bemf s 0 1 50\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
     # Bare current source directly on the port: series R/L/C are meaningless for a current drive
     # (the current is forced regardless) and an ideal I-source in series with L is degenerate.
-    "P2: Sine I (bare)": {"time_mode": 0, "coupling_mode": 1,
+    "P2: Sine I (bare)": {"coupling_mode": 1,
                           "circuit_spec": "ISIN Bemf 0 p 1 50\n"},
     # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters (WRmaxSteps=40)
-    "P3: Step/ramp V + RL": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
+    "P3: Step/ramp V + RL": {"t_end": 2.0e-2, "N_field_windows": 50,
                              "coupling_mode": 0, "WRmaxSteps": 40,
                              "circuit_spec": "VPULSE Vemf s 0 0 1 0 1e-4\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
     # Switch circuits (SW = time-gated resistor, closed during [tclose, topen)). NOTE C/Ron/times are
@@ -107,15 +103,15 @@ PRESETS = {
     # damped closed switch Ron~10 or its ~undamped LC ring dt-collapses) -- tune to your field.
     # 2-way (SPDT) switch: wiper w throws between the source branch (node a) and a short branch (node b),
     # both rejoining at the port p; cap w->0. Freewheel path is w-b-short-p (electrically w->p; tiny R).
-    "P4: 2-way switch (sine U, C)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
+    "P4: 2-way switch (sine U, C)": {"t_end": 2.0e-2, "N_field_windows": 50,
         "coupling_mode": 0, "WRmaxSteps": 40,
         "circuit_spec": "VSIN Bemf a p 1 50\nC Csw w 0 1e-6\n"
                         "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w b 6e-3 1e30 10 1e9 1e-5\nR shrt b p 1e-6\n"},
-    "P5: 2-way switch (DC U, C)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
+    "P5: 2-way switch (DC U, C)": {"t_end": 2.0e-2, "N_field_windows": 50,
         "coupling_mode": 0, "WRmaxSteps": 40,
         "circuit_spec": "VDC Vemf a p 1\nC Csw w 0 1e-6\n"
                         "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w b 6e-3 1e30 10 1e9 1e-5\nR shrt b p 1e-6\n"},
-    "P6: 2-way switch (AC vs R)": {"time_mode": 1, "t_end": 2.0e-2, "N_field_windows": 50,
+    "P6: 2-way switch (AC vs R)": {"t_end": 2.0e-2, "N_field_windows": 50,
         "coupling_mode": 0, "WRmaxSteps": 40,
         "circuit_spec": "VSIN Bemf p bac 1 50\nR Rload p br 1e4\n"
                         "SW ac bac 0 0 6e-3 1e-3 1e9 1e-5\nSW rd br 0 6e-3 1e30 1e-3 1e9 1e-5\n"},
@@ -126,12 +122,11 @@ PRESETS = {
 # Running the solver
 # ---------------------------------------------------------------------------
 # Conditional visibility: key -> list of AND-condition dicts; a control is shown iff ANY dict fully
-# matches the current control values (OR-of-ANDs). Keys absent here are always visible. The custom
-# spec box + SVG editor are handled separately in JS (visible only when circuit_kind == 4).
-# The properties grid forces absolute-end-time mode (time_mode=1, injected in collect()); "Sim duration"
-# = t_end. So the old time_mode-conditional rules are gone. What remains: N_field_eval_intervals only
-# matters for the pointwise reconstruction modes (0=secant, 3=central diff) -- linear/average force 1
-# solve/window and ignore it -- so it's shown only then.
+# matches the current control values (OR-of-ANDs). Keys absent here are always visible. The circuit
+# side is always the custom node-graph spec (circuit_spec.txt); the run is absolute-end-time only
+# ("Sim duration" = t_end). What remains conditional: N_field_eval_intervals only matters for the
+# pointwise reconstruction modes (0=secant, 3=central diff) -- linear/average force 1 solve/window
+# and ignore it -- so it's shown only then.
 VISIBLE_WHEN = {
     "N_field_eval_intervals": [{"reconstruct_mode": [0, 3]}],
 }
@@ -318,57 +313,6 @@ HELP = {
         "absolute. Converges from iteration&nbsp;1. Only the terminal scalars &mdash; cheaper, ignores the "
         "waveform interior.</div>"
     ),
-    "circuit_kind": (
-        "<div class='hh'>Circuit topology</div>"
-        "<table>"
-        "<tr><th>kind</th><th>circuit (coil always sits between port p and gnd)</th></tr>"
-        "<tr><td>simple source</td><td>one source (sine V / sine I / step) + series R/L/C to the port</td></tr>"
-        "<tr><td>#4 2-way (sine U,C)</td><td>sine U + cap C. drive [0,t1): U charges C &amp; drives the "
-        "coil &rarr; freewheel [t1,&infin;): C &#8741; coil, U off (the open pre-t0 state isn't a throw)</td></tr>"
-        "<tr><td>#5 2-way (DC U,C)</td><td>DC U + cap C. drive [0,t1) &rarr; freewheel [t1,&infin;)</td></tr>"
-        "<tr><td>#6 2-way (AC vs R)</td><td>V_AC and R both at the port. AC-drive [0,t1): V_AC drives "
-        "the coil &rarr; R-damp [t1,&infin;): R &#8741; coil, source off</td></tr>"
-        "<tr><td>custom</td><td>free node-graph from the spec / drag-drop editor</td></tr>"
-        "</table>"
-    ),
-    "switch_backend": (
-        "<div class='hh'>Switch backend</div>"
-        "<div class='hn'>behavioral R: each throw is a resistor R=Roff+(Ron&minus;Roff)&middot;g(t), the "
-        "gate g a clamped trapezoid &mdash; no .MODEL, robust.<br>native S: Xyce voltage-controlled "
-        "switch S + .MODEL VSWITCH, gated by a PWL control. Same schedule; can be stiffer at throws.</div>"
-    ),
-    "switch_t1": (
-        "<div class='hh'>Switch throw time t1</div>"
-        "<div class='hn'>First throw instant. #4/#5: drive &rarr; freewheel at t1. #6: AC-drive &rarr; "
-        "R-damp at t1. Must fall inside the run (&lt; end time).</div>"
-    ),
-    "switch_C": (
-        "<div class='hh'>Switch capacitor C (#4/#5)</div>"
-        "<div class='hn'>Cap in the drive/freewheel branch (C &#8741; coil during freewheel). A large C "
-        "stresses WR convergence (reactive coupling) &mdash; keep it small (presets: 1&micro;F).</div>"
-    ),
-    "switch_R": (
-        "<div class='hh'>Switch resistor R (#6)</div>"
-        "<div class='hn'>The damping resistor the switch places in parallel with the coil during the "
-        "R-damp phase (presets: 10k&Omega;).</div>"
-    ),
-    "switch_Ron": (
-        "<div class='hh'>Closed-switch resistance Ron</div>"
-        "<div class='hn'><b>Gotcha:</b> the #4/#5 cap&harr;coil freewheel is a nearly-undamped LC loop; "
-        "with a tiny Ron it rings and the timestep collapses at the freewheel throw. Use Ron &ge; a few "
-        "&Omega; (presets: 10). #6 has no LC loop &rarr; Ron=1m&Omega; is fine.</div>"
-    ),
-    "switch_Roff": (
-        "<div class='hh'>Open-switch resistance Roff</div>"
-        "<div class='hn'>Resistance of an open throw (large, e.g. 1e9). Kept finite (not &infin;) so every "
-        "node retains a well-defined admittance.</div>"
-    ),
-    "switch_trise": (
-        "<div class='hh'>Switch transition time</div>"
-        "<div class='hn'><b>Essential:</b> a finite ramp of each throw. An instantaneous throw "
-        "disconnects an ideal branch carrying inductive coil current &rarr; voltage kick &rarr; "
-        "dt-collapse. The gate ramps over this time at each edge.</div>"
-    ),
 }
 
 
@@ -382,9 +326,8 @@ def write_config(params, workdir=HERE):
                 f.write(f"{k} = {int(round(float(v)))}\n")
             else:
                 f.write(f"{k} = {float(v):.10g}\n")
-        # The circuit side is always authored via the text spec (circuit_spec.txt), so force the
-        # custom node-graph path; source_kind / R_series / switch_* keep their C++ defaults (inert).
-        f.write("circuit_kind = 4\n")
+        # The circuit side is always authored via the text spec (circuit_spec.txt); the C++ generator
+        # reads circuit_spec.txt directly, so no circuit-kind/source keys are needed here.
     return path
 
 
@@ -436,7 +379,7 @@ def emit_netlist():
                    capture_output=True, text=True, timeout=60)
 
 
-# Example custom node-graph spec (circuit_kind=4). Reserved nodes: p (port), 0 (ground).
+# Example custom node-graph spec. Reserved nodes: p (port), 0 (ground).
 DEFAULT_SPEC = """\
 # Custom node-graph circuit. Reserved nodes: p = port (field attaches here), 0 = ground.
 # <TYPE> <name> <nodeA> <nodeB> <params...>
@@ -462,7 +405,7 @@ def read_spec():
 
 def write_spec(params, workdir=HERE):
     """Write the custom node-graph spec to circuit_spec.txt (only when non-empty), so the C++
-    generator reads it for circuit_kind=4. Ignored by the built-in kinds."""
+    generator reads it as the circuit side."""
     spec = params.get("circuit_spec")
     if spec:
         with open(os.path.join(workdir, "circuit_spec.txt"), "w") as f:
@@ -2066,18 +2009,16 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # Frontend
 # ---------------------------------------------------------------------------
-# Properties layout: explicit rows (each an equal-column grid). time_mode is NOT shown -- the grid is
-# absolute-end-time only ("Sim duration" = t_end) and collect() injects time_mode=1. Params not placed
-# in a row but still consumed by the config (N_field_windows, N_periods, I_sat) are emitted as hidden
-# inputs so presets/reset/collect keep working.
+# Properties layout: explicit rows (each an equal-column grid). The run is absolute-end-time only
+# ("Sim duration" = t_end). Params not placed in a row but still consumed by the config
+# (N_field_windows, I_sat) are emitted as hidden inputs so presets/reset/collect keep working.
 _PROP_ROWS = [
-    ["coupling_mode", "reconstruct_mode", "N_field_eval_intervals",
-     "N_field_steps_per_source_period", "N_xyce_samples"],
+    ["coupling_mode", "reconstruct_mode", "N_field_eval_intervals", "N_xyce_samples"],
     ["t_end", "wr_convergence_method", "WRmaxSteps", "WR_tolerance", "interface_form"],
     ["use_t_floor", "t_floor_frac", "seam_average"],
     ["R_ROM", "L_ROM", "R_FEM", "L_FEM", "nonlin_model"],
 ]
-_PROP_HIDDEN = ["N_field_windows", "N_periods", "I_sat"]  # config-only; time_mode injected in JS
+_PROP_HIDDEN = ["N_field_windows", "I_sat"]  # config-only
 
 
 def _controls_html():
@@ -2612,8 +2553,7 @@ function collect(){
     p[s.dataset.key] = parseFloat(s.value);
   });
   const ta = document.getElementById('f_circuit_spec');
-  if (ta) p['circuit_spec'] = ta.value;   // custom node-graph spec (circuit_kind=custom)
-  p['time_mode'] = 1;   // properties grid is absolute-end-time only ("Sim duration" = t_end)
+  if (ta) p['circuit_spec'] = ta.value;   // custom node-graph spec (authored circuit side)
   p['probes'] = probes.slice();           // user output probes -> probes.txt
   return p;
 }

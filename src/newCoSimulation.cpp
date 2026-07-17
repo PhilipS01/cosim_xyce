@@ -102,29 +102,8 @@ bool LoadConfig(const string& filename)
         else if (key == "R_FEM")                            g_cfg.R_FEM = val;
         else if (key == "nonlin_model")                     g_cfg.nonlin_model = (unsigned)val;
         else if (key == "I_sat")                            g_cfg.I_sat = val;
-        else if (key == "source_kind")                      g_cfg.source_kind = (unsigned)val;
-        else if (key == "frequency")                        g_cfg.frequency = val;
-        else if (key == "amplitude")                        g_cfg.amplitude = val;
-        else if (key == "step_v_initial")                   g_cfg.step_v_initial = val;
-        else if (key == "step_v_final")                     g_cfg.step_v_final = val;
-        else if (key == "step_delay")                       g_cfg.step_delay = val;
-        else if (key == "step_rise")                        g_cfg.step_rise = val;
-        else if (key == "R_series")                         g_cfg.R_series = val;
-        else if (key == "L_series")                         g_cfg.L_series = val;
-        else if (key == "C_series")                         g_cfg.C_series = val;
-        else if (key == "circuit_kind")                     g_cfg.circuit_kind = (unsigned)val;
-        else if (key == "switch_backend")                   g_cfg.switch_backend = (unsigned)val;
-        else if (key == "switch_t1")                        g_cfg.switch_t1 = val;
-        else if (key == "switch_C")                         g_cfg.switch_C = val;
-        else if (key == "switch_R")                         g_cfg.switch_R = val;
-        else if (key == "switch_Ron")                       g_cfg.switch_Ron = val;
-        else if (key == "switch_Roff")                      g_cfg.switch_Roff = val;
-        else if (key == "switch_trise")                     g_cfg.switch_trise = val;
-        else if (key == "time_mode")                        g_cfg.time_mode = (unsigned)val;
         else if (key == "t_end")                            g_cfg.t_end = val;
         else if (key == "N_field_windows")                  g_cfg.N_field_windows = (unsigned)val;
-        else if (key == "N_periods")                        g_cfg.N_periods = (unsigned)val;
-        else if (key == "N_field_steps_per_source_period")  g_cfg.N_field_steps_per_source_period = (unsigned)val;
         else if (key == "N_field_eval_intervals")           g_cfg.N_field_eval_intervals = (unsigned)val;
         else if (key == "N_xyce_samples")                   g_cfg.N_xyce_samples = (unsigned)val;
         else if (key == "N_xyce_coupling_intervals")        g_cfg.N_xyce_samples = (unsigned)val;  // back-compat alias -> sampling role
@@ -321,8 +300,8 @@ void MasterProcess()
 {
     cout << "Master process started" << endl;
 
-    // Generate the circuit netlist from g_cfg (topology is window-invariant -> once here).
-    // Overwrites wr_circuit.cir with source (source_kind) + series R/L/C chain + fixed
+    // Generate the circuit netlist (topology is window-invariant -> once here).
+    // Overwrites wr_circuit.cir with the custom node-graph (circuit_spec.txt) + the fixed
     // WR interface. Per-window variable parameters still come from sim_params.inc.
     WriteCircuitNetlist("wr_circuit.cir");
 
@@ -364,27 +343,12 @@ void MasterProcess()
     // inside the Xyce Bfield interface condition; they need not match the "true" FEM values.
     const double L_ROM = g_cfg.L_ROM;
     const double R_ROM = g_cfg.R_ROM;
-    // Circuit voltage source Bsrc: single source of truth for amplitude/frequency, written via
-    // WriteSimParams to sim_params.inc (f_src, amp_src) and referenced by the netlist Bsrc, so
-    // dVdt_0 below cannot drift from the netlist.
-    const double V_src_amplitude = g_cfg.amplitude;
-    const double Frequency = g_cfg.frequency;
 
-    // Time stepping (the circuit side is handled dynamically by Xyce). Duration per time_mode:
-    //   0 (source periods):  T = N_periods/f,  N_steps_field = N_fsp*N_periods (sinusoidal sources).
-    //   1 (absolute end):    T = t_end,        N_steps_field = N_field_windows (step/switch/custom).
-    const unsigned N_periods = g_cfg.N_periods;
-    const unsigned N_field_steps_per_source_period = g_cfg.N_field_steps_per_source_period;
-    unsigned N_steps_field;
-    double dt_field;
-    if (g_cfg.time_mode == 1) {
-        N_steps_field = (g_cfg.N_field_windows >= 1) ? g_cfg.N_field_windows : 1u;
-        if (g_cfg.t_end <= 0.0) throw runtime_error("MasterProcess: t_end must be > 0 in absolute time_mode.");
-        dt_field = g_cfg.t_end / N_steps_field;
-    } else {
-        N_steps_field = N_field_steps_per_source_period * N_periods;
-        dt_field = (1.0 / Frequency) / N_field_steps_per_source_period;
-    }
+    // Time stepping (the circuit side is handled dynamically by Xyce). The run spans [0, t_end],
+    // split into N_field_windows equal WR windows: dt_field = t_end / N_field_windows.
+    const unsigned N_steps_field = (g_cfg.N_field_windows >= 1) ? g_cfg.N_field_windows : 1u;
+    if (g_cfg.t_end <= 0.0) throw runtime_error("MasterProcess: t_end must be > 0.");
+    const double dt_field = g_cfg.t_end / N_steps_field;
 
     // WR parameters
     const unsigned WRmaxSteps = g_cfg.WRmaxSteps;
@@ -405,21 +369,10 @@ void MasterProcess()
     double V0 = 0.0;
     double dIdt_0 = 0.0;
     // dV/dt of the port voltage at the window start (seed slope for vf_prev_k.pwl). At the window
-    // end it is carried from the converged V(p) waveform (topology-agnostic, correct also with Rs/Ls).
-    // Window 1: source-dependent initial slope (with I0=0,dIdt0=0, V(p)≈Vsrc). The sine
-    // formula holds ONLY for source_kind 0; for current/step sources it is wrong and slows the
-    // WR convergence of the first window (the remaining windows carry the slope from the solution).
-    double dVdt_0;
-    switch (g_cfg.source_kind) {
-        case 0: // sinusoidal VOLTAGE source (legacy): source slope amplitude*2*pi*f (regression anchor).
-            dVdt_0 = V_src_amplitude * 2.0 * M_PI * Frequency * cos(2.0 * M_PI * Frequency * 0.0);
-            break;
-        default: // current/step sources: neutral seed 0. V(p) starts ~0 (Ls blocks the initial current,
-                 // for the step the full source voltage first drops across Ls -> dV(p)/dt(0)≈0). A
-                 // slope seed from the pure ramp slope overshoots and COSTS WR iterations.
-            dVdt_0 = 0.0;
-            break;
-    }
+    // end it is carried from the converged V(p) waveform (topology-agnostic). Window 1 uses a neutral
+    // seed 0: the circuit is authored from circuit_spec.txt, so no source slope is known here; a wrong
+    // slope seed only overshoots and costs WR iterations (the converged result is unaffected).
+    double dVdt_0 = 0.0;
 
     //fprintf(file_Field, "%-10lu %-17.8e %-17.8e %-17.8e\n", global_field_index++, 0.0, V_field, I_field);
 
@@ -430,10 +383,10 @@ void MasterProcess()
         //R_ROM *= 1.2;
         //L_ROM *= 1.05;
 
-        const double t_start = (step_field - 1) * dt_field; // needed mainly here (in cpp); Xyce always simulates from 0 to the stop time when called. In Xyce we only use it for the phase of the rest of the circuit (e.g. Vsrc if the circuit is only a voltage source)
+        const double t_start = (step_field - 1) * dt_field; // window-start absolute time (needed cpp-side); Xyce always simulates from 0 to the stop time when called.
         const double t_stop = step_field * dt_field;
 
-        WriteSimParams("sim_params.inc", 0.0, dt_field, t_start, I0, R_ROM, L_ROM, Frequency, V_src_amplitude, g_cfg.R_series, g_cfg.L_series, N_xyce_samples);
+        WriteSimParams("sim_params.inc", 0.0, dt_field, t_start, I0, R_ROM, L_ROM, N_xyce_samples);
 
         // Generate the window-specific restart/.tran directives (included by wr_circuit.cir).
         // Window 1: fresh UIC transient from 0; window k>1: restart from "restart_state".
@@ -980,91 +933,13 @@ static string fmtg(double x)
     return os.str();
 }
 
-// Absolute end time of the whole run (matches MasterProcess): absolute mode -> t_end,
-// periods mode -> N_periods/frequency. Used by the switch-control PWL end time.
+// Absolute end time of the whole run (= t_end). Used by the custom-spec SW element's PWL end time.
 static double simEndTime()
 {
-    if (g_cfg.time_mode == 1) return (g_cfg.t_end > 0.0) ? g_cfg.t_end : 1.0;
-    return (g_cfg.frequency > 0.0) ? (double)g_cfg.N_periods / g_cfg.frequency : 1.0;
+    return (g_cfg.t_end > 0.0) ? g_cfg.t_end : 1.0;
 }
 
-// --- Switch-throw emitter (increment 2) -------------------------------------------------------
-// Emits a two-terminal connection between n1 and n2 that is CLOSED (low R) during [ta, tb) and
-// OPEN (high R) otherwise. Backend per g_cfg.switch_backend:
-//   0 behavioral: resistor with an IF(time) value (Ron inside the window, Roff outside) -- no
-//                 .MODEL, robust, plays well with the WR windows.
-//   1 native:     Xyce voltage-controlled switch S + a PWL control source = 1 in [ta,tb)
-//                 (shared .MODEL SWMOD emitted once by emitSwitchTopology).
-// Open-ended-to-end: pass tb >= tEnd (1e30). From-start: pass ta <= 0.
-static void emitThrow(ofstream& out, const string& tag, const string& n1, const string& n2,
-                      double ta, double tb, double tEnd)
-{
-    // Trapezoidal "closed" gate g(t) in [0,1]: rises over [ta, ta+tau] (or =1 from the start if
-    // ta<=0), falls over [tb, tb+tau] (or stays 1 to the end if tb>=tEnd). tau = switch_trise.
-    const double tau = (g_cfg.switch_trise > 0.0) ? g_cfg.switch_trise : 1.0e-9;
-    if (g_cfg.switch_backend == 1) {
-        // native VC switch + PWL control (ramps 0<->1 over tau at each edge -> S device slides
-        // between ROFF and RON continuously, no instantaneous topology jump).
-        out << "S" << tag << " " << n1 << " " << n2 << " ctrl" << tag << " 0 SWMOD\n";
-        out << "Vctrl" << tag << " ctrl" << tag << " 0 PWL(";
-        if (ta <= 0.0) out << "0 1";
-        else           out << "0 0 " << ta << " 0 " << (ta + tau) << " 1";
-        if (tb < tEnd) out << " " << tb << " 1 " << (tb + tau) << " 0 " << tEnd << " 0";
-        else           out << " " << tEnd << " 1";
-        out << ")\n";
-    } else {
-        // behavioral resistor R = Roff + (Ron-Roff)*g(t), g a clamped trapezoid (continuous, so
-        // the integrator steps through the throw instead of colliding with a discontinuity).
-        //   up = 1                          if ta<=0   else clamp((t-ta)/tau, 0, 1)
-        //   dn = 0                          if tb>=tEnd else clamp((t-tb)/tau, 0, 1)
-        //   g  = up - dn
-        const string up = (ta <= 0.0) ? string("1")
-            : ("MIN(MAX((TIME-" + fmtg(ta) + ")/" + fmtg(tau) + ",0),1)");
-        const string dn = (tb >= tEnd) ? string("0")
-            : ("MIN(MAX((TIME-" + fmtg(tb) + ")/" + fmtg(tau) + ",0),1)");
-        out << "R" << tag << " " << n1 << " " << n2 << " R={" << g_cfg.switch_Roff
-            << " + (" << g_cfg.switch_Ron << "-" << g_cfg.switch_Roff << ")*("
-            << up << " - " << dn << ")}\n";
-    }
-}
-
-// Emits the switch-circuit side (circuit_kind 1/2/3) at port p (see SimConfig::circuit_kind).
-// The field/interface (Vmeas, Bfield) stays common and is emitted by WriteCircuitNetlist.
-static void emitSwitchTopology(ofstream& out)
-{
-    const double tEnd = simEndTime();
-    const double t1 = g_cfg.switch_t1;
-
-    if (g_cfg.switch_backend == 1) {
-        out << ".MODEL SWMOD VSWITCH(RON=" << g_cfg.switch_Ron << " ROFF=" << g_cfg.switch_Roff
-            << " VON=0.5 VOFF=0.4)\n";
-    }
-
-    switch (g_cfg.circuit_kind) {
-        case 1: // #4 two-way, sine U, cap C: drive[0,t1) -> freewheel[t1,inf)
-            out << "Bemf p a V = { amp_src*sin(2*pi*f_src*time) }\n";   // U: + at p, - at a
-            out << "Csw w 0 " << g_cfg.switch_C << " IC=0\n";           // C: wiper -> gnd
-            emitThrow(out, "drv", "w", "a", 0.0, t1,   tEnd);          // drive     (w<->U-)
-            emitThrow(out, "fw",  "w", "p", t1,  1e30, tEnd);          // freewheel (w<->p)
-            break;
-        case 2: // #5 two-way, DC U, cap C: drive[0,t1) -> freewheel[t1,inf)
-            out << "Vemf p a {amp_src}\n";                              // U_DC: + at p, - at a
-            out << "Csw w 0 " << g_cfg.switch_C << " IC=0\n";
-            emitThrow(out, "drv", "w", "a", 0.0, t1,   tEnd);          // drive     (w<->U-)
-            emitThrow(out, "fw",  "w", "p", t1,  1e30, tEnd);          // freewheel (w<->p)
-            break;
-        case 3: // #6 two-way, AC vs R: AC-drive[0,t1) -> R-damp[t1,inf)
-            out << "Bemf p bac V = { amp_src*sin(2*pi*f_src*time) }\n"; // V_AC: + at p, - at bac
-            out << "Rload p br " << g_cfg.switch_R << "\n";            // R: p -> br
-            emitThrow(out, "ac", "bac", "0", 0.0, t1,   tEnd);        // ground V_AC bottom (drive)
-            emitThrow(out, "rd", "br",  "0", t1,  1e30, tEnd);        // ground R bottom (damp)
-            break;
-        default:
-            throw runtime_error("emitSwitchTopology: unknown circuit_kind");
-    }
-}
-
-// Emits a user-authored node-graph circuit (circuit_kind==4) from circuit_spec.txt. Reserved nodes:
+// Emits a user-authored node-graph circuit from circuit_spec.txt. Reserved nodes:
 // p (port, field attaches here) and 0 (ground); any other token is a user node. The fixed WR
 // interface is appended by WriteCircuitNetlist -- the spec must not touch node nx. Well-posedness is
 // the user's responsibility (full generality). Line format, '#'/'*' comment, blanks skipped:
@@ -1075,7 +950,7 @@ static void emitCustomTopology(ofstream& out)
 {
     ifstream in("circuit_spec.txt");
     if (!in) {
-        throw runtime_error("emitCustomTopology: circuit_kind=4 (custom) but circuit_spec.txt not found.");
+        throw runtime_error("emitCustomTopology: circuit_spec.txt not found.");
     }
     int emitted = 0, lineno = 0;
     string line;
@@ -1189,12 +1064,11 @@ static void emitCustomTopology(ofstream& out)
         throw runtime_error("emitCustomTopology: circuit_spec.txt has no elements.");
 }
 
-// Generates the full circuit netlist (wr_circuit.cir) from g_cfg. The topology is
-// window-invariant -> called ONCE before the WR loop (and in emit mode). Elements are written
-// INLINE (no .INCLUDE of the devices) so the UI netlist parser (does not follow .INCLUDEs)
-// can draw the circuit. Per-window variable quantities (amp_src/f_src/Rs/Ls/...)
-// stay as {param} references in sim_params.inc; C_series and step parameters are written as
-// literals (config-constant). The WR interface (Vmeas/Bfield) is fixed and unchanged.
+// Generates the full circuit netlist (wr_circuit.cir) from the custom node-graph in
+// circuit_spec.txt. The topology is window-invariant -> called ONCE before the WR loop (and in
+// emit mode). Elements are written INLINE (no .INCLUDE of the devices) so the UI netlist parser
+// (does not follow .INCLUDEs) can draw the circuit. The WR interface (Vmeas/Bfield) is fixed and
+// appended after the user circuit; per-window quantities stay as {param} refs in sim_params.inc.
 void WriteCircuitNetlist(const string& filename)
 {
     LoadProbes("probes.txt");   // populate g_probes for the .print line (both `emit` and solve paths)
@@ -1208,66 +1082,11 @@ void WriteCircuitNetlist(const string& filename)
     out << "Generated circuit netlist (WriteCircuitNetlist from sim_config.txt) -- DO NOT EDIT BY HAND\n";
     out << ".INCLUDE sim_params.inc\n\n";
 
-    if (g_cfg.circuit_kind == 4) {
-        // --- Custom node-graph (increment 3a): user-authored circuit from circuit_spec.txt. ---
-        out << "* === CIRCUIT SIDE (custom node-graph from circuit_spec.txt) ===\n";
-        emitCustomTopology(out);
-        out << "\n";
-    } else if (g_cfg.circuit_kind != 0) {
-        // --- Switch topology (increment 2): #4/#5/#6 attach their own network at port p. ---
-        out << "* === CIRCUIT SIDE (switch topology circuit_kind=" << g_cfg.circuit_kind
-            << ", backend=" << (g_cfg.switch_backend ? "native-S" : "behavioral") << ") ===\n";
-        emitSwitchTopology(out);
-        out << "\n";
-    } else {
-    // --- Simple source (increment 1): source_kind + series R/L/C chain source->port. ---
-    // Active series elements on the source->port path (nonzero only). Order R,L,C.
-    vector<char> series;
-    if (g_cfg.R_series != 0.0) series.push_back('R');
-    if (g_cfg.L_series != 0.0) series.push_back('L');
-    if (g_cfg.C_series != 0.0) series.push_back('C');
-    // Without series elements the source sits directly on port p (one-way toy: V(p)==Vsrc).
-    const string hot = series.empty() ? string("p") : string("s");
-
-    out << "* === CIRCUIT SIDE (source_kind=" << g_cfg.source_kind << ") ===\n";
-    switch (g_cfg.source_kind) {
-        case 1: // sinusoidal CURRENT source: drives the loop current directly into the port (check the
-                // sign via I(Vmeas)). NOTE: series R/L/C are physically meaningless with a current source
-                // (the current is forced; series elements only float the source node) AND
-                // an ideal current source in series with L is degenerate (zero crossing -> singular
-                // Jacobian -> dt collapse). Hence: bare source directly on p (preset P2 sets R/L/C=0).
-            out << "Bemf 0 " << hot << " I = { amp_src*sin(2*pi*f_src*time) }\n";
-            break;
-        case 2: // step/ramp VOLTAGE source: single rising edge (tf=0, pw/per large)
-            out << "Vemf " << hot << " 0 PULSE("
-                << g_cfg.step_v_initial << " " << g_cfg.step_v_final << " "
-                << g_cfg.step_delay << " " << g_cfg.step_rise << " 0 1e30 1e30)\n";
-            break;
-        case 0: // sinusoidal VOLTAGE source (legacy default / regression anchor)
-        default:
-            out << "Bemf " << hot << " 0 V = { amp_src*sin(2*pi*f_src*time) }\n";
-            break;
-    }
+    out << "* === CIRCUIT SIDE (custom node-graph from circuit_spec.txt) ===\n";
+    emitCustomTopology(out);
     out << "\n";
 
-    if (!series.empty()) {
-        out << "* series R/L/C  source->port\n";
-        string node = "s";
-        for (size_t i = 0; i < series.size(); ++i) {
-            const string next = (i + 1 == series.size()) ? string("p") : ("cm" + to_string(i));
-            switch (series[i]) {
-                case 'R': out << "Rs_d " << node << " " << next << " {Rs}\n";       break;
-                case 'L': out << "Ls_d " << node << " " << next << " {Ls} IC=0\n";   break;
-                case 'C': out << "Cs_d " << node << " " << next << " "
-                              << g_cfg.C_series << " IC=0\n";                        break;
-            }
-            node = next;
-        }
-        out << "\n";
-    }
-    }
-
-    // Feste WR-Schnittstelle. Kopplungsrichtung per coupling_mode.
+    // Fixed WR interface. Coupling direction per coupling_mode.
     // Both coupling directions use the SAME matched-secant Bfield: the field's Thevenin equivalent, a
     // voltage source V(vfprev) behind the ROM impedance Z = Rrom + Lrom/dt. That IS a Newton/secant
     // linearisation of the field's V-I characteristic V = Z_field(I) about the previous iterate
@@ -1318,8 +1137,8 @@ void WriteCircuitNetlist(const string& filename)
 }
 
 // Writes sim_params.inc: the per-window .PARAM lines the netlist references (t_start/t_stop/t_abs_start,
-// I0, Rrom/Lrom, f_src/amp_src, Rs/Ls) plus the derived dt_print = t_window/N_xyce_samples (print
-// cadence + interface PWL resolution) and t_floor = t_floor_frac*t_window (secant-denominator guard).
+// I0, Rrom/Lrom) plus the derived dt_print = t_window/N_xyce_samples (print cadence + interface PWL
+// resolution) and t_floor = t_floor_frac*t_window (secant-denominator guard).
 // Throws if t_window <= 0 or N_xyce_samples < 1.
 void WriteSimParams(
     const string& filename,
@@ -1329,10 +1148,6 @@ void WriteSimParams(
     double i0,
     double rrom,
     double lrom,
-    double f_src,   // frequency of the circuit voltage source (Bsrc); single source of truth
-    double amp_src, // amplitude of the circuit voltage source (Bsrc)
-    double r_series, // series coupling impedance source->port (two-way coupling)
-    double l_series,
     const unsigned N_xyce_samples
 )
 {
@@ -1371,10 +1186,6 @@ void WriteSimParams(
     out << ".PARAM Rrom         = " << rrom         << "\n";
     out << ".PARAM Lrom         = " << lrom         << "\n";
     out << ".PARAM dt_print     = " << dt_print     << "\n";
-    out << ".PARAM f_src        = " << f_src        << "\n";
-    out << ".PARAM amp_src      = " << amp_src      << "\n";
-    out << ".PARAM Rs           = " << r_series     << "\n";
-    out << ".PARAM Ls           = " << l_series     << "\n";
     out << ".PARAM t_floor      = " << t_floor      << "\n";
 }
 
