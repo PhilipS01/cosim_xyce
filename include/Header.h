@@ -87,7 +87,14 @@ struct SimConfig
     unsigned N_field_steps_per_source_period = 50;
     // Coupling-grid resolutions
     unsigned N_field_eval_intervals = 1;
-    unsigned N_xyce_coupling_intervals = 100;
+    // How finely the Xyce solution is sampled: sets the .tran print cadence dt_print = t_window /
+    // N_xyce_samples (-> the raw wr_circuit.cir.prn rows) AND the interface PWL resolution that
+    // ReadXyceResults resamples V(p)/I(Vmeas) onto (vf_prev_k.pwl / i_prev_k.pwl, both directions).
+    unsigned N_xyce_samples = 100;
+    // Secant-denominator floor t_floor as a fraction of the window: t_floor = t_floor_frac * t_window.
+    // Only the window-start 1/0 guard in Z = Rrom + Lrom/MAX(dt, t_floor) (see use_t_floor); the floor
+    // value is accuracy/stability-neutral (floor-sweep), so a fraction of the window is a scale-free knob.
+    double t_floor_frac = 0.01;
     // Waveform relaxation
     unsigned WRmaxSteps = 20;
     double WR_tolerance = 1.0e-3;
@@ -119,6 +126,17 @@ struct SimConfig
     //       converges (no dt-collapse seen up to ~MHz -- Xyce handles the stiffness), just less cleanly.
     //       Provided to compare the two.
     unsigned interface_form = 0;
+    // Secant-denominator floor in the Bfield impedance Z = Rrom + Lrom/dt (dt = time - t_abs_start):
+    //   1 = on (default): dt -> MAX(time - t_abs_start, t_floor); guards the 1/0 at the exact window
+    //       start (time == t_abs_start), where dt would be 0 -> Lrom/0 singularity.
+    //   0 = off: dt = (time - t_abs_start) bare; Z -> infinity at the window start. Test only.
+    unsigned use_t_floor = 1;
+    // Window-seam handoff: how the carried terminal values (V0, I0 seeding the next window) are picked
+    // from the converged iterate (the two solvers agree to within WR_tolerance there):
+    //   0 = one-sided (default): V0 = circuit V(p), I0 = field I. (Restart checkpoint = Xyce state.)
+    //   1 = midpoint: V0 = 0.5*(V_circuit + V_field), I0 = 0.5*(I_circuit + I_field). Seam-blend test
+    //       (only the carried seeds are averaged; the Xyce restart checkpoint is unchanged).
+    unsigned seam_average = 0;
 };
 
 extern SimConfig g_cfg;
@@ -177,7 +195,7 @@ void writePWLFile(const string& filename, const Waveform& wf);
 
 Waveform resampleWaveformUniform(const Waveform& raw, double t_start, double t_stop, unsigned N_intervals);
 
-void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, double t_start, double t_stop, unsigned N_coupling_intervals);
+void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, double t_start, double t_stop, unsigned N_xyce_samples);
 
 void appendCircuitWaveformXyceStyle(FILE* file, const CircuitWaveform& wf, double t_start, unsigned long& global_index, bool skip_first_point);
 
@@ -192,7 +210,7 @@ void RunXyce(const string& filename);
 // der Elemente), damit der UI-Netzlisten-Parser (folgt keinen .INCLUDEs) die Schaltung zeichnen kann.
 void WriteCircuitNetlist(const string& filename);
 
-void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double dIdt0, double r_series, double l_series, const unsigned N_coupling_intervals);
+void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double dIdt0, double r_series, double l_series, const unsigned N_xyce_samples);
 
 // Generiert restart.inc (von wr_circuit.cir inkludiert): die fenster-spezifische
 // .OPTIONS RESTART und .tran Zeile. Fenster 1 (first_window=true): frischer UIC-Transient

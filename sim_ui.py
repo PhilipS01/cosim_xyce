@@ -59,7 +59,7 @@ PARAMS = [
     ("N_periods",                       "Number of source periods",     1,        "int",   (1, 10, 1)),
     ("N_field_steps_per_source_period", "Field steps / source period",  50,       "int",   (2, 200, 1)),
     ("N_field_eval_intervals",          "FEM eval intervals / window",  1,        "int",   (1, 64, 1)),
-    ("N_xyce_coupling_intervals",       "Xyce coupling intervals",      100,      "int",   (2, 400, 1)),
+    ("N_xyce_samples",                  "Xyce solution samples",        100,      "int",   (1, 400, 1)),
     ("WRmaxSteps",                      "WR max iterations",            20,       "int",   (1, 100, 1)),
     ("WR_tolerance",                    "WR tolerance",                 1.0e-3,   "float", None),
     ("wr_convergence_method",           "WR convergence metric",        1,        "choice",
@@ -71,6 +71,11 @@ PARAMS = [
          3: "pointwise (central diff)"}),
     ("interface_form",                  "Interface stamping",           0,        "choice",
         {0: "Thevenin (V source)", 1: "Norton (I source)"}),
+    ("use_t_floor",                     "Secant t_floor",               1,        "choice",
+        {1: "on (guard 1/0)", 0: "off (bare dt)"}),
+    ("t_floor_frac",                    "t_floor / window",             0.01,     "float", None),
+    ("seam_average",                    "Window-seam handoff",          0,        "choice",
+        {0: "one-sided (V<-ckt, I<-fld)", 1: "midpoint (average)"}),
 ]
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
 KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}
@@ -254,6 +259,35 @@ HELP = {
         "weakly tied &rarr; stiffer. Same terminal (window-boundary) fixpoint, but the <b>interior V(p) "
         "waveform differs</b> from Thevenin (measured &gt; the signal amplitude on a 20&nbsp;kHz current "
         "source); it still converges (no dt-collapse seen up to ~MHz). Provided to compare the two.</div>"
+    ),
+    "seam_average": (
+        "<div class='hh'>Window-seam handoff</div>"
+        "<div class='hn'>Which terminal value seeds the next window (both solvers agree &lt; WR "
+        "tolerance at the seam).<br>"
+        "<b>one-sided</b> (default): V0 = circuit V(p), I0 = field I.<br>"
+        "<b>midpoint</b>: V0 = &frac12;(V_circuit+V_field), I0 = &frac12;(I_circuit+I_field). Only the "
+        "carried seeds are averaged; the Xyce restart checkpoint is unchanged. Seam-blend test.</div>"
+    ),
+    "use_t_floor": (
+        "<div class='hh'>Secant denominator floor (t_floor)</div>"
+        "<div class='hn'>The Bfield impedance Z = Rrom + Lrom/dt uses dt = time&minus;t_abs_start.<br>"
+        "<b>on</b> (default): dt &rarr; MAX(time&minus;t_abs_start, t_floor); guards the 1/0 at the exact "
+        "window start (dt=0 &rarr; Lrom/0 singularity). t_floor is set by <b>t_floor / window</b>.<br>"
+        "<b>off</b>: bare dt; Z &rarr; &infin; at the window start. Test only.</div>"
+    ),
+    "t_floor_frac": (
+        "<div class='hh'>t_floor as a fraction of the window</div>"
+        "<div class='hn'>Sets the secant-denominator floor: t_floor = (this) &times; t_window (only "
+        "used when <b>Secant t_floor</b> is on). Scale-free &mdash; the floor tracks window length. The "
+        "floor value is accuracy/stability-neutral (floor-sweep), so this is a conditioning knob, not "
+        "physics. Default 0.01 (= t_window/100).</div>"
+    ),
+    "N_xyce_samples": (
+        "<div class='hh'>Xyce solution samples</div>"
+        "<div class='hn'>How finely the Xyce solution is sampled: sets the .tran print cadence "
+        "dt_print = t_window/N (the raw wr_circuit.cir.prn rows) AND the interface PWL resolution "
+        "(V(p)&rarr;vf_prev_k.pwl and I(Vmeas)&rarr;i_prev_k.pwl, <b>both coupling directions</b>). "
+        "Decoupled from t_floor (that is now <b>t_floor / window</b>).</div>"
     ),
     "coupling_mode": (
         "<div class='hh'>Coupling direction</div>"
@@ -1915,7 +1949,7 @@ class Handler(BaseHTTPRequestHandler):
                 vl_eval = eval_vlines(body.get("vlines"), s["params"])
                 plots = make_sweep_plots(s["keys"], s["rows"], s["mode"],
                                          s["free_keys"], vl_eval)
-                csv_path, files = export_sweep_csv(body.get("path") or "sweep.csv",
+                csv_path, files = export_sweep_csv(body.get("path") or "results/sweeps/sweep.csv",
                                                    s["keys"], s["rows"], plots)
                 self._send(200, json.dumps({"ok": True, "path": csv_path, "files": files}))
             except Exception as e:
@@ -1936,7 +1970,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/export_csv":
             try:
-                out = export_run_csv(body.get("path") or "results.csv",
+                out = export_run_csv(body.get("path") or "results/results.csv",
                                      body.get("params", {}), body.get("summary", {}),
                                      body.get("plots", {}))
                 self._send(200, json.dumps({"ok": True, "path": out}))
@@ -2038,8 +2072,9 @@ class Handler(BaseHTTPRequestHandler):
 # inputs so presets/reset/collect keep working.
 _PROP_ROWS = [
     ["coupling_mode", "reconstruct_mode", "N_field_eval_intervals",
-     "N_field_steps_per_source_period", "N_xyce_coupling_intervals"],
+     "N_field_steps_per_source_period", "N_xyce_samples"],
     ["t_end", "wr_convergence_method", "WRmaxSteps", "WR_tolerance", "interface_form"],
+    ["use_t_floor", "t_floor_frac", "seam_average"],
     ["R_ROM", "L_ROM", "R_FEM", "L_FEM", "nonlin_model"],
 ]
 _PROP_HIDDEN = ["N_field_windows", "N_periods", "I_sat"]  # config-only; time_mode injected in JS
@@ -2444,7 +2479,7 @@ INDEX_HTML = """<!doctype html>
       <h2>Results</h2>
       <div class="hd-tools">
         <span class="mini" id="csvStatus"></span>
-        <input type="text" id="csvPath" class="pathin" placeholder="results.csv" value="results.csv" spellcheck="false">
+        <input type="text" id="csvPath" class="pathin" placeholder="results/results.csv" value="results/results.csv" spellcheck="false">
         <button class="small" onclick="exportCsv()">Export CSV</button>
       </div>
     </div>
@@ -2468,7 +2503,7 @@ INDEX_HTML = """<!doctype html>
         <span id="sw_vlines_val" class="sub2" style="font-family:ui-monospace,monospace;white-space:nowrap"></span>
       </div>
       <div class="btns" style="margin-top:10px;align-items:center;gap:10px">
-        <input type="text" id="sweepCsvPath" class="pathin" placeholder="sweep.csv" value="sweep.csv" spellcheck="false">
+        <input type="text" id="sweepCsvPath" class="pathin" placeholder="results/sweeps/sweep.csv" value="results/sweeps/sweep.csv" spellcheck="false">
         <button class="small" onclick="exportSweep()">Export sweep<span class="help" data-help="sweep_export">?</span></button>
         <span class="mini" id="sweepCsvStatus"></span>
       </div>

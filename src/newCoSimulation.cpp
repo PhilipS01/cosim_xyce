@@ -122,13 +122,17 @@ bool LoadConfig(const string& filename)
         else if (key == "N_periods")                        g_cfg.N_periods = (unsigned)val;
         else if (key == "N_field_steps_per_source_period")  g_cfg.N_field_steps_per_source_period = (unsigned)val;
         else if (key == "N_field_eval_intervals")           g_cfg.N_field_eval_intervals = (unsigned)val;
-        else if (key == "N_xyce_coupling_intervals")        g_cfg.N_xyce_coupling_intervals = (unsigned)val;
+        else if (key == "N_xyce_samples")                   g_cfg.N_xyce_samples = (unsigned)val;
+        else if (key == "N_xyce_coupling_intervals")        g_cfg.N_xyce_samples = (unsigned)val;  // back-compat alias -> sampling role
+        else if (key == "t_floor_frac")                     g_cfg.t_floor_frac = val;
         else if (key == "WRmaxSteps")                       g_cfg.WRmaxSteps = (unsigned)val;
         else if (key == "WR_tolerance")                     g_cfg.WR_tolerance = val;
         else if (key == "wr_convergence_method")            g_cfg.wr_convergence_method = (unsigned)val;
         else if (key == "coupling_mode")                    g_cfg.coupling_mode = (unsigned)val;
         else if (key == "reconstruct_mode")                 g_cfg.reconstruct_mode = (unsigned)val;
         else if (key == "interface_form")                   g_cfg.interface_form = (unsigned)val;
+        else if (key == "use_t_floor")                      g_cfg.use_t_floor = (unsigned)val;
+        else if (key == "seam_average")                     g_cfg.seam_average = (unsigned)val;
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
     }
     return true;
@@ -367,10 +371,11 @@ void MasterProcess()
     // WR parameters
     const unsigned WRmaxSteps = g_cfg.WRmaxSteps;
     const double WR_tolerance = g_cfg.WR_tolerance;
-    // Fixed coupling-grid resolution, decoupled from Xyce's adaptive step. Controls TWO things
-    // with one value: (1) Xyce print cadence dt_print = dt_field/N (WriteSimParams) and
-    // (2) resample resolution of V(p) into vf_prev_k.pwl. See voltage_driven_refactor.tex.
-    const unsigned N_xyce_coupling_intervals = g_cfg.N_xyce_coupling_intervals;
+    // Xyce-solution sampling, decoupled from Xyce's adaptive step. Controls TWO things with one value:
+    // (1) Xyce print cadence dt_print = dt_field/N (WriteSimParams) and (2) resample resolution of the
+    // interface PWL (V(p)->vf_prev_k.pwl / I(Vmeas)->i_prev_k.pwl, both directions). t_floor is now a
+    // SEPARATE knob (t_floor_frac). See voltage_driven_refactor.tex.
+    const unsigned N_xyce_samples = g_cfg.N_xyce_samples;
     // FEM evaluation intervals per window (FEM-PWL has N+1 points). =1 → 2-point ramp → single
     // linear extrapolation of the field current per window. Higher → multi-rate, piecewise linear.
     const unsigned N_field_eval_intervals = g_cfg.N_field_eval_intervals;
@@ -410,7 +415,7 @@ void MasterProcess()
         const double t_start = (step_field - 1) * dt_field; // brauchen wir vor allem hier (in cpp), Xyce simuliert immer von 0 bis Stopzeitpunkt wenn man es aufruft. In xyce nutzen wir es nur für die Phase der restlichen Schaltung (z.B. Vsrc wenn Schaltung nur Spannungsquelle ist)
         const double t_stop = step_field * dt_field;
 
-        WriteSimParams("sim_params.inc", 0.0, dt_field, t_start, I0, R_ROM, L_ROM, Frequency, V_src_amplitude, dIdt_0, g_cfg.R_series, g_cfg.L_series, N_xyce_coupling_intervals);
+        WriteSimParams("sim_params.inc", 0.0, dt_field, t_start, I0, R_ROM, L_ROM, Frequency, V_src_amplitude, dIdt_0, g_cfg.R_series, g_cfg.L_series, N_xyce_samples);
 
         // Fenster-spezifische Restart/.tran-Direktiven generieren (von wr_circuit.cir inkludiert).
         // Fenster 1: frischer UIC-Transient ab 0; Fenster k>1: Restart aus "restart_state".
@@ -442,7 +447,7 @@ void MasterProcess()
             // Circuit Solver aufrufen: Biface liefert I(Vmeas) = INTERFACE_condition(V(p), V(vfprev), V(iprev)).
             // ReadXyceResults schreibt V(p)-Waveform nach vf_prev_k.pwl für FEM-Eingang.
             RunXyce("wr_circuit.cir");
-            ReadXyceResults("wr_circuit.cir.prn", circuit_sol, t_start, t_stop, N_xyce_coupling_intervals);
+            ReadXyceResults("wr_circuit.cir.prn", circuit_sol, t_start, t_stop, N_xyce_samples);
 
             // FEM Solver aufrufen (dummy). Kopplungsrichtung per coupling_mode:
             //   0 voltage-driven: liest vf_prev_k.pwl (V(p)), schreibt i_prev_k.pwl (I_field).
@@ -533,7 +538,7 @@ void MasterProcess()
 
             // Beide auf gemeinsames FEM-Eval-Grid (N_field_eval_intervals+1) re-sampeln,
             // damit appendFieldWaveformXyceStyle übereinstimmende Zeitstempel sieht.
-            // (vf_conv hat N_xyce_coupling_intervals+1 Knoten, i_conv hat N_field_eval_intervals+1)
+            // (vf_conv hat N_xyce_samples+1 Knoten, i_conv hat N_field_eval_intervals+1)
             Waveform vf_endpoints = resampleWaveformUniform(
                 vf_conv, t_start, t_stop, N_field_eval_intervals
             );
@@ -544,9 +549,19 @@ void MasterProcess()
             // und hängen sie an die bisherigen Zeitfenster an (Waveforms bereits absolut → Offset 0.0)
             appendFieldWaveformXyceStyle(file_Field_waveform, vf_endpoints, i_endpoints, 0.0, global_field_waveform_index, skip_first_point);
 
-            // Festhalten der Endwerte für die Anfangswerte des nächsten Zeitfensters
-            V0 = vf_conv.y.back(); // Portspannung am Fensterende (= V(p) bei t=dt_field)
-            I0 = I_field;          // Feldstrom am Fensterende (FEM-Ausgang)
+            // Festhalten der Endwerte für die Anfangswerte des nächsten Zeitfensters.
+            // Default (one-sided): V0 = circuit V(p), I0 = field I. seam_average: midpoint of both
+            // terminals (they agree < WR_tolerance, so the blend stays within tol of either side).
+            const double V_circ_end = vf_conv.y.back();  // circuit port voltage at window end
+            if (g_cfg.seam_average) {
+                double V_circ_dummy, I_circ_end;
+                Read_Terminal_results("Circuit.txt", V_circ_dummy, I_circ_end);  // I(Vmeas) at end
+                V0 = 0.5 * (V_circ_end + V_field);
+                I0 = 0.5 * (I_circ_end + I_field);
+            } else {
+                V0 = V_circ_end;  // Portspannung am Fensterende (= V(p) bei t=dt_field)
+                I0 = I_field;     // Feldstrom am Fensterende (FEM-Ausgang)
+            }
 
             // dI/dt am Fensterende = dI/dt am Anfang des nächsten Fensters (Stetigkeit)
             const size_t n_i = i_conv.t.size();
@@ -1254,18 +1269,23 @@ void WriteCircuitNetlist(const string& filename)
     out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
     out << "VIprev iprev  0 PWL FILE \"i_prev_k.pwl\"\n";
     out << "Vmeas p nx 0\n";
+    // Secant denominator dt. use_t_floor guards the 1/0 at the exact window start (time==t_abs_start);
+    // off -> bare (time - t_abs_start), Z -> infinity there (test only).
+    const string dt_expr = g_cfg.use_t_floor
+        ? "MAX(time - t_abs_start, t_floor)"
+        : "(time - t_abs_start)";
     if (g_cfg.interface_form == 1) {
         // Norton (dual of the Thevenin): a behavioral CURRENT source with shunt G = 1/Z. Same TERMINAL
         // fixpoint, but G -> 0 at the window start -> V(p) weakly tied -> stiffer, and the interior V(p)
         // waveform differs from the Thevenin one (converges anyway; no dt-collapse observed up to ~MHz).
         out << "* interface_form = Norton: current source I = V(iprev) + (V(nx) - V(vfprev))/Z, Z = Rrom + Lrom/dt\n";
         out << "Bfield nx 0 I = {\n";
-        out << "+ V(iprev) + (V(nx) - V(vfprev)) / (Rrom + Lrom/MAX(time - t_abs_start, t_floor))\n";
+        out << "+ V(iprev) + (V(nx) - V(vfprev)) / (Rrom + Lrom/" << dt_expr << ")\n";
         out << "+ }\n\n";
     } else {
         // Thevenin (default): a behavioral VOLTAGE source that pins V(nx)=V(p).
         out << "Bfield nx 0 V = {\n";
-        out << "+ V(vfprev) + (Rrom + Lrom/MAX(time - t_abs_start, t_floor)) * (I(Vmeas) - V(iprev))\n";
+        out << "+ V(vfprev) + (Rrom + Lrom/" << dt_expr << ") * (I(Vmeas) - V(iprev))\n";
         out << "+ }\n\n";
     }
 
@@ -1289,33 +1309,33 @@ void WriteSimParams(
     double dIdt0,   // Anfangs-dI/dt (für Ls-Sekanten-Guard bei time<=eps_t)
     double r_series, // serielle Kopplungsimpedanz Quelle→Port (two-way coupling)
     double l_series,
-    const unsigned N_coupling_intervals
+    const unsigned N_xyce_samples
 )
 {
     if (t_window <= 0.0) {
         throw runtime_error("WriteSimParams: t_window (stopping time for xyce) must be positive.");
     }
 
-    if (N_coupling_intervals < 1) {
-        throw runtime_error("WriteSimParams: N_coupling_intervals must be >= 1.");
+    if (N_xyce_samples < 1) {
+        throw runtime_error("WriteSimParams: N_xyce_samples must be >= 1.");
     }
-    
-    // Für xyce output/print times (dt_print)
-    // hier: output bei jedem re-sampling Punkt (siehe resampleWaveformUniform, welcher die xyce-Punkte reduziert)
-    const double h_coupling = t_window / static_cast<double>(N_coupling_intervals); 
-    
+
+    // Xyce print cadence dt_print: output at every re-sampling point (see resampleWaveformUniform,
+    // which reduces the Xyce points). This is the raw resolution of the interface PWL.
+    const double dt_print = t_window / static_cast<double>(N_xyce_samples);
+
     // Zum vermeiden von Singularitäten in den Ableitungen
     const double eps_t = 1.0e-15;
 
-    // Boden auf die akkumulierte Sekantenzeit t_acc = h_coupling. NUR eine 1/0-Absicherung
-    // am exakten Fensterstart-Eval-Punkt (time == t_abs_start): Lrom/MAX(t_acc, t_floor)
-    // statt Lrom/t_acc. Der eigentliche Stabilitaets-Fix fuer das echte Ls_d ist NICHT
-    // dieser Boden, sondern dass Biface eine GLATTE Sekante nutzt (kein IF(...)-Hartschalter
-    // mehr auf den konstanten I0): der IF-Zweig erzwang am Fensterstart eine ideale
-    // Stromquelle (Admittanz 0) in Reihe mit dem realen BDF-Ls_d → entartet/steif → Crash.
-    // Die glatte Sekante haelt die Admittanz endlich (winzig, aber >0). Boden-Sweep
-    // (Faktor 0..20) bestaetigt: der Boden-Wert ist accuracy/stability-neutral.
-    const double t_floor = h_coupling;
+    // Boden auf die akkumulierte Sekantenzeit t_acc. NUR eine 1/0-Absicherung am exakten
+    // Fensterstart-Eval-Punkt (time == t_abs_start): Lrom/MAX(t_acc, t_floor) statt Lrom/t_acc.
+    // Der eigentliche Stabilitaets-Fix fuer das echte Ls_d ist NICHT dieser Boden, sondern dass
+    // Biface eine GLATTE Sekante nutzt (kein IF(...)-Hartschalter mehr auf den konstanten I0):
+    // der IF-Zweig erzwang am Fensterstart eine ideale Stromquelle (Admittanz 0) in Reihe mit
+    // dem realen BDF-Ls_d → entartet/steif → Crash. Die glatte Sekante haelt die Admittanz
+    // endlich (winzig, aber >0). Boden-Sweep (Faktor 0..20) bestaetigt: accuracy/stability-neutral.
+    // Der Boden ist jetzt ein eigener Knopf: t_floor = t_floor_frac * t_window (fensterskaliert).
+    const double t_floor = g_cfg.t_floor_frac * t_window;
 
     // Zeit ist absolut/kontinuierlich (Checkpoint/Restart): tran-Stoppzeit ist der
     // ABSOLUTE Fensterende-Zeitpunkt, nicht die Fensterlaenge.
@@ -1330,7 +1350,7 @@ void WriteSimParams(
     out << ".PARAM Rrom         = " << rrom         << "\n";
     out << ".PARAM Lrom         = " << lrom         << "\n";
     out << ".PARAM eps_t        = " << eps_t        << "\n";
-    out << ".PARAM dt_print     = " << h_coupling   << "\n";
+    out << ".PARAM dt_print     = " << dt_print     << "\n";
     out << ".PARAM f_src        = " << f_src        << "\n";
     out << ".PARAM amp_src      = " << amp_src      << "\n";
     out << ".PARAM dIdt0        = " << dIdt0        << "\n";
