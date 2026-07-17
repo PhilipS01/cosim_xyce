@@ -34,3 +34,6 @@ circuit_spec.txt
 # node deps for the schematic layout (elkjs)
 node_modules/
 package-lock.json
+
+# python venv (created by setup.sh)
+.venv/
