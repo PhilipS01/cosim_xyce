@@ -21,7 +21,7 @@ using namespace std;
 // this file before invoking the solver.
 struct SimConfig
 {
-    // Reduced-order model (used inside the Xyce Biface interface condition)
+    // Reduced-order model (used inside the Xyce Bfield interface condition)
     double L_ROM = 0.9 * 1.6e-7;
     double R_ROM = 0.9 * 5.1e-4;
     // "True" field/FEM parameters (intentionally different from the ROM)
@@ -31,7 +31,7 @@ struct SimConfig
     //   1 = magnetic saturation: flux lambda(I) = L_FEM*I_sat*atan(I/I_sat),
     //       so the small-signal inductance L(I) = L_FEM/(1+(I/I_sat)^2) drops as
     //       the core saturates. I_sat is the saturation current scale (A).
-    // The Xyce ROM (Biface) stays linear, so the nonlinearity is a genuine
+    // The Xyce ROM (Bfield) stays linear, so the nonlinearity is a genuine
     // field/ROM model mismatch that the WR iteration must resolve.
     unsigned nonlin_model = 0;
     double I_sat = 100.0;
@@ -168,11 +168,14 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
 void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_time,
                                         unsigned N_field_eval_intervals);
 
+// Legacy interface (from the reference CoSimulation_WR.cpp): declared for source compatibility but
+// NOT defined in this codebase. Here the circuit side is solved by Xyce (RunXyce) and the interface
+// condition is stamped as the netlist Bfield source, so neither of these is called.
 void CIRCUIT_solver(const double dt_circuit, const unsigned N_dt_circuit_per_dt_field, const double time_field);
 
-double INTERFACE_condition(	const bool reset, const double dt_circuit, const double dt_field,
-							double& V_circuit, double& I_circuit_last_time,
-							double& V_field_last_WR_it, double& V_field_last_time, double& I_field_last_WR_it, double& I_field_last_time);
+double INTERFACE_condition( const bool reset, const double dt_circuit, const double dt_field,
+                            double& V_circuit, double& I_circuit_last_time,
+                            double& V_field_last_WR_it, double& V_field_last_time, double& I_field_last_WR_it, double& I_field_last_time);
 
 struct Waveform;
 struct CircuitWaveform;
@@ -203,49 +206,52 @@ void appendFieldWaveformXyceStyle(FILE* file, const Waveform& vf, const Waveform
 
 void RunXyce(const string& filename);
 
-// Generiert die vollstaendige Schaltungs-Netzliste (wr_circuit.cir) aus g_cfg: Quelle (source_kind)
-// + serielle R/L/C-Kette Quelle->Port p + feste WR-Schnittstelle (Vmeas, Bfield) + Includes. Wird
-// EINMAL vor der Fensterschleife (und im emit-Modus) aufgerufen; Topologie ist fensterinvariant.
-// Die pro-Fenster variablen Groessen bleiben in sim_params.inc/restart.inc. Inline (kein .INCLUDE
-// der Elemente), damit der UI-Netzlisten-Parser (folgt keinen .INCLUDEs) die Schaltung zeichnen kann.
+// Generates the full circuit netlist (wr_circuit.cir) from g_cfg: source (source_kind)
+// + series R/L/C chain source->port p + fixed WR interface (Vmeas, Bfield) + includes. Called
+// ONCE before the window loop (and in emit mode); the topology is window-invariant.
+// The per-window variable quantities stay in sim_params.inc/restart.inc. Written inline (no .INCLUDE
+// of the elements) so the UI netlist parser (does not follow .INCLUDEs) can draw the circuit.
 void WriteCircuitNetlist(const string& filename);
 
-void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double dIdt0, double r_series, double l_series, const unsigned N_xyce_samples);
+void WriteSimParams(const string& filename, double t_start, double t_stop, double t_abs_start, double i0, double rrom, double lrom, double f_src, double amp_src, double r_series, double l_series, const unsigned N_xyce_samples);
 
-// Generiert restart.inc (von wr_circuit.cir inkludiert): die fenster-spezifische
-// .OPTIONS RESTART und .tran Zeile. Fenster 1 (first_window=true): frischer UIC-Transient
-// ab t=0, schreibt Checkpoints (JOB). Fenster k>1: Restart aus committed_file (FILE=),
-// schreibt neue Checkpoints. Zeit ist absolut: tran-Stoppzeit = t_stop (absolut).
+// Generates restart.inc (included by wr_circuit.cir): the window-specific
+// .OPTIONS RESTART and .tran line. Window 1 (first_window=true): fresh UIC transient
+// from t=0, writes checkpoints (JOB). Window k>1: restart from committed_file (FILE=),
+// writes new checkpoints. Time is absolute: tran stop time = t_stop (absolute).
 void WriteRestartDirectives(const string& filename, bool first_window,
                             double dt_window, const string& ckpt_out_prefix,
                             const string& committed_file);
 
-// Loescht alte Checkpoint-Kandidaten <prefix>* vor der WR-Schleife (verhindert, dass ein
-// veralteter Kandidat als neuester ausgewaehlt wird).
+// Deletes stale checkpoint candidates <prefix>* before the WR loop (prevents an
+// outdated candidate from being picked as the newest one).
 void ClearCheckpoints(const string& prefix);
 
-// Sucht den neuesten (nach mtime) Checkpoint <prefix>* und kopiert ihn nach committed_file
-// als Restart-Basis fuer das naechste Zeitfenster.
+// Finds the checkpoint <prefix>* with the greatest sim-time (= window end) and copies it to
+// committed_file as the restart basis for the next time window.
 void CommitCheckpoint(const string& prefix, const string& committed_file);
 
+// Writes the two window-end terminal scalars (V, I) to a one-line text file, used to hand the
+// field/circuit end values between solver stages (Field.txt / Circuit.txt).
 inline void Write_Terminal_results(const char s[80], const double V, const double I)
 {
-	FILE* file = fopen(s, "w");
-	fprintf(file, " %12.5e   % 12.5e", V, I);
-	fflush(file);
-	fclose(file);
+    FILE* file = fopen(s, "w");
+    fprintf(file, " %12.5e   % 12.5e", V, I);
+    fflush(file);
+    fclose(file);
 }
 
+// Reads back the two terminal scalars (V, I) written by Write_Terminal_results.
 inline void Read_Terminal_results(const char s[80], double& V, double& I)
 {
-	FILE* file = fopen(s, "r");
-	const int l_char = 256;
-	char in[l_char];
-	char* ptr_in = &in[0];
+    FILE* file = fopen(s, "r");
+    const int l_char = 256;
+    char in[l_char];
+    char* ptr_in = &in[0];
 
-	fgets(ptr_in, l_char, file);
-	sscanf(ptr_in, "%lg %lg", &V, &I);
-	fclose(file);
+    fgets(ptr_in, l_char, file);
+    sscanf(ptr_in, "%lg %lg", &V, &I);
+    fclose(file);
 }
 
 

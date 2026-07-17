@@ -66,6 +66,10 @@ void appendProbeColumns(const string& xyce_prn, FILE* out, size_t n_probes,
     fflush(out);
 }
 
+// Loads tunable parameters from a key=value config file into the global g_cfg. Accepts "key=value"
+// or "key value" ('='/','/tab are treated as separators); '#' starts a comment. Unknown keys are
+// logged and ignored; N_xyce_coupling_intervals is a back-compat alias for N_xyce_samples. Returns
+// false (and keeps all defaults) if the file cannot be opened.
 bool LoadConfig(const string& filename)
 {
     ifstream in(filename);
@@ -139,10 +143,12 @@ bool LoadConfig(const string& filename)
 }
 
 
+// A scalar time series (strictly increasing time t[], value y[]); the basic PWL/interface waveform.
 struct Waveform {
     vector<double> t;
     vector<double> y;
 
+    // Append (time, value); throws if time is not strictly greater than the last (monotonic guard).
     void push(double time, double value) {
     if (!t.empty() && time <= t.back()) {
         cerr << "Waveform time error: new time = " << time
@@ -154,6 +160,9 @@ struct Waveform {
     }
 };
 
+// Append (time, value) to wf, but if `time` equals the last timestamp (within tolerance) overwrite
+// the last sample instead of pushing a duplicate. Throws if time goes backwards. Tolerates the
+// shared window-edge point Xyce emits twice across a restart boundary.
 void pushOrReplaceDuplicateTime(Waveform& wf, double time, double value)
 {
     const double absTol = 1e-15;
@@ -182,12 +191,15 @@ void pushOrReplaceDuplicateTime(Waveform& wf, double time, double value)
     throw std::runtime_error("Xyce output times are decreasing.");
 }
 
+// Circuit-side time series: the three printed columns per point -- port voltage vp = V(p),
+// interface node vnx = V(nx), interface current i = I(Vmeas).
 struct CircuitWaveform {
     vector<double> t;
     vector<double> vp;
     vector<double> vnx;
     vector<double> i;
 
+    // Append one (time, vp, vnx, i) row; throws if time is not strictly increasing.
     void push(double time, double vp_value, double vnx_value, double i_value) {
         if (!t.empty() && time <= t.back()) {
             throw runtime_error("CircuitWaveform times must be strictly increasing.");
@@ -200,6 +212,8 @@ struct CircuitWaveform {
     }
 };
 
+// Like the Waveform overload, for CircuitWaveform: append (time, vp, vnx, i) or overwrite the last
+// row when `time` coincides with the last timestamp (within tolerance). Throws if time decreases.
 void pushOrReplaceDuplicateTime(
     CircuitWaveform& wf,
     double time,
@@ -235,6 +249,8 @@ void pushOrReplaceDuplicateTime(
 }
 
 
+// Writes a waveform as a Xyce PWL FILE table (one "time value" pair per line, full double precision).
+// Throws if the waveform is empty or its t/y sizes disagree.
 void writePWLFile(const string& filename, const Waveform& wf) {
     if (wf.t.size() != wf.y.size() || wf.t.empty()) {
         throw runtime_error("Invalid waveform.");
@@ -252,9 +268,9 @@ void writePWLFile(const string& filename, const Waveform& wf) {
     }
 }
 
-// Schreibt 2-Punkt PWL als lineare Rampe von (t_start, value_start) mit Steigung `slope`.
-// slope=0 (default) → konstante PWL. slope ≠ 0 sorgt für konsistente Anfangsableitung
-// an V(iprev)/V(vfprev) am Fensteranfang (passend zur dIdt0-Verwendung in Biface IF-Guard).
+// Writes a 2-point PWL as a linear ramp from (t_start, value_start) with slope `slope`.
+// slope=0 (default) -> constant PWL. slope != 0 sets a consistent initial slope of the
+// seed waveform V(iprev)/V(vfprev) at the window start (dIdt0/dVdt0 carried from the previous window).
 void WriteInitialPwl(
     const char* filename,
     double t_start,
@@ -275,6 +291,8 @@ void WriteInitialPwl(
     fclose(file);
 }
 
+// Reads a "time value" PWL table back into a Waveform (via pushOrReplaceDuplicateTime, so a repeated
+// final/edge timestamp collapses). Throws if the file cannot be opened or contains no data.
 Waveform readPWLFile(const string& filename)
 {
     ifstream in(filename);
@@ -301,19 +319,19 @@ Waveform readPWLFile(const string& filename)
 //It can be realized where ever it's easiest, e.g., inside the circuit solver, or inside the FEM solver, or exterior
 void MasterProcess()
 {
-	cout << "Master process started" << endl;
+    cout << "Master process started" << endl;
 
-    // Schaltungs-Netzliste aus g_cfg generieren (Topologie fensterinvariant -> einmal hier).
-    // Ueberschreibt wr_circuit.cir mit Quelle (source_kind) + serieller R/L/C-Kette + fixer
-    // WR-Schnittstelle. Pro-Fenster variable Parameter kommen weiter aus sim_params.inc.
+    // Generate the circuit netlist from g_cfg (topology is window-invariant -> once here).
+    // Overwrites wr_circuit.cir with source (source_kind) + series R/L/C chain + fixed
+    // WR interface. Per-window variable parameters still come from sim_params.inc.
     WriteCircuitNetlist("wr_circuit.cir");
 
-    // Datei für Feldlösung an Synchronisationszeitpunkten (entspricht hier Feldschritten)
+    // File for the field solution at the synchronization points (here equal to the field steps)
     FILE* file_Field = fopen("Field_solution.prn", "w");
     fprintf(file_Field, "Index       TIME              V(FIELD)          I(FIELD)\n");
     fflush(file_Field);
 
-    // Datei für die rekonstruierte/extrapolierte Feldlösung, d.h. die Felddaten die Xyce eingelesen hat
+    // File for the reconstructed/extrapolated field solution, i.e. the field data Xyce read in
     FILE* file_Field_waveform = fopen("Field_waveform_solution.prn", "w");
     fprintf(file_Field_waveform, "Index       TIME              V(FIELD)          I(FIELD)\n");
     fflush(file_Field_waveform);
@@ -343,7 +361,7 @@ void MasterProcess()
 
     // All tunable parameters come from g_cfg (loaded from sim_config.txt; see SimConfig).
     // The impedance values (L_ROM, R_ROM) are a reduced-order model of the field domain used
-    // inside the Xyce Biface interface condition; they need not match the "true" FEM values.
+    // inside the Xyce Bfield interface condition; they need not match the "true" FEM values.
     const double L_ROM = g_cfg.L_ROM;
     const double R_ROM = g_cfg.R_ROM;
     // Circuit voltage source Bsrc: single source of truth for amplitude/frequency, written via
@@ -386,87 +404,87 @@ void MasterProcess()
     double I0 = 0.0;
     double V0 = 0.0;
     double dIdt_0 = 0.0;
-    // dV/dt der Portspannung am Fensteranfang (Seed-Slope für vf_prev_k.pwl). Wird am Fensterende
-    // aus der konvergierten V(p)-Waveform getragen (topologie-agnostisch, korrekt auch mit Rs/Ls).
-    // Fenster 1: quellen-abhaengige Anfangssteigung (bei I0=0,dIdt0=0 ist V(p)≈Vsrc). Die sinus-
-    // Formel gilt NUR fuer source_kind 0; fuer Strom-/Step-Quellen ist sie falsch und verlangsamt die
-    // WR-Konvergenz des ersten Fensters (die restlichen Fenster tragen die Steigung aus der Loesung).
+    // dV/dt of the port voltage at the window start (seed slope for vf_prev_k.pwl). At the window
+    // end it is carried from the converged V(p) waveform (topology-agnostic, correct also with Rs/Ls).
+    // Window 1: source-dependent initial slope (with I0=0,dIdt0=0, V(p)≈Vsrc). The sine
+    // formula holds ONLY for source_kind 0; for current/step sources it is wrong and slows the
+    // WR convergence of the first window (the remaining windows carry the slope from the solution).
     double dVdt_0;
     switch (g_cfg.source_kind) {
-        case 0: // sinusoidale SPANNUNGsquelle (Legacy): Quellensteigung amplitude*2*pi*f (Regressions-Anker).
+        case 0: // sinusoidal VOLTAGE source (legacy): source slope amplitude*2*pi*f (regression anchor).
             dVdt_0 = V_src_amplitude * 2.0 * M_PI * Frequency * cos(2.0 * M_PI * Frequency * 0.0);
             break;
-        default: // Strom-/Step-Quellen: neutraler Seed 0. V(p) startet ~0 (Ls blockiert den Anfangsstrom,
-                 // beim Step faellt die volle Quellspannung zunaechst ueber Ls ab -> dV(p)/dt(0)≈0). Ein
-                 // Steigungs-Seed aus der reinen Rampensteigung ueberschiesst und KOSTET WR-Iterationen.
+        default: // current/step sources: neutral seed 0. V(p) starts ~0 (Ls blocks the initial current,
+                 // for the step the full source voltage first drops across Ls -> dV(p)/dt(0)≈0). A
+                 // slope seed from the pure ramp slope overshoots and COSTS WR iterations.
             dVdt_0 = 0.0;
             break;
     }
 
     //fprintf(file_Field, "%-10lu %-17.8e %-17.8e %-17.8e\n", global_field_index++, 0.0, V_field, I_field);
 
-    // Äußere Schleife der Zeitfenster
-    // hier ist Feldintervall = WR-Zeitfenster
+    // Outer loop over the time windows
+    // here the field interval = WR time window
     for (unsigned step_field = 1; step_field <= N_steps_field; step_field++) {
-        // nichtlineares Verhalten des RL-Gliedes (dummy)
+        // nonlinear behavior of the RL element (dummy)
         //R_ROM *= 1.2;
         //L_ROM *= 1.05;
 
-        const double t_start = (step_field - 1) * dt_field; // brauchen wir vor allem hier (in cpp), Xyce simuliert immer von 0 bis Stopzeitpunkt wenn man es aufruft. In xyce nutzen wir es nur für die Phase der restlichen Schaltung (z.B. Vsrc wenn Schaltung nur Spannungsquelle ist)
+        const double t_start = (step_field - 1) * dt_field; // needed mainly here (in cpp); Xyce always simulates from 0 to the stop time when called. In Xyce we only use it for the phase of the rest of the circuit (e.g. Vsrc if the circuit is only a voltage source)
         const double t_stop = step_field * dt_field;
 
-        WriteSimParams("sim_params.inc", 0.0, dt_field, t_start, I0, R_ROM, L_ROM, Frequency, V_src_amplitude, dIdt_0, g_cfg.R_series, g_cfg.L_series, N_xyce_samples);
+        WriteSimParams("sim_params.inc", 0.0, dt_field, t_start, I0, R_ROM, L_ROM, Frequency, V_src_amplitude, g_cfg.R_series, g_cfg.L_series, N_xyce_samples);
 
-        // Fenster-spezifische Restart/.tran-Direktiven generieren (von wr_circuit.cir inkludiert).
-        // Fenster 1: frischer UIC-Transient ab 0; Fenster k>1: Restart aus "restart_state".
+        // Generate the window-specific restart/.tran directives (included by wr_circuit.cir).
+        // Window 1: fresh UIC transient from 0; window k>1: restart from "restart_state".
         WriteRestartDirectives("restart.inc", step_field == 1, dt_field, "ckpt_out", "restart_state");
 
-        // initialisiere mit zuletzt akzeptierten Werten. Zeitstempel sind ABSOLUT ([t_start, t_stop]),
-        // da Xyce die PWL-FILE-Quellen an der absoluten Simulationszeit auswertet (Restart startet
-        // bei t_start, nicht bei 0).
+        // initialize with the last accepted values. Timestamps are ABSOLUTE ([t_start, t_stop]),
+        // because Xyce evaluates the PWL FILE sources at the absolute simulation time (restart starts
+        // at t_start, not at 0).
         WriteInitialPwl("vf_prev_k.pwl", t_start, t_stop, V0, dVdt_0);
-        // i_prev_k.pwl: lineare Rampe mit Steigung dIdt_0, passend zur akkumulierten Sekante im FEM.
+        // i_prev_k.pwl: linear ramp with slope dIdt_0, matching the accumulated secant in the FEM.
         WriteInitialPwl("i_prev_k.pwl",   t_start, t_stop, I0, dIdt_0);
 
-        // Veraltete Checkpoint-Kandidaten dieses Prefixes entfernen, damit CommitCheckpoint
-        // nach der WR-Schleife garantiert den frisch erzeugten Kandidaten dieses Fensters waehlt.
+        // Remove stale checkpoint candidates of this prefix so that CommitCheckpoint after the WR
+        // loop is guaranteed to pick the freshly created candidate of this window.
         ClearCheckpoints("ckpt_out");
 
-        CircuitWaveform circuit_sol; // circuit solution array (nur für Ausgabe/Visualisierung gebraucht)
+        CircuitWaveform circuit_sol; // circuit solution array (only needed for output/visualization)
 
         unsigned WR_iteration;
         double WR_rel_Error = 1.0;
         bool WR_converged = false;
-        Waveform i_prev_last_iter; // i_m^(k-1) für L1-Konvergenzkriterium; leer am Fensteranfang
-        double V_field_last_iter = 0.0; // für terminal-skalar Kriterium (Referenz CoSimulation_WR.cpp)
+        Waveform i_prev_last_iter; // i_m^(k-1) for the L1 convergence criterion; empty at the window start
+        double V_field_last_iter = 0.0; // for the terminal-scalar criterion (reference CoSimulation_WR.cpp)
         double I_field_last_iter = 0.0;
-        // WR-Iterationsschleife
+        // WR iteration loop
         for (WR_iteration = 1; WR_iteration <= WRmaxSteps; WR_iteration++) {
             circuit_sol = CircuitWaveform{};
 
-            // Circuit Solver aufrufen: Biface liefert I(Vmeas) = INTERFACE_condition(V(p), V(vfprev), V(iprev)).
-            // ReadXyceResults schreibt V(p)-Waveform nach vf_prev_k.pwl für FEM-Eingang.
+            // Call the circuit solver: Bfield returns I(Vmeas) = INTERFACE_condition(V(p), V(vfprev), V(iprev)).
+            // ReadXyceResults writes the V(p) waveform to vf_prev_k.pwl for the FEM input.
             RunXyce("wr_circuit.cir");
             ReadXyceResults("wr_circuit.cir.prn", circuit_sol, t_start, t_stop, N_xyce_samples);
 
-            // FEM Solver aufrufen (dummy). Kopplungsrichtung per coupling_mode:
-            //   0 voltage-driven: liest vf_prev_k.pwl (V(p)), schreibt i_prev_k.pwl (I_field).
-            //   1 current-driven: liest i_prev_k.pwl (I(Vmeas)), schreibt vf_prev_k.pwl (V_field).
-            // schreibt Endwerte in Field.txt
+            // Call the FEM solver (dummy). Coupling direction per coupling_mode:
+            //   0 voltage-driven: reads vf_prev_k.pwl (V(p)), writes i_prev_k.pwl (I_field).
+            //   1 current-driven: reads i_prev_k.pwl (I(Vmeas)), writes vf_prev_k.pwl (V_field).
+            // writes the end values to Field.txt
             if (g_cfg.coupling_mode == 1)
                 FEM_solver_current_driven_waveform(I0, V0, N_field_eval_intervals);
             else
                 FEM_solver_voltage_driven_waveform(I0, N_field_eval_intervals);
             Read_Terminal_results("Field.txt", V_field, I_field);
 
-            // i_prev = Feldstrom-Waveform dieser Iteration (FEM-Ausgang)
+            // i_prev = field-current waveform of this iteration (FEM output)
             Waveform i_prev = readPWLFile("i_prev_k.pwl");
             std::cout << "PWL points: " << i_prev.t.size() << std::endl;
 
-            // Prüfe Konvergenzkriterium. Methode wählbar via g_cfg.wr_convergence_method:
-            //   0 = Waveform-L1 des Feldstroms (dieses Codebase)
-            //   1 = terminal-skalar (Referenz CoSimulation_WR.cpp): Feld-vs-Schaltung +
-            //       Iterations-zu-Iterations-Aenderung der Terminalwerte V,I.
+            // Check the convergence criterion. Method selectable via g_cfg.wr_convergence_method:
+            //   0 = waveform L1 of the field current (this codebase)
+            //   1 = terminal-scalar (reference CoSimulation_WR.cpp): field-vs-circuit +
+            //       iteration-to-iteration change of the terminal values V,I.
             bool can_converge;
             if (g_cfg.wr_convergence_method == 1) {
                 double V_circuit, I_circuit;
@@ -474,11 +492,11 @@ void MasterProcess()
                 WR_rel_Error = eval_WR_convergence_terminal(
                     V_field, I_field, V_circuit, I_circuit,
                     V_field_last_iter, I_field_last_iter, WR_iteration);
-                // Referenz erlaubt Konvergenz ab Iteration 1 (FC-Terme allein koennen reichen).
+                // reference allows convergence from iteration 1 (the FC terms alone can suffice).
                 can_converge = true;
             } else {
-                // L1-rel-Norm von (i_m^(k) - i_m^(k-1)) / i_m^(k); braucht >=2 Iterationen
-                // (Iteration 1 liefert Sentinel 1.0, keine Vorgaenger-Waveform).
+                // L1 relative norm of (i_m^(k) - i_m^(k-1)) / i_m^(k); needs >=2 iterations
+                // (iteration 1 returns the sentinel 1.0, no previous waveform).
                 WR_rel_Error = eval_WR_convergence(i_prev, i_prev_last_iter, WR_iteration);
                 can_converge = (WR_iteration > 1);
             }
@@ -488,15 +506,15 @@ void MasterProcess()
                 break;
             }
 
-            // Werte dieser Iteration für die nächste Konvergenzprüfung aufheben
+            // keep the values of this iteration for the next convergence check
             i_prev_last_iter = i_prev;
             V_field_last_iter = V_field;
             I_field_last_iter = I_field;
         }
 
-        // Screen Output
+        // Screen output
         //
-        // Resultate in Datei schreiben
+        // Write results to file
 
         PRINT(t_stop);
         PRINT(WR_rel_Error);
@@ -512,17 +530,17 @@ void MasterProcess()
             PRINT(V_field);
             PRINT(I_field);
 
-            // Feldlösung an den Endpunkten (hier gleich den Synchronisationspunkten) im Xyce Format speichern
+            // Store the field solution at the endpoints (here equal to the synchronization points) in Xyce format
             fprintf(file_Field, "%-10lu %-17.8e %-17.8e %-17.8e\n", global_field_index++, t_stop, V_field, I_field);
             fflush(file_Field);
 
-            // Konvergierten Endzustand als Restart-Basis fuers naechste Fenster sichern.
-            // (Alle WR-Iterationen schrieben denselben Kandidaten ckpt_out<t_stop>; der
-            // neueste ist der konvergierte.)
+            // Save the converged end state as the restart basis for the next window.
+            // (All WR iterations wrote the same candidate ckpt_out<t_stop>; the
+            // newest one is the converged one.)
             CommitCheckpoint("ckpt_out", "restart_state");
 
-            // die Xycelösung des Zeitfensters an die vorigen anhängen.
-            // Waveforms tragen jetzt ABSOLUTE Zeit → Offset 0.0 (kein erneutes Verschieben).
+            // Append the Xyce solution of this time window to the previous ones.
+            // Waveforms now carry ABSOLUTE time -> offset 0.0 (no further shifting).
             const bool skip_first_point = (step_field > 1);
             appendCircuitWaveformXyceStyle(file_Circuit, circuit_sol, 0.0, global_circuit_index, skip_first_point);
 
@@ -531,14 +549,14 @@ void MasterProcess()
                 appendProbeColumns("wr_circuit.cir.prn", file_Probes, g_probes.size(),
                                    global_probe_index, skip_first_point);
 
-            // auch die Feld-WAVEFORMS (also nicht nur Endpunkte) speichern wir im Xyce Format ab
-            // dafür lesen wir die konvergierten Waveforms ein (letzte Iteration)
+            // We also store the field WAVEFORMS (i.e. not only endpoints) in Xyce format;
+            // for that we read in the converged waveforms (last iteration)
             Waveform vf_conv = readPWLFile("vf_prev_k.pwl"); // port voltage V(p) from Xyce (coupling grid)
             Waveform i_conv  = readPWLFile("i_prev_k.pwl");  // field current I_field from FEM (FEM grid)
 
-            // Beide auf gemeinsames FEM-Eval-Grid (N_field_eval_intervals+1) re-sampeln,
-            // damit appendFieldWaveformXyceStyle übereinstimmende Zeitstempel sieht.
-            // (vf_conv hat N_xyce_samples+1 Knoten, i_conv hat N_field_eval_intervals+1)
+            // Re-sample both onto a common FEM-eval grid (N_field_eval_intervals+1),
+            // so that appendFieldWaveformXyceStyle sees matching timestamps.
+            // (vf_conv has N_xyce_samples+1 nodes, i_conv has N_field_eval_intervals+1)
             Waveform vf_endpoints = resampleWaveformUniform(
                 vf_conv, t_start, t_stop, N_field_eval_intervals
             );
@@ -546,10 +564,10 @@ void MasterProcess()
                 i_conv, t_start, t_stop, N_field_eval_intervals
             );
 
-            // und hängen sie an die bisherigen Zeitfenster an (Waveforms bereits absolut → Offset 0.0)
+            // and append them to the previous time windows (waveforms already absolute -> offset 0.0)
             appendFieldWaveformXyceStyle(file_Field_waveform, vf_endpoints, i_endpoints, 0.0, global_field_waveform_index, skip_first_point);
 
-            // Festhalten der Endwerte für die Anfangswerte des nächsten Zeitfensters.
+            // Record the end values as the initial values of the next time window.
             // Default (one-sided): V0 = circuit V(p), I0 = field I. seam_average: midpoint of both
             // terminals (they agree < WR_tolerance, so the blend stays within tol of either side).
             const double V_circ_end = vf_conv.y.back();  // circuit port voltage at window end
@@ -559,11 +577,11 @@ void MasterProcess()
                 V0 = 0.5 * (V_circ_end + V_field);
                 I0 = 0.5 * (I_circ_end + I_field);
             } else {
-                V0 = V_circ_end;  // Portspannung am Fensterende (= V(p) bei t=dt_field)
-                I0 = I_field;     // Feldstrom am Fensterende (FEM-Ausgang)
+                V0 = V_circ_end;  // port voltage at window end (= V(p) at t=dt_field)
+                I0 = I_field;     // field current at window end (FEM output)
             }
 
-            // dI/dt am Fensterende = dI/dt am Anfang des nächsten Fensters (Stetigkeit)
+            // dI/dt at window end = dI/dt at the start of the next window (continuity)
             const size_t n_i = i_conv.t.size();
             if (n_i >= 2) {
                 const double dt_end = i_conv.t[n_i - 1] - i_conv.t[n_i - 2];
@@ -572,9 +590,9 @@ void MasterProcess()
                 dIdt_0 = 0.0;
             }
 
-            // dV/dt der Portspannung am Fensterende → Seed-Slope des nächsten Fensters.
-            // Aus der konvergierten V(p)-Waveform gemessen (topologie-agnostisch): korrekt auch
-            // wenn V(p) ≠ Vsrc (serielle Rs/Ls), wo die reine Quellensteigung falsch wäre.
+            // dV/dt of the port voltage at window end -> seed slope of the next window.
+            // Measured from the converged V(p) waveform (topology-agnostic): correct also
+            // when V(p) != Vsrc (series Rs/Ls), where the pure source slope would be wrong.
             const size_t n_v = vf_conv.t.size();
             if (n_v >= 2) {
                 const double dt_end_v = vf_conv.t[n_v - 1] - vf_conv.t[n_v - 2];
@@ -596,17 +614,17 @@ void MasterProcess()
 
 }
 
-// FEM-Solver (voltage-driven): nimmt Portspannungs-Waveform V_p(t) aus vf_prev_k.pwl
-// und berechnet Feldstrom I_field(t) via akkumulierter Sekante. Konsistent mit Biface-Ausdruck
-// in wr_circuit.cir. Multi-rate: FEM arbeitet auf gröberem Grid als Xyce-intern.
+// FEM solver (voltage-driven): takes the port-voltage waveform V_p(t) from vf_prev_k.pwl
+// and computes the field current I_field(t) via an accumulated secant. Consistent with the Bfield
+// expression in wr_circuit.cir. Multi-rate: the FEM works on a coarser grid than Xyce internally.
 void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eval_intervals)
 {
     // Reads the port voltage waveform stored by ReadXyceResults from V(p).
     const Waveform vport = readPWLFile("vf_prev_k.pwl");
 
-    // Zeit ist jetzt absolut (vport.t.front() = absoluter Fensteranfang, nicht 0). Der
-    // FEM-Solver ist offset-agnostisch: t_acc wird unten als (t[j] - front) gemessen, also
-    // korrekt unabhaengig vom absoluten Startzeitpunkt. Daher keine "startet bei 0"-Pruefung.
+    // Time is now absolute (vport.t.front() = absolute window start, not 0). The
+    // FEM solver is offset-agnostic: t_acc is measured below as (t[j] - front), i.e.
+    // correct independent of the absolute start time. Hence no "starts at 0" check.
 
     const size_t Nv = vport.t.size();
     if (Nv < 2) {
@@ -633,18 +651,18 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     const double t_start = vport.t.front();
     const double t_end   = vport.t.back();
 
-    // Multi-rate: FEM re-sampelt Portspannung auf groebers FEM-Grid.
+    // Multi-rate: the FEM re-samples the port voltage onto a coarser FEM grid.
     const Waveform V_eval = resampleWaveformUniform(
         vport, t_start, t_end, N_field_eval_intervals
     );
     const size_t N = V_eval.t.size(); // = N_field_eval_intervals + 1
 
-    // KRITISCH: I_field-Berechnung muss exakt dasselbe akkumulierte Sekanten-Modell wie
-    // Biface in wr_circuit.cir verwenden, um konsistenten WR-Fixpunkt zu garantieren.
-    // Biface: I_c = V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/time)
-    // FEM-Herleitung: V_p = R_FEM*I_f + L_FEM*(I_f - I0)/t_acc
-    //   → I_f = (V_p + L_FEM*I0/t_acc) / (R_FEM + L_FEM/t_acc)  für t_acc > 0
-    //   → I_f = I_win_start                                     für t_acc = 0
+    // CRITICAL: the I_field computation must use exactly the same accumulated secant model as
+    // Bfield in wr_circuit.cir to guarantee a consistent WR fixpoint.
+    // Bfield: I_c = V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/(time - t_abs_start))
+    // FEM derivation: V_p = R_FEM*I_f + L_FEM*(I_f - I0)/t_acc
+    //   -> I_f = (V_p + L_FEM*I0/t_acc) / (R_FEM + L_FEM/t_acc)  for t_acc > 0
+    //   -> I_f = I_win_start                                     for t_acc = 0
     const double t_win_start = V_eval.t.front();
     const double t_win_end   = V_eval.t.back();
 
@@ -699,7 +717,7 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     // This file is used by Xyce as V(iprev) in the next WR iteration.
     writePWLFile("i_prev_k.pwl", current);
 
-    // Terminal-Werte am Fensterende für Konvergenz-Propagation ins nächste Fenster.
+    // Terminal values at the window end for convergence propagation into the next window.
     Write_Terminal_results("Field.txt", vport.y.back(), current.y.back());
 }
 
@@ -785,47 +803,47 @@ void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_
     Write_Terminal_results("Field.txt", V_field_end, I_end);  // (V_field_end, I_end)
 }
 
-// WR-Konvergenzkriterium auf Basis der Stromwaveforms benachbarter Iterationen:
+// WR convergence criterion based on the current waveforms of adjacent iterations:
 //
 //   ∫|i_m^(k)(t) - i_m^(k-1)(t)| dt   /   ∫|i_m^(k)(t)| dt   ≤   WR_tolerance
 //
-// Integration via Trapezregel über das Kopplungsraster (i_curr und i_prev_iter teilen sich
-// dasselbe uniforme Zeitgrid aus resampleWaveformUniform). Wegen Transmissionsbedingung
-// i_m^(k) = i_c^(k) wird hier der konvergierte/gerade berechnete Schaltungsstrom verwendet.
+// Integration via the trapezoidal rule over the coupling grid (i_curr and i_prev_iter share
+// the same uniform time grid from resampleWaveformUniform). Because of the transmission condition
+// i_m^(k) = i_c^(k), the converged/just-computed circuit current is used here.
 double eval_WR_convergence(const Waveform& i_curr, const Waveform& i_prev_iter, const unsigned WR_iteration)
 {
-	if (WR_iteration < 2 || i_prev_iter.t.empty()) {
-		cout << "WR-step  " << WR_iteration << ": skip (no previous waveform)" << endl;
-		return 1.0;
-	}
+    if (WR_iteration < 2 || i_prev_iter.t.empty()) {
+        cout << "WR-step  " << WR_iteration << ": skip (no previous waveform)" << endl;
+        return 1.0;
+    }
 
-	if (i_curr.t.size() != i_prev_iter.t.size() || i_curr.t.size() < 2) {
-		throw runtime_error("eval_WR_convergence: waveform size mismatch or too small.");
-	}
+    if (i_curr.t.size() != i_prev_iter.t.size() || i_curr.t.size() < 2) {
+        throw runtime_error("eval_WR_convergence: waveform size mismatch or too small.");
+    }
 
-	double num = 0.0; // ∫ |i^(k) - i^(k-1)| dt
-	double den = 0.0; // ∫ |i^(k)|         dt
-	for (size_t n = 0; n + 1 < i_curr.t.size(); ++n) {
-		const double dt = i_curr.t[n + 1] - i_curr.t[n];
+    double num = 0.0; // ∫ |i^(k) - i^(k-1)| dt
+    double den = 0.0; // ∫ |i^(k)|         dt
+    for (size_t n = 0; n + 1 < i_curr.t.size(); ++n) {
+        const double dt = i_curr.t[n + 1] - i_curr.t[n];
 
-		const double diff_a = std::fabs(i_curr.y[n]     - i_prev_iter.y[n]);
-		const double diff_b = std::fabs(i_curr.y[n + 1] - i_prev_iter.y[n + 1]);
-		num += 0.5 * (diff_a + diff_b) * dt;
+        const double diff_a = std::fabs(i_curr.y[n]     - i_prev_iter.y[n]);
+        const double diff_b = std::fabs(i_curr.y[n + 1] - i_prev_iter.y[n + 1]);
+        num += 0.5 * (diff_a + diff_b) * dt;
 
-		const double abs_a = std::fabs(i_curr.y[n]);
-		const double abs_b = std::fabs(i_curr.y[n + 1]);
-		den += 0.5 * (abs_a + abs_b) * dt;
-	}
+        const double abs_a = std::fabs(i_curr.y[n]);
+        const double abs_b = std::fabs(i_curr.y[n + 1]);
+        den += 0.5 * (abs_a + abs_b) * dt;
+    }
 
-	if (den <= 0.0) {
-		throw runtime_error("eval_WR_convergence: zero denominator (current waveform identically zero?).");
-	}
+    if (den <= 0.0) {
+        throw runtime_error("eval_WR_convergence: zero denominator (current waveform identically zero?).");
+    }
 
-	const double WR_relErr = num / den;
-	cout << "WR-step  " << WR_iteration
-	     << ", L1 rel current error = " << WR_relErr << endl;
+    const double WR_relErr = num / den;
+    cout << "WR-step  " << WR_iteration
+         << ", L1 rel current error = " << WR_relErr << endl;
 
-	return WR_relErr;
+    return WR_relErr;
 }
 
 
@@ -867,7 +885,8 @@ double eval_WR_convergence_terminal(
 
 // Reads Xyce .prn output produced by ".print tran V(p) V(nx) I(Vmeas)"
 // Columns: Index  time  V(p)  V(nx)  I(Vmeas)
-// Writes V(p) resampled to vf_prev_k.pwl (port voltage for FEM voltage-driven input).
+// Resamples the circuit->field quantity per coupling_mode: voltage-driven -> V(p) to
+// vf_prev_k.pwl (field reads port voltage); current-driven -> I(Vmeas) to i_prev_k.pwl.
 // Writes last (V(nx), I(Vmeas)) to Circuit.txt.
 void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, double t_start, double t_stop, unsigned N_xyce_eval_points)
 {
@@ -879,13 +898,13 @@ void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, doubl
     circuit_raw.vnx.clear();
     circuit_raw.i.clear();
 
-	FILE* file = fopen(filename.c_str(), "r");
-	if (!file)
-		throw runtime_error(string("Could not open Xyce results file: ") + filename);
+    FILE* file = fopen(filename.c_str(), "r");
+    if (!file)
+        throw runtime_error(string("Could not open Xyce results file: ") + filename);
 
-	char line[512];
+    char line[512];
 
-    // prüfe ob Datei leer ist, überspringt auch die erste Zeile (Header)
+    // check whether the file is empty, also skips the first line (header)
     if (!fgets(line, sizeof(line), file)) {
         fclose(file);
         throw runtime_error("ReadXyceResults: empty file");
@@ -893,29 +912,29 @@ void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, doubl
 
     double last_V = 0.0;
     double last_I = 0.0;
-	double idx, time, Vp, Viface, I;
-	unsigned step = 0;
+    double idx, time, Vp, Viface, I;
+    unsigned step = 0;
 
-	while (fgets(line, sizeof(line), file))
-	{
-		if (strncmp(line, "End", 3) == 0) break;
+    while (fgets(line, sizeof(line), file))
+    {
+        if (strncmp(line, "End", 3) == 0) break;
 
-		if (sscanf(line, "%lg %lg %lg %lg %lg", &idx, &time, &Vp, &Viface, &I) == 5)
-		{
+        if (sscanf(line, "%lg %lg %lg %lg %lg", &idx, &time, &Vp, &Viface, &I) == 5)
+        {
             pushOrReplaceDuplicateTime(vp_raw, time, Vp);
             pushOrReplaceDuplicateTime(i_raw, time, I);
             pushOrReplaceDuplicateTime(circuit_raw, time, Vp, Viface, I);
 
             last_V = Viface;
             last_I = I;
-			step++;
-		}
-	}
+            step++;
+        }
+    }
 
-	fclose(file);
+    fclose(file);
 
-	if (step == 0)
-		throw runtime_error("ReadXyceResults: no data rows read");
+    if (step == 0)
+        throw runtime_error("ReadXyceResults: no data rows read");
 
     Write_Terminal_results("Circuit.txt", last_V, last_I);
 
@@ -935,6 +954,8 @@ void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, doubl
     }
 }
 
+// Runs the Xyce circuit solver on the given netlist (stdout/stderr redirected to xyce_*.log).
+// Throws if Xyce exits non-zero.
 void RunXyce(const string& filename) {
     string cmd =
         string("Xyce ") + filename +
@@ -1168,12 +1189,12 @@ static void emitCustomTopology(ofstream& out)
         throw runtime_error("emitCustomTopology: circuit_spec.txt has no elements.");
 }
 
-// Generiert die vollstaendige Schaltungs-Netzliste (wr_circuit.cir) aus g_cfg. Topologie ist
-// fensterinvariant -> EINMAL vor der WR-Schleife (und im emit-Modus) aufgerufen. Elemente werden
-// INLINE geschrieben (kein .INCLUDE der Devices), damit der UI-Netzlisten-Parser (folgt keinen
-// .INCLUDEs) die Schaltung zeichnen kann. Pro-Fenster variable Groessen (amp_src/f_src/Rs/Ls/...)
-// bleiben als {param}-Referenzen in sim_params.inc; C_series und Step-Parameter werden als Literale
-// geschrieben (konfig-konstant). Die WR-Schnittstelle (Vmeas/Bfield) ist fix und unveraendert.
+// Generates the full circuit netlist (wr_circuit.cir) from g_cfg. The topology is
+// window-invariant -> called ONCE before the WR loop (and in emit mode). Elements are written
+// INLINE (no .INCLUDE of the devices) so the UI netlist parser (does not follow .INCLUDEs)
+// can draw the circuit. Per-window variable quantities (amp_src/f_src/Rs/Ls/...)
+// stay as {param} references in sim_params.inc; C_series and step parameters are written as
+// literals (config-constant). The WR interface (Vmeas/Bfield) is fixed and unchanged.
 void WriteCircuitNetlist(const string& filename)
 {
     LoadProbes("probes.txt");   // populate g_probes for the .print line (both `emit` and solve paths)
@@ -1200,29 +1221,29 @@ void WriteCircuitNetlist(const string& filename)
         out << "\n";
     } else {
     // --- Simple source (increment 1): source_kind + series R/L/C chain source->port. ---
-    // Aktive serielle Elemente auf dem Pfad Quelle->Port (nur nonzero). Reihenfolge R,L,C.
+    // Active series elements on the source->port path (nonzero only). Order R,L,C.
     vector<char> series;
     if (g_cfg.R_series != 0.0) series.push_back('R');
     if (g_cfg.L_series != 0.0) series.push_back('L');
     if (g_cfg.C_series != 0.0) series.push_back('C');
-    // Ohne serielle Elemente sitzt die Quelle direkt auf dem Port p (Einweg-Toy: V(p)==Vsrc).
+    // Without series elements the source sits directly on port p (one-way toy: V(p)==Vsrc).
     const string hot = series.empty() ? string("p") : string("s");
 
     out << "* === CIRCUIT SIDE (source_kind=" << g_cfg.source_kind << ") ===\n";
     switch (g_cfg.source_kind) {
-        case 1: // sinusoidale STROMquelle: treibt den Schleifenstrom direkt in den Port (Vorzeichen
-                // via I(Vmeas) pruefen). HINWEIS: serielle R/L/C sind bei einer Stromquelle physikalisch
-                // sinnlos (der Strom ist erzwungen; serielle Elemente floaten nur den Quellknoten) UND
-                // eine ideale Stromquelle in Reihe mit L ist entartet (Nulldurchgang -> singulaere
-                // Jacobi -> dt-Kollaps). Daher: bare Quelle direkt auf p (Preset P2 setzt R/L/C=0).
+        case 1: // sinusoidal CURRENT source: drives the loop current directly into the port (check the
+                // sign via I(Vmeas)). NOTE: series R/L/C are physically meaningless with a current source
+                // (the current is forced; series elements only float the source node) AND
+                // an ideal current source in series with L is degenerate (zero crossing -> singular
+                // Jacobian -> dt collapse). Hence: bare source directly on p (preset P2 sets R/L/C=0).
             out << "Bemf 0 " << hot << " I = { amp_src*sin(2*pi*f_src*time) }\n";
             break;
-        case 2: // Step/Rampen-SPANNUNGsquelle: einzelne steigende Flanke (tf=0, pw/per gross)
+        case 2: // step/ramp VOLTAGE source: single rising edge (tf=0, pw/per large)
             out << "Vemf " << hot << " 0 PULSE("
                 << g_cfg.step_v_initial << " " << g_cfg.step_v_final << " "
                 << g_cfg.step_delay << " " << g_cfg.step_rise << " 0 1e30 1e30)\n";
             break;
-        case 0: // sinusoidale SPANNUNGsquelle (Legacy-Default / Regressions-Anker)
+        case 0: // sinusoidal VOLTAGE source (legacy default / regression anchor)
         default:
             out << "Bemf " << hot << " 0 V = { amp_src*sin(2*pi*f_src*time) }\n";
             break;
@@ -1296,18 +1317,21 @@ void WriteCircuitNetlist(const string& filename)
     out << ".end\n";
 }
 
+// Writes sim_params.inc: the per-window .PARAM lines the netlist references (t_start/t_stop/t_abs_start,
+// I0, Rrom/Lrom, f_src/amp_src, Rs/Ls) plus the derived dt_print = t_window/N_xyce_samples (print
+// cadence + interface PWL resolution) and t_floor = t_floor_frac*t_window (secant-denominator guard).
+// Throws if t_window <= 0 or N_xyce_samples < 1.
 void WriteSimParams(
     const string& filename,
-    double t_start, // Print-Startzeit (absolut) = t_abs_start; Xyce gibt ab hier aus
-    double t_window, // Fensterlaenge dt_field
-    double t_abs_start, // absoluter Fensteranfang; jetzt für (time - t_abs_start) in den Sekanten-Termen
+    double t_start, // print start time (absolute) = t_abs_start; Xyce prints from here on
+    double t_window, // window length dt_field
+    double t_abs_start, // absolute window start; now used for (time - t_abs_start) in the secant terms
     double i0,
     double rrom,
     double lrom,
-    double f_src,   // Frequenz der Schaltungs-Spannungsquelle (Bsrc); single source of truth
-    double amp_src, // Amplitude der Schaltungs-Spannungsquelle (Bsrc)
-    double dIdt0,   // Anfangs-dI/dt (für Ls-Sekanten-Guard bei time<=eps_t)
-    double r_series, // serielle Kopplungsimpedanz Quelle→Port (two-way coupling)
+    double f_src,   // frequency of the circuit voltage source (Bsrc); single source of truth
+    double amp_src, // amplitude of the circuit voltage source (Bsrc)
+    double r_series, // series coupling impedance source->port (two-way coupling)
     double l_series,
     const unsigned N_xyce_samples
 )
@@ -1324,21 +1348,18 @@ void WriteSimParams(
     // which reduces the Xyce points). This is the raw resolution of the interface PWL.
     const double dt_print = t_window / static_cast<double>(N_xyce_samples);
 
-    // Zum vermeiden von Singularitäten in den Ableitungen
-    const double eps_t = 1.0e-15;
-
-    // Boden auf die akkumulierte Sekantenzeit t_acc. NUR eine 1/0-Absicherung am exakten
-    // Fensterstart-Eval-Punkt (time == t_abs_start): Lrom/MAX(t_acc, t_floor) statt Lrom/t_acc.
-    // Der eigentliche Stabilitaets-Fix fuer das echte Ls_d ist NICHT dieser Boden, sondern dass
-    // Biface eine GLATTE Sekante nutzt (kein IF(...)-Hartschalter mehr auf den konstanten I0):
-    // der IF-Zweig erzwang am Fensterstart eine ideale Stromquelle (Admittanz 0) in Reihe mit
-    // dem realen BDF-Ls_d → entartet/steif → Crash. Die glatte Sekante haelt die Admittanz
-    // endlich (winzig, aber >0). Boden-Sweep (Faktor 0..20) bestaetigt: accuracy/stability-neutral.
-    // Der Boden ist jetzt ein eigener Knopf: t_floor = t_floor_frac * t_window (fensterskaliert).
+    // Floor on the accumulated secant time t_acc. ONLY a 1/0 safeguard at the exact
+    // window-start eval point (time == t_abs_start): Lrom/MAX(t_acc, t_floor) instead of Lrom/t_acc.
+    // The actual stability fix for the real Ls_d is NOT this floor, but that
+    // Bfield uses a SMOOTH secant (no more IF(...) hard switch on the constant I0):
+    // the IF branch forced an ideal current source (admittance 0) at the window start in series with
+    // the real BDF Ls_d -> degenerate/stiff -> crash. The smooth secant keeps the admittance
+    // finite (tiny, but >0). Floor sweep (factor 0..20) confirms: accuracy/stability-neutral.
+    // The floor is now its own knob: t_floor = t_floor_frac * t_window (window-scaled).
     const double t_floor = g_cfg.t_floor_frac * t_window;
 
-    // Zeit ist absolut/kontinuierlich (Checkpoint/Restart): tran-Stoppzeit ist der
-    // ABSOLUTE Fensterende-Zeitpunkt, nicht die Fensterlaenge.
+    // Time is absolute/continuous (checkpoint/restart): the tran stop time is the
+    // ABSOLUTE window-end time, not the window length.
     const double t_stop_abs = t_abs_start + t_window;
 
     ofstream out(filename);
@@ -1349,22 +1370,20 @@ void WriteSimParams(
     out << ".PARAM I0           = " << i0           << "\n";
     out << ".PARAM Rrom         = " << rrom         << "\n";
     out << ".PARAM Lrom         = " << lrom         << "\n";
-    out << ".PARAM eps_t        = " << eps_t        << "\n";
     out << ".PARAM dt_print     = " << dt_print     << "\n";
     out << ".PARAM f_src        = " << f_src        << "\n";
     out << ".PARAM amp_src      = " << amp_src      << "\n";
-    out << ".PARAM dIdt0        = " << dIdt0        << "\n";
     out << ".PARAM Rs           = " << r_series     << "\n";
     out << ".PARAM Ls           = " << l_series     << "\n";
     out << ".PARAM t_floor      = " << t_floor      << "\n";
 }
 
-// Schreibt restart.inc: die fenster-spezifische .OPTIONS RESTART und .tran Zeile.
-// Zeit ist absolut → tran-Stoppzeit = {t_stop} (absolut), Print-Start = {t_abs_start}.
-//   Fenster 1: frischer UIC-Transient ab 0, schreibt Checkpoints (JOB=...).
-//   Fenster k>1: Restart aus committed_file (FILE=...), schreibt neue Checkpoints.
-// INITIAL_INTERVAL = Fensterlaenge → genau ein Checkpoint am (absoluten) Fensterende.
-// Als Literal geschrieben, da .OPTIONS sich nicht auf {param}-Expansion verlassen soll.
+// Writes restart.inc: the window-specific .OPTIONS RESTART and .tran line.
+// Time is absolute -> tran stop time = {t_stop} (absolute), print start = {t_abs_start}.
+//   Window 1: fresh UIC transient from 0, writes checkpoints (JOB=...).
+//   Window k>1: restart from committed_file (FILE=...), writes new checkpoints.
+// INITIAL_INTERVAL = window length -> exactly one checkpoint at the (absolute) window end.
+// Written as a literal, since .OPTIONS should not rely on {param} expansion.
 void WriteRestartDirectives(
     const string& filename,
     bool first_window,
@@ -1382,37 +1401,37 @@ void WriteRestartDirectives(
     if (first_window) {
         out << ".OPTIONS RESTART PACK=0 JOB=" << ckpt_out_prefix
             << " INITIAL_INTERVAL=" << dt_window << "\n";
-        // Frischer Transient ab 0; Print ab {t_abs_start} (=0 im ersten Fenster).
+        // Fresh transient from 0; print from {t_abs_start} (=0 in the first window).
         out << ".tran {dt_print} {t_stop} {t_abs_start} UIC\n";
     } else {
         out << ".OPTIONS RESTART FILE=" << committed_file
             << " JOB=" << ckpt_out_prefix
             << " INITIAL_INTERVAL=" << dt_window << "\n";
-        // Restart setzt Integrator auf die Checkpoint-Zeit; kein UIC.
+        // Restart sets the integrator to the checkpoint time; no UIC.
         out << ".tran {dt_print} {t_stop} {t_abs_start}\n";
     }
 }
 
-// Loescht alte Checkpoint-Kandidaten <prefix>* im Arbeitsverzeichnis. Verhindert, dass
-// ein veralteter Kandidat aus einem frueheren Fenster faelschlich committed wird.
+// Deletes stale checkpoint candidates <prefix>* in the working directory. Prevents an
+// outdated candidate from a previous window being committed by mistake.
 void ClearCheckpoints(const string& prefix)
 {
     namespace fs = std::filesystem;
     for (const auto& entry : fs::directory_iterator(fs::current_path())) {
         if (!entry.is_regular_file()) continue;
         const string name = entry.path().filename().string();
-        if (name.rfind(prefix, 0) == 0) { // beginnt mit prefix
+        if (name.rfind(prefix, 0) == 0) { // starts with prefix
             std::error_code ec;
             fs::remove(entry.path(), ec);
         }
     }
 }
 
-// Sucht den Checkpoint <prefix>* mit der GROESSTEN Simulationszeit (= Fensterende) und
-// kopiert ihn nach committed_file als Restart-Basis fuers naechste Zeitfenster.
-// Die Sim-Zeit steht als Suffix im Dateinamen (Xyce: JOB + Zeit, z.B. ckpt_out0.02).
-// Max-Zeit (statt mtime) ist robust, weil Xyce beim Restart zusaetzlich einen Checkpoint
-// bei t=0 schreibt (ckpt_out0); der gewollte Endzustand hat immer die groesste Zeit.
+// Finds the checkpoint <prefix>* with the GREATEST simulation time (= window end) and
+// copies it to committed_file as the restart basis for the next time window.
+// The sim-time is the suffix in the file name (Xyce: JOB + time, e.g. ckpt_out0.02).
+// Max-time (instead of mtime) is robust, because on restart Xyce additionally writes a checkpoint
+// at t=0 (ckpt_out0); the desired end state always has the greatest time.
 void CommitCheckpoint(const string& prefix, const string& committed_file)
 {
     namespace fs = std::filesystem;
@@ -1423,13 +1442,13 @@ void CommitCheckpoint(const string& prefix, const string& committed_file)
     for (const auto& entry : fs::directory_iterator(fs::current_path())) {
         if (!entry.is_regular_file()) continue;
         const string name = entry.path().filename().string();
-        if (name.rfind(prefix, 0) != 0) continue; // nicht unser Prefix
+        if (name.rfind(prefix, 0) != 0) continue; // not our prefix
 
-        // Zeit-Suffix hinter dem Prefix parsen (z.B. "0", "0.02", "4e-04").
+        // Parse the time suffix after the prefix (e.g. "0", "0.02", "4e-04").
         const string suffix = name.substr(prefix.size());
         char* end = nullptr;
         const double t = std::strtod(suffix.c_str(), &end);
-        if (end == suffix.c_str()) continue; // kein numerisches Suffix → ueberspringen
+        if (end == suffix.c_str()) continue; // no numeric suffix -> skip
 
         if (!found || t > best_time) {
             best = entry.path();
@@ -1455,9 +1474,10 @@ void CommitCheckpoint(const string& prefix, const string& committed_file)
     }
 }
 
-// Linearer Resampler auf uniformes Grid mit N_intervals+1 Stuetzstellen ueber [t_start, t_stop].
-// Zweck: Xyce-Adaptiv-Output auf festes Raster reduzieren bevor er als V(iprev) PWL-Quelle in der
-// naechsten WR-Iteration wiederverwendet wird (siehe Aufruf in ReadXyceResults).
+// Linear resampler onto a uniform grid with N_intervals+1 nodes over [t_start, t_stop].
+// Purpose: reduce the adaptive Xyce output to a fixed grid before it is reused as a PWL source
+// (V(vfprev) or V(iprev), depending on coupling_mode) in the next WR iteration (see the call in
+// ReadXyceResults).
 Waveform resampleWaveformUniform(
     const Waveform& raw,
     double t_start,
@@ -1508,6 +1528,9 @@ Waveform resampleWaveformUniform(
     return sampled;
 }
 
+// Appends a circuit waveform (Index TIME V(P) V(NX) I(VMEAS)) to an open .prn file with a running
+// global_index and absolute time (t_abs_start offset). skip_first_point drops the shared window-edge
+// sample when stitching consecutive windows.
 void appendCircuitWaveformXyceStyle(
     FILE* file,
     const CircuitWaveform& wf,
@@ -1538,6 +1561,9 @@ void appendCircuitWaveformXyceStyle(
     fflush(file);
 }
 
+// Appends the field waveforms (Index TIME V(FIELD) I(FIELD)) to an open .prn file with a running
+// global_index and absolute time. vf and i must share the same time grid (checked). skip_first_point
+// drops the shared window-edge sample between consecutive windows.
 void appendFieldWaveformXyceStyle(
     FILE* file,
     const Waveform& vf,
