@@ -96,6 +96,7 @@ the user circuit.
 | `use_t_floor` | `1` = guard the window-start `1/0` in `Z` with `t_floor`, `0` = bare `dt` (test) |
 | `t_floor_frac` | `t_floor = t_floor_frac · t_window` (window-scaled secant-denominator floor) |
 | `seam_average` | window-seam handoff: `0` = one-sided (V←circuit, I←field), `1` = midpoint |
+| `validation_mode` | `0` = WR co-sim (default). `1` = **monolithic reference**: replace the behavioral `Bfield` with the *true* field as real Xyce devices (`R_FEM` + `L_FEM` in series on the port branch) and solve the whole circuit as one transient over `[0, t_end]` — no WR loop, no field solver, no coupling. Gives a reference to validate the coupled run against; the WR/coupling/secant knobs are disabled and the convergence plot is empty. Linear field only (saturation ignored) |
 
 Output **probes** (extra Xyce `.print` tokens like `V(a)`, `I(Rr1)`) are written
 to `probes.txt` and captured per window into `Probes_solution.prn`.
@@ -148,6 +149,11 @@ unknown keys ignored; missing keys keep defaults). Run the solver directly:
 
 ## Things to study
 
+- **Validate the coupling** — set `validation_mode=1` to solve the circuit against
+  the *true* field as real `R_FEM`/`L_FEM` devices in one monolithic transient
+  (the reference), then flip back to `0` (WR co-sim) and confirm the coupled
+  solution reproduces it. Export both runs to CSV / overlay the plots; the
+  reference is exact, so any deviation is WR/ROM error. Linear field only.
 - **Two-way coupling** — author series R/L on the source→port path in the spec,
   then watch the WR iteration count and `Xyce solves` / solver time grow as the
   coupling strengthens (vs the trivial one-way `R=L=0` ~2-iteration case).

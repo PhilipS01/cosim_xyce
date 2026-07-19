@@ -13,6 +13,10 @@ until the window converges below `WR_tolerance`. The interface contains a ROM
 `N_field_windows` windows over `[0, t_end]`, each restarted from the previous via
 a Xyce checkpoint.
 
+A **validation mode** (`validation_mode=1`) swaps the behavioral `Bfield` for the
+true field as real `R_FEM`/`L_FEM` devices and solves everything as one monolithic
+Xyce transient — a reference to check the coupled WR solution against.
+
 ## Requirements
 
 - **Python 3** + `numpy` + `matplotlib` (`pip install numpy matplotlib`).

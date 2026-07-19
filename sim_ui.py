@@ -80,6 +80,8 @@ PARAMS = [
     ("t_floor_frac",                    "t_floor / window",             0.01,     "float", None),
     ("seam_average",                    "Window-seam handoff",          0,        "choice",
         {0: "one-sided (V<-ckt, I<-fld)", 1: "midpoint (average)"}),
+    ("validation_mode",                 "Validation mode",              0,        "choice",
+        {0: "WR co-sim", 1: "monolithic (real R_FEM/L_FEM)"}),
 ]
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
 KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}
@@ -135,10 +137,23 @@ PRESETS = {
 # ("Sim duration" = t_end). What remains conditional: N_field_eval_intervals only matters for the
 # pointwise-secant reconstruction (0) -- linear (1) forces 1 solve/window and ignores it -- so it's
 # shown only then. t_floor_frac only matters when the secant t_floor guard is on (use_t_floor=1);
-# with bare dt (0) the floor is irrelevant.
+# with bare dt (0) the floor is irrelevant. validation_mode=1 (monolithic reference: the true field
+# stamped as real R_FEM/L_FEM devices, one Xyce transient, no WR) makes the whole WR/coupling/secant
+# machinery irrelevant, so those controls are disabled while it is on -- only t_end/windows/samples
+# (the tran grid), R_FEM/L_FEM (the devices) and the nonlinearity fields stay live.
 VISIBLE_WHEN = {
-    "N_field_eval_intervals": [{"reconstruct_mode": [0]}],
-    "t_floor_frac":           [{"use_t_floor": [1]}],
+    "N_field_eval_intervals": [{"reconstruct_mode": [0], "validation_mode": [0]}],
+    "t_floor_frac":           [{"use_t_floor": [1], "validation_mode": [0]}],
+    "coupling_mode":          [{"validation_mode": [0]}],
+    "reconstruct_mode":       [{"validation_mode": [0]}],
+    "interface_form":         [{"validation_mode": [0]}],
+    "seam_average":           [{"validation_mode": [0]}],
+    "wr_convergence_method":  [{"validation_mode": [0]}],
+    "WRmaxSteps":             [{"validation_mode": [0]}],
+    "WR_tolerance":           [{"validation_mode": [0]}],
+    "use_t_floor":            [{"validation_mode": [0]}],
+    "R_ROM":                  [{"validation_mode": [0]}],
+    "L_ROM":                  [{"validation_mode": [0]}],
 }
 
 
@@ -303,6 +318,19 @@ HELP = {
         "matched-secant Bfield.<br>current-driven (Neumann): circuit sets I(Vmeas), field returns "
         "V_field; plain voltage source &mdash; removes the high-frequency window-start V(p) spike on "
         "current-source circuits.</div>"
+    ),
+    "validation_mode": (
+        "<div class='hh'>Validation mode</div>"
+        "<div class='hn'><b>WR co-sim</b> (default) &mdash; the normal coupled run: the field is a "
+        "reduced-order matched-secant <code>Bfield</code> source, iterated to a fixpoint per window "
+        "(waveform relaxation).</div>"
+        "<div class='hn'><b>monolithic</b> &mdash; replaces <code>Bfield</code> with the TRUE field as "
+        "real Xyce devices (<code>R_FEM</code> + <code>L_FEM</code> in series on the port branch) and "
+        "solves the whole circuit as ONE transient over [0, t_end] &mdash; no WR loop, no field solver, "
+        "no coupling. Produces a <i>reference</i>; flip back to WR co-sim and check the coupled solution "
+        "reproduces it. WR/coupling/secant knobs are disabled here (irrelevant) and the convergence plot "
+        "is empty. Linear field only &mdash; magnetic saturation is ignored (a plain inductor can't "
+        "reproduce the flux law).</div>"
     ),
     "wr_convergence_method": (
         "<div class='hh'>WR convergence metric</div>"
@@ -2029,7 +2057,7 @@ class Handler(BaseHTTPRequestHandler):
 #   group := (title, open_by_default, [rows]);  row := [control keys laid out equal-width]
 _PROP_GROUPS = [
     ("Run & windows",      True,  [["t_end", "N_field_windows", "__arrow__", "window_width"]]),
-    ("Coupling",           True,  [["coupling_mode", "N_xyce_samples",
+    ("Coupling",           True,  [["validation_mode", "coupling_mode", "N_xyce_samples",
                                     "reconstruct_mode", "N_field_eval_intervals"]]),
     ("WR iteration",       False, [["wr_convergence_method", "WRmaxSteps", "WR_tolerance"]]),
     ("Interface & secant", False, [["use_t_floor", "t_floor_frac", "interface_form", "seam_average"]]),

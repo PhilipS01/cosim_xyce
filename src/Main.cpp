@@ -29,7 +29,12 @@ int main( int No_Arguments, char* Arguments[  ] )
     }
 
     //CALL MASTER PROCESS
-    MasterProcess();
+    // validation_mode=1: monolithic reference solve (true field as real R_FEM/L_FEM devices, one
+    // Xyce transient, no WR) to validate the coupled run against. Else the full WR co-simulation.
+    if (g_cfg.validation_mode)
+        MonolithicValidationSolve();
+    else
+        MasterProcess();
 
     cout << endl <<"Finished WR toy successfully" << endl;
     return 0;

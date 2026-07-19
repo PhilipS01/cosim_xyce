@@ -90,6 +90,14 @@ struct SimConfig
     //   1 = midpoint: V0 = 0.5*(V_circuit + V_field), I0 = 0.5*(I_circuit + I_field). Seam-blend test
     //       (only the carried seeds are averaged; the Xyce restart checkpoint is unchanged).
     unsigned seam_average = 0;
+    // Validation mode: replace the behavioral matched-secant Bfield with the TRUE field as REAL
+    // Xyce devices (R_FEM + L_FEM in series on the port branch) and solve the whole circuit as ONE
+    // monolithic transient over [0, t_end] -- no WR loop, no dummy field solver, no PWL exchange,
+    // no windowing. Produces a reference solution to validate the coupled WR run against.
+    //   0 = WR co-sim (default), 1 = monolithic reference.
+    // Linear field only: a plain Xyce inductor cannot reproduce the saturation flux law, so
+    // nonlin_model=1 is warned + ignored here.
+    unsigned validation_mode = 0;
 };
 
 extern SimConfig g_cfg;
@@ -111,6 +119,12 @@ void appendProbeColumns(const string& xyce_prn, FILE* out, size_t n_probes,
 
 
 void MasterProcess();
+
+// Validation-mode driver (validation_mode=1): solves the circuit + true field (real R_FEM/L_FEM
+// devices) as ONE monolithic Xyce transient over [0, t_end] and writes the standard output files
+// (Circuit_solution.prn / Field_*_solution.prn / WR_error.txt header) so the UI plots/CSV work
+// unchanged. No WR loop, no dummy field solver. Reference for validating the coupled run.
+void MonolithicValidationSolve();
 
 void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eval_intervals);
 

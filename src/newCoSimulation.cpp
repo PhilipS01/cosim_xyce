@@ -116,6 +116,7 @@ bool LoadConfig(const string& filename)
         else if (key == "interface_form")                   g_cfg.interface_form = (unsigned)val;
         else if (key == "use_t_floor")                      g_cfg.use_t_floor = (unsigned)val;
         else if (key == "seam_average")                     g_cfg.seam_average = (unsigned)val;
+        else if (key == "validation_mode")                  g_cfg.validation_mode = (unsigned)val;
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
     }
     return true;
@@ -565,6 +566,97 @@ void MasterProcess()
     fclose(file_Field_waveform);
     if (file_Probes) { fprintf(file_Probes, "End\n"); fclose(file_Probes); }
 
+}
+
+// Validation-mode driver (validation_mode=1). The true field is stamped as real Xyce devices
+// (R_FEM + L_FEM series on the port branch; see the validation branch of WriteCircuitNetlist) and
+// the whole circuit is solved as ONE Xyce transient over [0, t_end] -- no WR loop, no dummy field
+// solver, no PWL exchange, no windowing. Writes the SAME output files as MasterProcess so the UI
+// plots / CSV export / summary work unchanged: V(FIELD)=V(nx), I(FIELD)=I(Vmeas) (they equal the
+// circuit port quantities, so the reference "circuit" and "field" curves coincide). WR_error.txt
+// gets only its header -> the convergence plot renders empty and the WR summary cards are omitted
+// (both degrade gracefully). Linear field only (nonlin_model warned + ignored in the netlist).
+void MonolithicValidationSolve()
+{
+    cout << "Validation mode: monolithic reference solve (real R_FEM + L_FEM devices)." << endl;
+    if (g_cfg.nonlin_model != 0)
+        cout << "  WARNING: nonlin_model=" << g_cfg.nonlin_model
+             << " (saturation) is IGNORED in validation mode -- L_FEM is a linear inductor." << endl;
+
+    if (g_cfg.t_end <= 0.0) throw runtime_error("MonolithicValidationSolve: t_end must be > 0.");
+
+    // Netlist with the real FEM devices (validation branch inside WriteCircuitNetlist).
+    WriteCircuitNetlist("wr_circuit.cir");
+
+    // Reference print grid = the WR run's TOTAL resolution: N_field_windows * N_xyce_samples
+    // samples over the whole [0, t_end] (dt_print = t_end / N_eff), so the reference and the coupled
+    // run line up point-for-point when compared (plots / CSV export).
+    const unsigned N_win  = (g_cfg.N_field_windows >= 1) ? g_cfg.N_field_windows : 1u;
+    const unsigned N_samp = (g_cfg.N_xyce_samples  >= 1) ? g_cfg.N_xyce_samples  : 1u;
+    const unsigned N_eff  = N_win * N_samp;
+
+    // sim_params.inc provides dt_print (= t_end/N_eff) and t_stop that the .tran line references.
+    // Rrom/Lrom are written but unused by the validation netlist.
+    WriteSimParams("sim_params.inc", 0.0, g_cfg.t_end, 0.0, 0.0, g_cfg.R_ROM, g_cfg.L_ROM, N_eff);
+
+    // One fresh UIC transient over the whole [0, t_end] -- no restart/checkpoint (single solve).
+    // The step CEILING (4th .tran field) = dt_print bounds Xyce's adaptive stepper so this single
+    // long transient is resolved on the same grid as the stitched WR run; without it the integrator
+    // coasts over quiet stretches and the monolithic reference comes out far coarser than the
+    // per-window WR solves.
+    {
+        ofstream rst("restart.inc");
+        if (!rst) throw runtime_error("MonolithicValidationSolve: could not open restart.inc");
+        rst << ".tran {dt_print} {t_stop} {t_abs_start} {dt_print} UIC\n";
+    }
+
+    RunXyce("wr_circuit.cir");
+
+    // Parse the solve onto the uniform grid (reuses the WR parser; its Circuit.txt / *.pwl
+    // side-writes are harmless leftovers in this mode).
+    CircuitWaveform circuit_sol;
+    ReadXyceResults("wr_circuit.cir.prn", circuit_sol, 0.0, g_cfg.t_end, N_eff);
+    if (circuit_sol.t.empty())
+        throw runtime_error("MonolithicValidationSolve: no circuit data parsed from wr_circuit.cir.prn.");
+
+    // Field terminal = the real-device branch: V(FIELD) = V(nx), I(FIELD) = I(Vmeas).
+    Waveform vfield, ifield;
+    for (size_t n = 0; n < circuit_sol.t.size(); ++n) {
+        vfield.push(circuit_sol.t[n], circuit_sol.vnx[n]);
+        ifield.push(circuit_sol.t[n], circuit_sol.i[n]);
+    }
+
+    // Circuit_solution.prn: Index TIME V(P) V(NX) I(VMEAS)  (+ End).
+    FILE* file_Circuit = fopen("Circuit_solution.prn", "w");
+    fprintf(file_Circuit, "Index       TIME              V(P)              V(NX)             I(VMEAS)\n");
+    unsigned long idx_c = 0;
+    appendCircuitWaveformXyceStyle(file_Circuit, circuit_sol, 0.0, idx_c, /*skip_first_point=*/false);
+    fprintf(file_Circuit, "End\n");
+    fclose(file_Circuit);
+
+    // Field_waveform_solution.prn: dense field waveform (no trailing "End", matching MasterProcess).
+    FILE* file_Field_waveform = fopen("Field_waveform_solution.prn", "w");
+    fprintf(file_Field_waveform, "Index       TIME              V(FIELD)          I(FIELD)\n");
+    unsigned long idx_fw = 0;
+    appendFieldWaveformXyceStyle(file_Field_waveform, vfield, ifield, 0.0, idx_fw, /*skip_first_point=*/false);
+    fclose(file_Field_waveform);
+
+    // Field_solution.prn: the window-end (final) row -> summary card final V/I.
+    FILE* file_Field = fopen("Field_solution.prn", "w");
+    fprintf(file_Field, "Index       TIME              V(FIELD)          I(FIELD)\n");
+    const size_t last = circuit_sol.t.size() - 1;
+    fprintf(file_Field, "%-10lu %-17.8e %-17.8e %-17.8e\n",
+            0UL, circuit_sol.t[last], circuit_sol.vnx[last], circuit_sol.i[last]);
+    fprintf(file_Field, "End\n");
+    fclose(file_Field);
+
+    // WR_error.txt: header only (no WR iterations) -> empty convergence plot, no WR summary cards.
+    FILE* file_WR_error = fopen("WR_error.txt", "w");
+    fprintf(file_WR_error, "   Time, WR_TotalRelErr, N_iterations, Converged \n");
+    fclose(file_WR_error);
+
+    cout << "Validation reference written "
+         << "(Circuit_solution.prn / Field_solution.prn / Field_waveform_solution.prn)." << endl;
 }
 
 // FEM solver (voltage-driven): takes the port-voltage waveform V_p(t) from vf_prev_k.pwl
@@ -1068,6 +1160,20 @@ void WriteCircuitNetlist(const string& filename)
     emitCustomTopology(out);
     out << "\n";
 
+    if (g_cfg.validation_mode) {
+        // Validation mode: the TRUE field as REAL Xyce devices (R_FEM + L_FEM in series on the
+        // port branch), replacing the behavioral matched-secant Bfield. Solved monolithically
+        // (MonolithicValidationSolve) -> a reference for the coupled WR run. Vmeas is kept so the
+        // print columns V(p)/V(nx)/I(Vmeas) are unchanged; with Vmeas a 0 V ammeter V(p)=V(nx), so
+        // the "circuit" and "field" curves coincide by construction. Linear field only.
+        out << "* === VALIDATION MODE: true field as real devices (R_FEM + L_FEM series on port) ===\n";
+        if (g_cfg.nonlin_model != 0)
+            out << "* NOTE: nonlin_model=" << g_cfg.nonlin_model
+                << " (saturation) is IGNORED here -- Lfem is a linear inductor.\n";
+        out << "Vmeas p nx 0\n";
+        out << "Rfem  nx nfem " << g_cfg.R_FEM << "\n";
+        out << "Lfem  nfem 0 "  << g_cfg.L_FEM << "\n\n";
+    } else {
     // Fixed WR interface. Coupling direction per coupling_mode.
     // Both coupling directions use the SAME matched-secant Bfield: the field's Thevenin equivalent, a
     // voltage source V(vfprev) behind the ROM impedance Z = Rrom + Lrom/dt. That IS a Newton/secant
@@ -1110,6 +1216,7 @@ void WriteCircuitNetlist(const string& filename)
         out << "+ V(vfprev) + (Rrom + Lrom/" << dt_expr << ") * (I(Vmeas) - V(iprev))\n";
         out << "+ }\n\n";
     }
+    } // end WR-interface / validation-mode branch
 
     out << ".INCLUDE restart.inc\n";
     out << ".print tran V(p) V(nx) I(Vmeas)";
