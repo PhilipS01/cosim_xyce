@@ -24,12 +24,34 @@ a Xyce checkpoint.
 ## Quick start
 
 ```sh
+./setup.sh                        # macOS/Linux: venv + deps + build + optional tools
+python3 sim_ui.py                 # serves http://127.0.0.1:8000
+```
+
+Or by hand:
+
+```sh
 pip install numpy matplotlib      # core deps
 npm install                       # optional: schematic layout
 python3 sim_ui.py                 # builds ./main, serves http://127.0.0.1:8000
 ```
 
 Full usage, parameters, and the circuit-spec format: **[UI_README.md](UI_README.md)**.
+
+## Windows
+
+`setup.sh` is bash (macOS/Linux). On Windows, two routes:
+
+- **WSL2 (recommended)** — install WSL2 + a Linux distro, then run `./setup.sh`
+  inside it; from there it's identical to Linux
+  (`sudo apt-get install -y g++ make python3 python3-venv python3-pip poppler-utils`,
+  plus the Xyce Linux build). Open `http://127.0.0.1:8000` in the Windows browser.
+- **Native** — run `./setup.ps1` in PowerShell. It needs a **MinGW/Clang**
+  toolchain + `make` (MSVC is *not* used) — e.g. MSYS2
+  (`pacman -S mingw-w64-ucrt-x86_64-gcc make`) or scoop. The build emits
+  `main.exe` (the UI resolves the name automatically). The inline schematic PNG
+  needs **poppler** (`pdftoppm`) on `PATH` — there is no `sips` on Windows — but
+  simulations, plots, and `.tex`/`.pdf` export work without it.
 
 ## Run the solver directly
 

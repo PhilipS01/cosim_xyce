@@ -40,6 +40,15 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# Compiled solver binary. On Windows the MinGW/Clang + Make build emits "main.exe" (GCC/Clang append
+# .exe when the -o name has no extension); everywhere else it's "main". Resolve it here so the build
+# check and the run/emit calls all agree on the name.
+MAIN_EXE = "main.exe" if os.name == "nt" else "main"
+
+
+def main_binary():
+    return os.path.join(HERE, MAIN_EXE)
+
 # --- Parameter spec: (key, label, default, kind, slider min/max/step or None) ---
 # kind: "float" or "int". slider tuple => render a range slider alongside the box.
 PARAMS = [
@@ -360,8 +369,7 @@ def read_config():
 
 
 def ensure_built():
-    main_path = os.path.join(HERE, "main")
-    if not os.path.exists(main_path):
+    if not os.path.exists(main_binary()):
         subprocess.run(["make"], cwd=HERE, check=True,
                        capture_output=True, text=True)
 
@@ -369,7 +377,7 @@ def ensure_built():
 def run_solver(workdir=HERE):
     ensure_built()
     t0 = time.perf_counter()
-    proc = subprocess.run([os.path.join(HERE, "main")], cwd=workdir,
+    proc = subprocess.run([main_binary()], cwd=workdir,
                           capture_output=True, text=True, timeout=600)
     elapsed = time.perf_counter() - t0
     return proc.returncode, proc.stdout, proc.stderr, elapsed
@@ -379,7 +387,7 @@ def emit_netlist():
     """Regenerate wr_circuit.cir from the current sim_config.txt without solving
     ('main emit'), so the rendered schematic reflects the current config."""
     ensure_built()
-    subprocess.run([os.path.join(HERE, "main"), "emit"], cwd=HERE,
+    subprocess.run([main_binary(), "emit"], cwd=HERE,
                    capture_output=True, text=True, timeout=60)
 
 

@@ -1,5 +1,6 @@
 # build
 main
+main.exe
 *.o
 
 # Xyce run outputs / coupling artifacts
