@@ -94,8 +94,9 @@ the user circuit.
 | `coupling_mode` | `0` = voltage-driven (circuit sets `V(p)`, field returns `I`), `1` = current-driven (circuit sets `I(Vmeas)`, field returns `V_field`) |
 | `reconstruct_mode` | field reconstruction within a window: `0` pointwise (secant), `1` linear ramp |
 | `interface_form` | WR interface stamping: `0` = Thevenin (V source), `1` = Norton (I source) — algebraic duals, same terminal fixpoint |
-| `use_t_floor` | `1` = guard the window-start `1/0` in `Z` with `t_floor`, `0` = bare `dt` (test) |
-| `t_floor_frac` | `t_floor = t_floor_frac · t_window` (window-scaled secant-denominator floor) |
+| `precondition` | interface preconditioner: `1` = on (default, the matched-secant ROM impedance `Z = R_ROM + L_ROM/dt` in `Bfield` — an optimized/Robin transmission that accelerates the WR contraction); `0` = **classical Gauss–Seidel (Dirichlet–Neumann) WR** — drop the `Z` correction, drive the port with a *pure* source of the field's own response (`I_field` current source when voltage-driven, `V_field` voltage source when current-driven). Same fixpoint (the `Z`-term vanishes at convergence), slower contraction, may not converge for stiff coupling. Disables `interface_form`/`use_t_floor`/`R_ROM`/`L_ROM`. **Well-posedness:** an inductive port (series `L` to `p`) needs the voltage source → use `coupling_mode=1` (a pure current source in series with `L` is degenerate and Xyce aborts at `t=0`); a capacitive port is the dual (voltage-driven) |
+| `use_t_floor` | secant denominator `dt` in `Z = R_ROM + L_ROM/dt`: `1` = floored `MAX(dt, t_floor)` (default, guards the window-start `1/0`); `0` = bare `dt` (test); `2` = **constant** `t_floor` → fixed interface impedance `Z = R_ROM + L_ROM/t_floor` (a constant Robin/optimized-transmission coefficient instead of the growing-admittance accumulated secant; same fixpoint, different WR rate) |
+| `t_floor_frac` | `t_floor = t_floor_frac · t_window` (window-scaled); the secant-denominator floor (`use_t_floor=1`) **or** the constant denominator (`use_t_floor=2`) |
 | `seam_average` | window-seam handoff: `0` = one-sided (V←circuit, I←field), `1` = midpoint |
 | `validation_mode` | `0` = WR co-sim (default). `1` = **monolithic reference**: replace the behavioral `Bfield` with the *true* field as real Xyce devices (`R_FEM` + `L_FEM` in series on the port branch) and solve the whole circuit as one transient over `[0, t_end]` — no WR loop, no field solver, no coupling. Gives a reference to validate the coupled run against; the WR/coupling/secant knobs are disabled and the convergence plot is empty. Linear field only (saturation ignored) |
 
@@ -169,6 +170,14 @@ unknown keys ignored; missing keys keep defaults). Run the solver directly:
   count climbs (operating-point / amplitude dependent, unlike the linear field).
 - **Interface stamping** — compare `interface_form` Thevenin vs Norton (same
   terminal fixpoint, different interior `V(p)` waveform and timestepping).
+- **Preconditioner vs classical WR** — set `precondition=0` to strip the
+  matched-secant ROM impedance and recover plain Gauss–Seidel
+  (Dirichlet–Neumann) coupling, then compare WR iteration counts (and whether it
+  converges at all) against the default `precondition=1` for the same circuit —
+  the fixpoint is identical, only the contraction rate changes. Match the source
+  to the port: an inductive port (series `L` to `p`, e.g. presets P1/P3) needs
+  `coupling_mode=1` so the circuit sees a voltage source; a pure current source
+  in series with `L` is degenerate.
 - Lower `WR_tolerance` → more WR iterations per window; toggle
   `wr_convergence_method` between waveform-L1 and terminal-scalar and compare.
 - **t_floor** – guards the window-start impedance by limiting the secant denominator. Find a sweet-spot. Choice is problem-dependant (source frequency, impedances of field/circuit, etc.)

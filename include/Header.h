@@ -79,10 +79,34 @@ struct SimConfig
     //       converges (no dt-collapse seen up to ~MHz -- Xyce handles the stiffness), just less cleanly.
     //       Provided to compare the two.
     unsigned interface_form = 0;
-    // Secant-denominator floor in the Bfield impedance Z = Rrom + Lrom/dt (dt = time - t_abs_start):
-    //   1 = on (default): dt -> MAX(time - t_abs_start, t_floor); guards the 1/0 at the exact window
-    //       start (time == t_abs_start), where dt would be 0 -> Lrom/0 singularity.
-    //   0 = off: dt = (time - t_abs_start) bare; Z -> infinity at the window start. Test only.
+    // Interface preconditioner (the matched-secant ROM impedance Z = Rrom + Lrom/dt in Bfield):
+    //   1 = on (default): the OPTIMIZED-transmission / Robin interface. Bfield carries the secant
+    //       correction Z*(I - i_prev) [Thevenin] or (V - vf_prev)/Z [Norton] -- a Newton linearisation
+    //       of the field V-I law that accelerates the WR contraction (this is the preconditioner).
+    //   0 = off -> CLASSICAL Gauss-Seidel (Dirichlet-Neumann) WR: drop the Z correction entirely; the
+    //       circuit port is driven by a PURE source carrying the field's OWN response variable
+    //       (I_field as a current source when voltage-driven; V_field as a voltage source when
+    //       current-driven). interface_form is ignored (the base must be the field's output, never the
+    //       circuit's prior iterate, else the loop decouples). SAME terminal fixpoint as the
+    //       preconditioned scheme (the Z-term vanishes at convergence), but plain Gauss-Seidel
+    //       contraction -- slower, and may not converge for stiff/strong coupling.
+    //       WELL-POSEDNESS: the pure source must match the port impedance. An INDUCTIVE port (series L
+    //       to p) demands the voltage source -> use current-driven (coupling_mode=1); a pure current
+    //       source in series with L is degenerate (Xyce aborts "failures at time 0"). A CAPACITIVE port
+    //       (shunt C on p) is the dual -> voltage-driven. The finite Z of the preconditioner hides this.
+    unsigned precondition = 1;
+    // Secant-denominator mode for the Bfield impedance Z = Rrom + Lrom/dt. All variants reuse the
+    // t_floor .PARAM (= t_floor_frac * t_window):
+    //   1 = floored (default): dt -> MAX(time - t_abs_start, t_floor); the accumulated-secant
+    //       denominator, guarding the 1/0 at the exact window start (dt=0 -> Lrom/0 singularity).
+    //   0 = bare: dt = (time - t_abs_start); Z -> infinity at the window start. Test only.
+    //   2 = constant: dt = t_floor (fixed over the window) -> Z = Rrom + Lrom/t_floor is a CONSTANT
+    //       interface impedance (a fixed Robin/optimized-transmission coefficient) rather than the
+    //       accumulated secant whose admittance grows across the window. Same terminal fixpoint (the
+    //       correction vanishes at convergence); only conditioning / WR contraction rate change. The
+    //       FEM solver keeps its own accumulated secant (t_acc = t - t_win_start) -- unchanged.
+    //       NB: a constant Z is usually a WEAKER preconditioner (rho -> 1) -> slow; a loose Cauchy
+    //       WR_tolerance can then stop early below the true fixpoint (tighten tol / add windows).
     unsigned use_t_floor = 1;
     // Window-seam handoff: how the carried terminal values (V0, I0 seeding the next window) are picked
     // from the converged iterate (the two solvers agree to within WR_tolerance there):

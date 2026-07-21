@@ -114,6 +114,7 @@ bool LoadConfig(const string& filename)
         else if (key == "coupling_mode")                    g_cfg.coupling_mode = (unsigned)val;
         else if (key == "reconstruct_mode")                 g_cfg.reconstruct_mode = (unsigned)val;
         else if (key == "interface_form")                   g_cfg.interface_form = (unsigned)val;
+        else if (key == "precondition")                     g_cfg.precondition = (unsigned)val;
         else if (key == "use_t_floor")                      g_cfg.use_t_floor = (unsigned)val;
         else if (key == "seam_average")                     g_cfg.seam_average = (unsigned)val;
         else if (key == "validation_mode")                  g_cfg.validation_mode = (unsigned)val;
@@ -1235,12 +1236,36 @@ void WriteCircuitNetlist(const string& filename)
     out << "VFprev vfprev 0 PWL FILE \"vf_prev_k.pwl\"\n";
     out << "VIprev iprev  0 PWL FILE \"i_prev_k.pwl\"\n";
     out << "Vmeas p nx 0\n";
-    // Secant denominator dt. use_t_floor guards the 1/0 at the exact window start (time==t_abs_start);
-    // off -> bare (time - t_abs_start), Z -> infinity there (test only).
-    const string dt_expr = g_cfg.use_t_floor
-        ? "MAX(time - t_abs_start, t_floor)"
-        : "(time - t_abs_start)";
-    if (g_cfg.interface_form == 1) {
+    // Secant denominator dt in Z = Rrom + Lrom/dt. use_t_floor selects how it is formed (all reuse the
+    // t_floor .PARAM = t_floor_frac * t_window):
+    //   1 = floored (default): MAX(time - t_abs_start, t_floor); the accumulated-secant denominator,
+    //       guarded against the 1/0 at the exact window start (time==t_abs_start, dt=0 -> Lrom/0).
+    //   0 = bare: (time - t_abs_start); Z -> infinity at the window start (test only).
+    //   2 = constant: t_floor; the denominator is FIXED over the window, so Z = Rrom + Lrom/t_floor is a
+    //       constant interface impedance (a fixed Robin/optimized-transmission coefficient) instead of
+    //       the accumulated secant whose admittance grows across the window. Same terminal fixpoint (the
+    //       correction vanishes at convergence -- see interface_form/precondition); only conditioning
+    //       and the WR contraction rate change. The FEM keeps its own accumulated secant (unchanged).
+    string dt_expr;
+    if      (g_cfg.use_t_floor == 2) dt_expr = "t_floor";
+    else if (g_cfg.use_t_floor == 1) dt_expr = "MAX(time - t_abs_start, t_floor)";
+    else                             dt_expr = "(time - t_abs_start)";
+    if (g_cfg.precondition == 0) {
+        // CLASSICAL Gauss-Seidel (Dirichlet-Neumann) WR: NO ROM preconditioner. Drop the matched-secant
+        // correction (Z*(I - i_prev) / (V - vf_prev)/Z) entirely; the circuit port is driven by a PURE
+        // source carrying the field's OWN response variable (never the circuit's prior iterate, which
+        // would decouple the loop). Same terminal fixpoint as the preconditioned scheme (the Z-term
+        // vanishes at convergence), but plain Gauss-Seidel contraction. interface_form is ignored.
+        if (g_cfg.coupling_mode == 1) {
+            // current-driven: the field returns V_field (vf_prev) -> pure Dirichlet voltage source.
+            out << "* precondition = 0 (classical WR): pure voltage source V(nx) = V_field, no ROM secant\n";
+            out << "Bfield nx 0 V = { V(vfprev) }\n\n";
+        } else {
+            // voltage-driven: the field returns I_field (i_prev) -> pure Neumann current source.
+            out << "* precondition = 0 (classical WR): pure current source I(nx->0) = I_field, no ROM secant\n";
+            out << "Bfield nx 0 I = { V(iprev) }\n\n";
+        }
+    } else if (g_cfg.interface_form == 1) {
         // Norton (dual of the Thevenin): a behavioral CURRENT source with shunt G = 1/Z. Same TERMINAL
         // fixpoint, but G -> 0 at the window start -> V(p) weakly tied -> stiffer, and the interior V(p)
         // waveform differs from the Thevenin one (converges anyway; no dt-collapse observed up to ~MHz).

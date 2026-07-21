@@ -75,8 +75,10 @@ PARAMS = [
         {0: "pointwise (secant)", 1: "linear ramp"}),
     ("interface_form",                  "Interface stamping",           0,        "choice",
         {0: "Thevenin (V source)", 1: "Norton (I source)"}),
-    ("use_t_floor",                     "Secant t_floor",               1,        "choice",
-        {1: "on (guard 1/0)", 0: "off (bare dt)"}),
+    ("precondition",                    "Interface preconditioner",     1,        "choice",
+        {1: "on (matched secant)", 0: "off (classical WR)"}),
+    ("use_t_floor",                     "Secant denominator",           1,        "choice",
+        {1: "floored (guard 1/0)", 0: "bare dt", 2: "constant (Lrom/t_floor)"}),
     ("t_floor_frac",                    "t_floor / window",             0.01,     "float", None),
     ("seam_average",                    "Window-seam handoff",          0,        "choice",
         {0: "one-sided (V<-ckt, I<-fld)", 1: "midpoint (average)"}),
@@ -143,17 +145,19 @@ PRESETS = {
 # (the tran grid), R_FEM/L_FEM (the devices) and the nonlinearity fields stay live.
 VISIBLE_WHEN = {
     "N_field_eval_intervals": [{"reconstruct_mode": [0], "validation_mode": [0]}],
-    "t_floor_frac":           [{"use_t_floor": [1], "validation_mode": [0]}],
+    "t_floor_frac":           [{"use_t_floor": [1, 2], "validation_mode": [0], "precondition": [1]}],
     "coupling_mode":          [{"validation_mode": [0]}],
     "reconstruct_mode":       [{"validation_mode": [0]}],
-    "interface_form":         [{"validation_mode": [0]}],
+    # interface_form / t_floor / the secant ROM impedance only exist when the preconditioner is on.
+    "interface_form":         [{"validation_mode": [0], "precondition": [1]}],
+    "use_t_floor":            [{"validation_mode": [0], "precondition": [1]}],
+    "precondition":           [{"validation_mode": [0]}],
     "seam_average":           [{"validation_mode": [0]}],
     "wr_convergence_method":  [{"validation_mode": [0]}],
     "WRmaxSteps":             [{"validation_mode": [0]}],
     "WR_tolerance":           [{"validation_mode": [0]}],
-    "use_t_floor":            [{"validation_mode": [0]}],
-    "R_ROM":                  [{"validation_mode": [0]}],
-    "L_ROM":                  [{"validation_mode": [0]}],
+    "R_ROM":                  [{"validation_mode": [0], "precondition": [1]}],
+    "L_ROM":                  [{"validation_mode": [0], "precondition": [1]}],
 }
 
 
@@ -285,6 +289,27 @@ HELP = {
         "waveform differs</b> from Thevenin (measured &gt; the signal amplitude on a 20&nbsp;kHz current "
         "source); it still converges (no dt-collapse seen up to ~MHz). Provided to compare the two.</div>"
     ),
+    "precondition": (
+        "<div class='hh'>Interface preconditioner (matched secant vs classical WR)</div>"
+        "<div class='hn'>Whether the field ROM impedance Z = Rrom + Lrom/dt enters the "
+        "<code>Bfield</code> interface. <b>Same fixpoint either way</b> &mdash; only the WR "
+        "<b>convergence rate</b> differs.<br>"
+        "<b>on</b> (default): the <b>optimized-transmission / Robin</b> interface. Bfield carries the "
+        "secant correction Z&middot;(I&minus;i_prev) (a Newton linearisation of the field V&ndash;I law) "
+        "that <b>accelerates</b> the contraction &mdash; this is the preconditioner.<br>"
+        "<b>off</b> &rarr; <b>classical Gauss&ndash;Seidel</b> (Dirichlet&ndash;Neumann) WR: drop the Z "
+        "term; the port is driven by a <b>pure</b> source of the field's own response (I_field current "
+        "source when voltage-driven, V_field voltage source when current-driven). "
+        "Interface stamping / t_floor / R_ROM / L_ROM are then unused. The Z-term vanishes at "
+        "convergence so the fixpoint is unchanged, but the loop contracts more slowly and <b>may not "
+        "converge</b> for stiff/strong coupling &mdash; that is what this knob is for.<br>"
+        "<b>Well-posedness (classical only):</b> the pure source must match the port impedance. An "
+        "<b>inductive</b> port (series L to <code>p</code>) needs the <b>voltage</b> source &rarr; use "
+        "<b>current-driven</b> (coupling_mode=1); a pure current source in series with L is degenerate "
+        "and Xyce aborts at t=0 (&ldquo;failures at time 0&rdquo;). A <b>capacitive</b> port (shunt C on "
+        "<code>p</code>) is the dual &mdash; use voltage-driven. The preconditioner's finite Z is what "
+        "hides this; classical exposes it.</div>"
+    ),
     "seam_average": (
         "<div class='hh'>Window-seam handoff</div>"
         "<div class='hn'>Which terminal value seeds the next window (both solvers agree &lt; WR "
@@ -294,11 +319,19 @@ HELP = {
         "carried seeds are averaged; the Xyce restart checkpoint is unchanged. Seam-blend test.</div>"
     ),
     "use_t_floor": (
-        "<div class='hh'>Secant denominator floor (t_floor)</div>"
-        "<div class='hn'>The Bfield impedance Z = Rrom + Lrom/dt uses dt = time&minus;t_abs_start.<br>"
-        "<b>on</b> (default): dt &rarr; MAX(time&minus;t_abs_start, t_floor); guards the 1/0 at the exact "
-        "window start (dt=0 &rarr; Lrom/0 singularity). t_floor is set by <b>t_floor / window</b>.<br>"
-        "<b>off</b>: bare dt; Z &rarr; &infin; at the window start. Test only.</div>"
+        "<div class='hh'>Secant denominator (dt in Z = Rrom + Lrom/dt)</div>"
+        "<div class='hn'>How the Bfield impedance denominator is formed; all variants reuse "
+        "<b>t_floor / window</b> (t_floor = t_floor_frac&middot;t_window).<br>"
+        "<b>floored</b> (default): dt &rarr; MAX(time&minus;t_abs_start, t_floor) &mdash; the "
+        "accumulated secant, guarded against the 1/0 at the window start (dt=0 &rarr; Lrom/0).<br>"
+        "<b>bare dt</b>: dt = time&minus;t_abs_start; Z &rarr; &infin; at the window start. Test only.<br>"
+        "<b>constant</b>: dt = t_floor (fixed over the window) &rarr; Z = Rrom + Lrom/t_floor is a "
+        "<b>constant</b> interface impedance (a fixed Robin/optimized-transmission coefficient) instead "
+        "of the accumulated secant whose admittance grows across the window. Same fixpoint (the "
+        "correction vanishes at convergence) &mdash; only conditioning / WR contraction rate change; the "
+        "FEM keeps its own accumulated secant. In practice a constant Z is usually a <b>weaker</b> "
+        "preconditioner (contraction &rho; near 1) &rarr; slow, and a loose Cauchy tolerance may stop "
+        "early below the true fixpoint (tighten WR_tolerance / add windows).</div>"
     ),
     "t_floor_frac": (
         "<div class='hh'>t_floor as a fraction of the window</div>"
@@ -2059,7 +2092,8 @@ _PROP_GROUPS = [
     ("Coupling",           True,  [["validation_mode", "coupling_mode", "N_xyce_samples",
                                     "reconstruct_mode", "N_field_eval_intervals"]]),
     ("WR iteration",       False, [["wr_convergence_method", "WRmaxSteps", "WR_tolerance"]]),
-    ("Interface & secant", False, [["use_t_floor", "t_floor_frac", "interface_form", "seam_average"]]),
+    ("Interface & secant", False, [["precondition", "interface_form", "use_t_floor", "t_floor_frac",
+                                    "seam_average"]]),
     ("Field / ROM model",  False, [["R_ROM", "L_ROM", "R_FEM", "L_FEM", "nonlin_model"]]),
 ]
 _PROP_HIDDEN = ["I_sat"]  # config-only (emitted as a hidden input so presets/reset/collect keep working)
