@@ -108,19 +108,19 @@ PRESETS = {
     "P3: Step/ramp V + RL": {"t_end": 2.0e-2, "N_field_windows": 50,
                              "coupling_mode": 0, "WRmaxSteps": 40,
                              "circuit_spec": "VPULSE Vemf s 0 0 1 0 1e-4\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
-    # Switch circuits (SW = time-gated resistor, closed during [tclose, topen)). NOTE C/Ron/times are
-    # numerical-survival defaults (C small enough for WR to contract; the cap<->coil freewheel needs a
-    # damped closed switch Ron~10 or its ~undamped LC ring dt-collapses) -- tune to your field.
-    # 2-way (SPDT) switch: wiper w throws between the source branch (node a) and a short branch (node b),
-    # both rejoining at the port p; cap w->0. Freewheel path is w-b-short-p (electrically w->p; tiny R).
-    "P4: 2-way switch (sine U, C)": {"t_end": 2.0e-2, "N_field_windows": 50,
-        "coupling_mode": 0, "WRmaxSteps": 40,
-        "circuit_spec": "VSIN Bemf a p 1 50\nC Csw w 0 1e-6\n"
-                        "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w b 6e-3 1e30 10 1e9 1e-5\nR shrt b p 1e-6\n"},
-    "P5: 2-way switch (DC U, C)": {"t_end": 2.0e-2, "N_field_windows": 50,
-        "coupling_mode": 0, "WRmaxSteps": 40,
-        "circuit_spec": "VDC Vemf a p 1\nC Csw w 0 1e-6\n"
-                        "SW drv w a 0 6e-3 10 1e9 1e-5\nSW fw w b 6e-3 1e30 10 1e9 1e-5\nR shrt b p 1e-6\n"},
+    # Switch circuits (SW = time-gated switch, closed during [tclose, topen); emitted as a Xyce native
+    # Generic Switch, S device + .MODEL SWITCH). 2-way (SPDT) switch: wiper w throws between the source
+    # branch (node a, drv closed early) and the freewheel branch (fw closed after), with cap w->0.
+    # P4 freewheels directly w->p; P5 via a short branch (node b -> R shrt -> p). Ron/C set the damping:
+    # an undamped cap<->coil freewheel driven on resonance rings hard (see the validation-vs-cosim study).
+    "P4: 2-way switch (sine U, C)": {"t_end": 1.6e-3, "N_field_windows": 100,
+        "coupling_mode": 0, "WRmaxSteps": 40, "L_FEM": 1.68e-7, "R_FEM": 5e-4,
+        "circuit_spec": "VSIN Bemf a p 1 20000\nC Csw 0 w 0.37e-3\n"
+                        "SW drv w a 0 1e-3 1e-3 1e12 0.1e-3\nSW fw w p 1e-3 1e30 1e-3 1e12 0.1e-3\n"},
+    "P5: 2-way switch (DC U, C)": {"t_end": 1.6e-3, "N_field_windows": 100,
+        "coupling_mode": 0, "WRmaxSteps": 40, "L_FEM": 1.68e-7, "R_FEM": 5e-4,
+        "circuit_spec": "VDC Vemf a p 1\nC Csw 0 w 0.37e-3\n"
+                        "SW drv w a 0 1e-3 1e-3 1e12 0.1e-3\nSW fw w p 1e-3 1e30 1e-3 1e12 0.1e-3\n"},
     "P6: 2-way switch (AC vs R)": {"t_end": 2.0e-2, "N_field_windows": 50,
         "coupling_mode": 0, "WRmaxSteps": 40,
         "circuit_spec": "VSIN Bemf p bac 1 50\nR Rload p br 1e4\n"
@@ -191,8 +191,10 @@ HELP = {
         "<td>time-gated switch</td>"
         "<td><code>a b</code> nodes &middot; <code>tclose</code> close time (s) &middot; <code>topen</code> "
         "open time (s) &mdash; big topen (e.g. <code>1e30</code>) stays closed to the end &middot; "
-        "<code>Ron</code> closed R (=10) &middot; <code>Roff</code> open R (=1e9) &middot; "
-        "<code>trise</code> transition (=1e-5)</td></tr>"
+        "<code>Ron</code>/<code>Roff</code> closed/open R &mdash; optional; if omitted Xyce's "
+        "defaults apply (<code>RON=1</code>, <code>ROFF=1e12</code>) &middot; "
+        "<code>trise</code> transition (=1e-5). Emitted as a Xyce native Generic Switch "
+        "(<code>S</code> device + <code>.MODEL SWITCH</code>)</td></tr>"
         "</table>"
     ),
     "probes": (
@@ -647,18 +649,15 @@ _MANUAL_LAYOUTS = {
         "routes": {frozenset({"0", "p"}): [(0, 0), (0, 120), (60, 120)],
                    frozenset({"nx", "0"}): [(120, 0), (120, 120), (60, 120)]},
         "size": (120, 120)},
-    # P4 / P5: SPDT wiper w (cap w->gnd) throws to source branch (a) / short branch (b), rejoining at
-    # port p; interface (ammeter -> field ROM) on the far right. Switch + branches left, field right.
-    frozenset({"a", "b", "w", "p", "nx", "0"}): {
-        "nets": {"w": (40, 120), "a": (160, 40), "b": (160, 200), "p": (300, 120),
+    # P4 / P5: SPDT wiper w (cap w->gnd) throws between the source branch (a, up) and the freewheel
+    # straight to the port (fw: w->p); same topology, source differs (sine / DC). Interface on the right.
+    frozenset({"a", "w", "p", "nx", "0"}): {
+        "nets": {"w": (40, 120), "a": (160, 40), "p": (300, 120),
                  "nx": (420, 120), "0": (330, 240)},
-        # The cap (outer branch) taps the wiper on a short stub (x 40->10) then drops at x=10, so its
-        # drop doesn't run on top of fw's drop; drv (up) + fw (down) stay colinear on the x=40 wiper line.
-        "routes": {frozenset({"w", "0"}): [(40, 120), (10, 120), (10, 240), (330, 240)],
+        # w is a 3-way junction: drv up (to a), fw straight right (to p), cap down (to gnd).
+        "routes": {frozenset({"w", "0"}): [(40, 120), (40, 240), (330, 240)],
                    frozenset({"w", "a"}): [(40, 120), (40, 40), (160, 40)],
-                   frozenset({"w", "b"}): [(40, 120), (40, 200), (160, 200)],
                    frozenset({"a", "p"}): [(160, 40), (300, 40), (300, 120)],
-                   frozenset({"b", "p"}): [(160, 200), (300, 200), (300, 120)],
                    frozenset({"nx", "0"}): [(420, 120), (420, 240), (330, 240)]},
         "size": (420, 240)},
     # P6: two parallel branches from port p to gnd -- (V + switch) and (R + switch) -- plus the
