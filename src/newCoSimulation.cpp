@@ -655,8 +655,27 @@ void MonolithicValidationSolve()
     fprintf(file_WR_error, "   Time, WR_TotalRelErr, N_iterations, Converged \n");
     fclose(file_WR_error);
 
+    // Probes_solution.prn: user probes are in the .print line, so copy their columns from the raw
+    // monolithic solve (dense, full resolution), same format as the WR path (MasterProcess). Without
+    // this the probe plot would show stale data from an earlier run.
+    if (!g_probes.empty()) {
+        FILE* file_Probes = fopen("Probes_solution.prn", "w");
+        fprintf(file_Probes, "Index       TIME");
+        for (const string& pr : g_probes) fprintf(file_Probes, "              %s", pr.c_str());
+        fprintf(file_Probes, "\n");
+        unsigned long idx_p = 0;
+        appendProbeColumns("wr_circuit.cir.prn", file_Probes, g_probes.size(), idx_p,
+                           /*skip_first_point=*/false);
+        fprintf(file_Probes, "End\n");
+        fclose(file_Probes);
+    } else {
+        // No probes this run: remove any stale Probes_solution.prn so the UI doesn't plot old data.
+        remove("Probes_solution.prn");
+    }
+
     cout << "Validation reference written "
-         << "(Circuit_solution.prn / Field_solution.prn / Field_waveform_solution.prn)." << endl;
+         << "(Circuit_solution.prn / Field_solution.prn / Field_waveform_solution.prn"
+         << (g_probes.empty() ? "" : " / Probes_solution.prn") << ")." << endl;
 }
 
 // FEM solver (voltage-driven): takes the port-voltage waveform V_p(t) from vf_prev_k.pwl
@@ -1108,26 +1127,45 @@ static void emitCustomTopology(ofstream& out)
             for (size_t i = 4; i < tok.size(); ++i) out << tok[i] << (i + 1 < tok.size() ? " " : "");
             out << ")\n";
         } else if (type == "SW") {
-            // Time-gated switch: CLOSED (Ron) during [tclose, topen), OPEN (Roff) otherwise, with a
-            // finite trapezoidal transition (tau) so the integrator steps through the throw instead of
-            // colliding with a discontinuity. Behavioral gated resistor (no .MODEL). topen>=tEnd (e.g.
-            // 1e30) = stays closed to the end; tclose<=0 = closed from the start.
+            // Time-gated switch: CLOSED (Ron) during [tclose, topen), OPEN (Roff) otherwise. Emitted as
+            // a Xyce NATIVE Generic Switch (S device + .MODEL SWITCH), which smooths the R transition
+            // internally (unlike the plain SPICE switch). CONTROL is a continuous 0->1 gate built from
+            // the smooth ramps up/dn (transition time tau) -- Xyce warns that discontinuous CONTROL
+            // hurts convergence, so we ramp it rather than hard-switch. With ON=1/OFF=0 the model
+            // interpolates Roff->Ron across the full ramp (tau keeps its old trapezoidal-transition
+            // meaning). topen>=tEnd (e.g. 1e30) = stays closed to the end; tclose<=0 = closed from start.
             //   SW name a b tclose topen [Ron Roff trise]
             need(6);
             const string& nm = tok[1]; const string& a = tok[2]; const string& b = tok[3];
             const double tclose = std::strtod(tok[4].c_str(), nullptr);
             const double topen  = std::strtod(tok[5].c_str(), nullptr);
-            const double Ron  = (tok.size() > 6) ? std::strtod(tok[6].c_str(), nullptr) : 10.0;
-            const double Roff = (tok.size() > 7) ? std::strtod(tok[7].c_str(), nullptr) : 1.0e9;
+            // Ron/Roff are optional: if the spec omits them, leave them OUT of the .MODEL so Xyce uses
+            // its own SWITCH defaults (RON=1, ROFF=1/GMIN=1e12) rather than forcing values here.
+            const bool  has_Ron  = (tok.size() > 6);
+            const bool  has_Roff = (tok.size() > 7);
+            const double Ron  = has_Ron  ? std::strtod(tok[6].c_str(), nullptr) : 1.0;    // Xyce default
+            const double Roff = has_Roff ? std::strtod(tok[7].c_str(), nullptr) : 1.0e12; // Xyce default
             double tau        = (tok.size() > 8) ? std::strtod(tok[8].c_str(), nullptr) : 1.0e-5;
             if (tau <= 0.0) tau = 1.0e-9;
             const double tEnd = simEndTime();
             const string up = (tclose <= 0.0) ? string("1")
                 : ("MIN(MAX((TIME-" + fmtg(tclose) + ")/" + fmtg(tau) + ",0),1)");
-            const string dn = (topen >= tEnd) ? string("0")
+            string dn = (topen >= tEnd) ? string("0")
                 : ("MIN(MAX((TIME-" + fmtg(topen) + ")/" + fmtg(tau) + ",0),1)");
-            out << "R" << nm << " " << a << " " << b << " R={" << fmtg(Roff)
-                << " + (" << fmtg(Ron) << "-" << fmtg(Roff) << ")*(" << up << " - " << dn << ")}\n";
+            // A literal-constant CONTROL (={1 - 0}, closed for the whole run) SEGFAULTS Xyce's generic
+            // switch (a control with no TIME/variable dependence). Keep it TIME-referenced: use an
+            // "opens at t_end" ramp for dn -- numerically 0 over the run (switch stays closed), but not
+            // a compile-time constant.
+            if (up == "1" && dn == "0")
+                dn = "MIN(MAX((TIME-" + fmtg(tEnd) + ")/" + fmtg(tau) + ",0),1)";
+            // Generic Switch: S<nm> a b <model> CONTROL={0..1 gate}; model interpolates Roff..Ron.
+            // Emit only the RON/ROFF the spec specified; otherwise let Xyce default them (RON=1, ROFF=1e12).
+            out << "S" << nm << " " << a << " " << b << " SWMOD" << nm
+                << " CONTROL={" << up << " - " << dn << "}\n";
+            out << ".MODEL SWMOD" << nm << " SWITCH (ON=1 OFF=0";
+            if (has_Ron)  out << " RON="  << fmtg(Ron);
+            if (has_Roff) out << " ROFF=" << fmtg(Roff);
+            out << ")\n";
         } else {
             throw runtime_error("emitCustomTopology: circuit_spec.txt line " + to_string(lineno)
                                 + " unknown TYPE '" + type + "'.");

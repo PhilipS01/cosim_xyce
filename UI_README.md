@@ -63,7 +63,8 @@ text box (saved to `circuit_spec.txt`), one element per line:
   `VPULSE/IPULSE name a b v1 v2 td tr` ·
   `VPWM/IPWM name a b v1 v2 freq duty` (pulse train) ·
   `VPWL/IPWL name a b t1 v1 t2 v2 …` (multi-step) ·
-  `SW name a b tclose topen [Ron Roff trise]` (time-gated switch).
+  `SW name a b tclose topen [Ron Roff trise]` (time-gated switch — emitted as a
+  Xyce native Generic Switch: `S` device + `.MODEL SWITCH`).
 - `#`/`*` comments and blank lines are ignored.
 
 Presets **P1–P6** (sine V + RL, bare current source, step/ramp + RL, and three
