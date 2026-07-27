@@ -116,6 +116,7 @@ bool LoadConfig(const string& filename)
         else if (key == "interface_form")                   g_cfg.interface_form = (unsigned)val;
         else if (key == "precondition")                     g_cfg.precondition = (unsigned)val;
         else if (key == "use_t_floor")                      g_cfg.use_t_floor = (unsigned)val;
+        else if (key == "interface_consistency")            g_cfg.interface_consistency = (unsigned)val;
         else if (key == "seam_average")                     g_cfg.seam_average = (unsigned)val;
         else if (key == "validation_mode")                  g_cfg.validation_mode = (unsigned)val;
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
@@ -1273,6 +1274,42 @@ void WriteCircuitNetlist(const string& filename)
         out << "Bfield nx 0 I = {\n";
         out << "+ V(iprev) + (V(nx) - V(vfprev)) / (Rrom + Lrom/" << dt_expr << ")\n";
         out << "+ }\n\n";
+    } else if (g_cfg.interface_consistency != 0 && g_cfg.coupling_mode == 0) {
+        // INCONSISTENT interface (Thevenin, voltage-driven only). Split the single secant denominator:
+        // the CIRCUIT inductive term uses the circuit's own timestep dt_C, the FIELD term keeps dtf
+        // (= dt_expr = the accumulated window time time - t_abs_start, per use_t_floor). Since the two
+        // Lrom/. denominators differ they no longer cancel -> the WR fixpoint SHIFTS. R stays a
+        // consistent difference. I0 = I_C(t0) = I_F(t0) (the carried window-start current, .PARAM I0).
+        // The circuit term's dt_C is realized three ways (interface_consistency = 1/2/3):
+        if (g_cfg.interface_consistency == 1) {
+            // 1 = REAL RL: Rrom + Lrom as REAL Xyce devices in series on the port branch, carrying
+            // I(Vmeas). The real Lromc (IC={I0}) contributes Lrom*(I_C - I0)/dt_C at Xyce's actual step;
+            // Bfield then carries ONLY the lagged field correction. Series branch is
+            // p-Vmeas-nx-Rromc-nrc-Lromc-nlc-Bfield-0, so I(Vmeas)=I(Lromc)=I_C. Window-1 UIC + restart
+            // carry Lromc's state across windows exactly like the authored circuit inductors.
+            out << "* interface_consistency=1 (inconsistent, real RL): Rrom+Lrom as real devices on port; Bfield = lagged field only\n";
+            out << "Rromc nx nrc {Rrom}\n";
+            out << "Lromc nrc nlc {Lrom} IC={I0}\n";
+            out << "Bfield nlc 0 V = { V(vfprev) - Rrom*V(iprev) - Lrom*(V(iprev) - I0)/" << dt_expr << " }\n\n";
+        } else if (g_cfg.interface_consistency == 2) {
+            // 2 = DDT: circuit inductive term = Lrom*DDT(I(Vmeas)), Xyce's time derivative at the circuit
+            // step (I0 constant -> DDT(I_C) = DDT(I_C - I0)). Requires DDT() support in a B-source.
+            out << "* interface_consistency=2 (inconsistent, DDT): circuit term Lrom*DDT(I(Vmeas)), field term over dtf\n";
+            out << "Bfield nx 0 V = {\n";
+            out << "+ V(vfprev) + Rrom*(I(Vmeas) - V(iprev))\n";
+            out << "+ + Lrom*DDT(I(Vmeas))\n";
+            out << "+ - Lrom*(V(iprev) - I0)/" << dt_expr << "\n";
+            out << "+ }\n\n";
+        } else {
+            // 3 = MEAN dt: circuit inductive term over dt_print = t_window/N_xyce_samples (existing .PARAM),
+            // a fixed representative mean step instead of the true adaptive dt_C.
+            out << "* interface_consistency=3 (inconsistent, mean dt): circuit term over dt_print, field term over dtf\n";
+            out << "Bfield nx 0 V = {\n";
+            out << "+ V(vfprev) + Rrom*(I(Vmeas) - V(iprev))\n";
+            out << "+ + Lrom*(I(Vmeas) - I0)/dt_print\n";
+            out << "+ - Lrom*(V(iprev) - I0)/" << dt_expr << "\n";
+            out << "+ }\n\n";
+        }
     } else {
         // Thevenin (default): a behavioral VOLTAGE source that pins V(nx)=V(p).
         out << "Bfield nx 0 V = {\n";

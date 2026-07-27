@@ -96,6 +96,7 @@ the user circuit.
 | `interface_form` | WR interface stamping: `0` = Thevenin (V source), `1` = Norton (I source) — algebraic duals, same terminal fixpoint |
 | `precondition` | interface preconditioner: `1` = on (default, the matched-secant ROM impedance `Z = R_ROM + L_ROM/dt` in `Bfield` — an optimized/Robin transmission that accelerates the WR contraction); `0` = **classical Gauss–Seidel (Dirichlet–Neumann) WR** — drop the `Z` correction, drive the port with a *pure* source of the field's own response (`I_field` current source when voltage-driven, `V_field` voltage source when current-driven). Same fixpoint (the `Z`-term vanishes at convergence), slower contraction, may not converge for stiff coupling. Disables `interface_form`/`use_t_floor`/`R_ROM`/`L_ROM`. **Well-posedness:** an inductive port (series `L` to `p`) needs the voltage source → use `coupling_mode=1` (a pure current source in series with `L` is degenerate and Xyce aborts at `t=0`); a capacitive port is the dual (voltage-driven) |
 | `use_t_floor` | secant denominator `dt` in `Z = R_ROM + L_ROM/dt`: `1` = floored `MAX(dt, t_floor)` (default, guards the window-start `1/0`); `0` = bare `dt` (test); `2` = **constant** `t_floor` → fixed interface impedance `Z = R_ROM + L_ROM/t_floor` (a constant Robin/optimized-transmission coefficient instead of the growing-admittance accumulated secant; same fixpoint, different WR rate) |
+| `interface_consistency` | **study knob** for the voltage-driven Thevenin interface only (`precondition=1`, `coupling_mode=0`, `interface_form=0`; ignored otherwise; FEM unchanged): `0` = **consistent** (default) — one secant denominator `dt` for both currents, so the two `Lrom/dt` terms cancel at convergence → true fixpoint; `1`/`2`/`3` = **inconsistent** — split the denominator so the circuit inductive term uses the circuit's own step `dt_C` while the field term keeps `time−t_abs_start` (`= dtf`, still per `use_t_floor`): `V_C = V_F + Rrom·(I_C−I_F) + Lrom·(I_C−I0)/dt_C − Lrom·(I_F−I0)/dtf`. The denominators differ → the `Lrom` terms no longer cancel → the fixpoint **shifts**. `dt_C` realized as: `1` real `R_ROM`/`L_ROM` Xyce devices on the port (`IC=I0`, exact adaptive step, `Bfield` = lagged field only); `2` `Lrom·DDT(I(Vmeas))` (Xyce supports `DDT`, but this stamping is numerically fragile — tends to step-collapse on the `Bfield` branch and may abort; prefer real RL); `3` over `dt_print = t_window/N_xyce_samples` (a fixed mean step) |
 | `t_floor_frac` | `t_floor = t_floor_frac · t_window` (window-scaled); the secant-denominator floor (`use_t_floor=1`) **or** the constant denominator (`use_t_floor=2`) |
 | `seam_average` | window-seam handoff: `0` = one-sided (V←circuit, I←field), `1` = midpoint |
 | `validation_mode` | `0` = WR co-sim (default). `1` = **monolithic reference**: replace the behavioral `Bfield` with the *true* field as real Xyce devices (`R_FEM` + `L_FEM` in series on the port branch) and solve the whole circuit as one transient over `[0, t_end]` — no WR loop, no field solver, no coupling. Gives a reference to validate the coupled run against; the WR/coupling/secant knobs are disabled and the convergence plot is empty. Linear field only (saturation ignored) |
@@ -178,6 +179,15 @@ unknown keys ignored; missing keys keep defaults). Run the solver directly:
   to the port: an inductive port (series `L` to `p`, e.g. presets P1/P3) needs
   `coupling_mode=1` so the circuit sees a voltage source; a pure current source
   in series with `L` is degenerate.
+- **Consistent vs inconsistent interface** — with the voltage-driven Thevenin
+  interface (`precondition=1`, `coupling_mode=0`, `interface_form=0`), flip
+  `interface_consistency` from `0` (consistent) to `1`/`2`/`3` (inconsistent: real
+  RL / DDT / mean dt). The consistent scheme shares one secant denominator so the
+  `Lrom` terms cancel at convergence (true fixpoint); the inconsistent ones give
+  the circuit and field terms different denominators, so they no longer cancel and
+  the fixpoint **shifts**. Compare the converged terminal values (and the WR
+  iteration count) against `interface_consistency=0` on the same circuit — the
+  shift is the cost of the mismatched denominator.
 - Lower `WR_tolerance` → more WR iterations per window; toggle
   `wr_convergence_method` between waveform-L1 and terminal-scalar and compare.
 - **t_floor** – guards the window-start impedance by limiting the secant denominator. Find a sweet-spot. Choice is problem-dependant (source frequency, impedances of field/circuit, etc.)

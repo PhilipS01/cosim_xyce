@@ -79,6 +79,9 @@ PARAMS = [
         {1: "on (matched secant)", 0: "off (classical WR)"}),
     ("use_t_floor",                     "Secant denominator",           1,        "choice",
         {1: "floored (guard 1/0)", 0: "bare dt", 2: "constant (Lrom/t_floor)"}),
+    ("interface_consistency",           "Interface condition",          0,        "choice",
+        {0: "consistent (matched dt)", 1: "inconsistent: real RL", 2: "inconsistent: DDT",
+         3: "inconsistent: mean dt"}),
     ("t_floor_frac",                    "t_floor / window",             0.01,     "float", None),
     ("seam_average",                    "Window-seam handoff",          0,        "choice",
         {0: "one-sided (V<-ckt, I<-fld)", 1: "midpoint (average)"}),
@@ -151,6 +154,8 @@ VISIBLE_WHEN = {
     # interface_form / t_floor / the secant ROM impedance only exist when the preconditioner is on.
     "interface_form":         [{"validation_mode": [0], "precondition": [1]}],
     "use_t_floor":            [{"validation_mode": [0], "precondition": [1]}],
+    # inconsistent split is the voltage-driven Thevenin V-form only.
+    "interface_consistency":  [{"validation_mode": [0], "precondition": [1], "coupling_mode": [0], "interface_form": [0]}],
     "precondition":           [{"validation_mode": [0]}],
     "seam_average":           [{"validation_mode": [0]}],
     "wr_convergence_method":  [{"validation_mode": [0]}],
@@ -332,6 +337,29 @@ HELP = {
         "FEM keeps its own accumulated secant. In practice a constant Z is usually a <b>weaker</b> "
         "preconditioner (contraction &rho; near 1) &rarr; slow, and a loose Cauchy tolerance may stop "
         "early below the true fixpoint (tighten WR_tolerance / add windows).</div>"
+    ),
+    "interface_consistency": (
+        "<div class='hh'>Interface condition: consistent vs inconsistent secant denominator</div>"
+        "<div class='hn'>A study knob for the <b>voltage-driven Thevenin</b> interface only "
+        "(precondition=on, coupling-direction=voltage-driven, stamping=Thevenin); ignored otherwise. "
+        "The FEM side is unchanged.<br>"
+        "<b>consistent</b> (default): one denominator dt for both currents in "
+        "Z&middot;(I(Vmeas)&minus;i_prev), so the two Lrom/dt terms cancel at convergence &rarr; the true "
+        "terminal fixpoint.<br>"
+        "<b>inconsistent</b>: split the denominator &mdash; the <b>circuit</b> inductive term uses the "
+        "circuit's own timestep dt_C, the <b>field</b> term keeps time&minus;t_abs_start (= dtf, still "
+        "honoring the secant-denominator choice):<br>"
+        "&nbsp;&nbsp;V_C = V_F + Rrom&middot;(I_C&minus;I_F) + Lrom&middot;(I_C&minus;I0)/dt_C &minus; "
+        "Lrom&middot;(I_F&minus;I0)/dtf.<br>"
+        "The denominators differ &rarr; the Lrom terms no longer cancel &rarr; the fixpoint <b>shifts</b> "
+        "(the effect being measured). dt_C is realized three ways:<br>"
+        "<b>real RL</b>: Rrom+Lrom as real Xyce devices on the port (Lrom IC=I0) &mdash; dt_C is Xyce's "
+        "actual adaptive step (exact); Bfield carries only the lagged field correction.<br>"
+        "<b>DDT</b>: circuit term = Lrom&middot;DDT(I(Vmeas)). Xyce supports DDT, but this stamping is "
+        "<b>numerically fragile</b> &mdash; it tends to step-collapse on the Bfield branch and may abort "
+        "the transient; prefer <b>real RL</b>. Kept for comparison.<br>"
+        "<b>mean dt</b>: circuit term over dt_print = t_window/N_xyce_samples &mdash; a fixed "
+        "representative step instead of the true dt_C.</div>"
     ),
     "t_floor_frac": (
         "<div class='hh'>t_floor as a fraction of the window</div>"
@@ -2092,8 +2120,8 @@ _PROP_GROUPS = [
     ("Coupling",           True,  [["validation_mode", "coupling_mode", "N_xyce_samples",
                                     "reconstruct_mode", "N_field_eval_intervals"]]),
     ("WR iteration",       False, [["wr_convergence_method", "WRmaxSteps", "WR_tolerance"]]),
-    ("Interface & secant", False, [["precondition", "interface_form", "use_t_floor", "t_floor_frac",
-                                    "seam_average"]]),
+    ("Interface & secant", False, [["precondition", "interface_form", "use_t_floor",
+                                    "interface_consistency", "t_floor_frac", "seam_average"]]),
     ("Field / ROM model",  False, [["R_ROM", "L_ROM", "R_FEM", "L_FEM", "nonlin_model"]]),
 ]
 _PROP_HIDDEN = ["I_sat"]  # config-only (emitted as a hidden input so presets/reset/collect keep working)

@@ -108,6 +108,30 @@ struct SimConfig
     //       NB: a constant Z is usually a WEAKER preconditioner (rho -> 1) -> slow; a loose Cauchy
     //       WR_tolerance can then stop early below the true fixpoint (tighten tol / add windows).
     unsigned use_t_floor = 1;
+    // Interface CONSISTENCY -- consistent (default) vs an INCONSISTENT split of the secant denominator,
+    // for studying whether the mismatched-denominator scheme is really worse. Scope: the voltage-driven
+    // Thevenin V-form only (precondition=1, coupling_mode=0, interface_form=0); ignored otherwise (falls
+    // back to the consistent emission). The FEM solvers are UNCHANGED (they keep their own accumulated
+    // secant and still produce vf_prev/i_prev); only the circuit-side Bfield stamping changes.
+    // Consistent (=0) shares ONE denominator dt for both currents in Z*(I(Vmeas) - i_prev), so the two
+    // Lrom/dt terms cancel at convergence -> true terminal fixpoint. Inconsistent (>0) splits it so the
+    // CIRCUIT inductive term uses the circuit's own timestep dt_C while the FIELD term keeps
+    // time - t_abs_start (= dtf, still honoring use_t_floor):
+    //   V_C = V_F + Rrom*(I_C - I_F) + Lrom*(I_C - I0)/dt_C - Lrom*(I_F - I0)/dtf,  I0 = I_C(t0) = I_F(t0).
+    // The denominators differ -> the Lrom terms no longer cancel -> the fixpoint SHIFTS (the measured
+    // effect). The circuit term's dt_C is realized three ways:
+    //   0 = consistent (default): the single-denominator form, emitted byte-for-byte as before.
+    //   1 = inconsistent, REAL RL: Rrom + Lrom stamped as REAL Xyce devices in series on the port branch
+    //       (carrying I(Vmeas), Lrom IC={I0}); Bfield carries only the lagged field correction. dt_C is
+    //       then Xyce's actual (adaptive) circuit timestep -- exact.
+    //   2 = inconsistent, DDT: circuit term = Lrom*DDT(I(Vmeas)) in the behavioral Bfield (Xyce time
+    //       derivative at the circuit step). Xyce DOES support DDT(), but this stamping (a voltage source
+    //       whose value depends on the derivative of its own branch current) is numerically fragile --
+    //       observed to step-collapse on the BFIELD branch and abort the transient (exit 256). Prefer the
+    //       real-RL realization (=1); mode 2 is kept for comparison but may not converge.
+    //   3 = inconsistent, MEAN dt: circuit term = Lrom*(I(Vmeas) - I0)/dt_print, dt_print = t_window/
+    //       N_xyce_samples (the existing .PARAM) -- a fixed representative mean step instead of dt_C.
+    unsigned interface_consistency = 0;
     // Window-seam handoff: how the carried terminal values (V0, I0 seeding the next window) are picked
     // from the converged iterate (the two solvers agree to within WR_tolerance there):
     //   0 = one-sided (default): V0 = circuit V(p), I0 = field I. (Restart checkpoint = Xyce state.)
