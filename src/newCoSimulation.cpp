@@ -10,6 +10,15 @@
 #include <vector>
 #include <sstream>
 
+#ifdef _WIN32
+// RunXyce spawns Xyce once per WR iteration (windows x WR steps), so the per-call
+// process cost matters. system() would route every one of those through cmd.exe --
+// two CreateProcess calls instead of one, plus a console window per spawn.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 
 // Global tunable configuration (defaults defined in SimConfig). Overwritten by LoadConfig.
 SimConfig g_cfg;
@@ -1004,12 +1013,71 @@ void ReadXyceResults(const string& filename, CircuitWaveform& circuit_raw, doubl
 
 // Runs the Xyce circuit solver on the given netlist (stdout/stderr redirected to xyce_*.log).
 // Throws if Xyce exits non-zero.
+#ifdef _WIN32
+// Open a log file as an inheritable handle for the child's stdout/stderr, replacing
+// the "> xyce_stdout.log" shell redirection that cmd.exe would otherwise do for us.
+static HANDLE OpenChildLog(const char* path) {
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    return CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+#endif
+
 void RunXyce(const string& filename) {
+#ifdef _WIN32
+    HANDLE hOut = OpenChildLog("xyce_stdout.log");
+    HANDLE hErr = OpenChildLog("xyce_stderr.log");
+    if (hOut == INVALID_HANDLE_VALUE || hErr == INVALID_HANDLE_VALUE) {
+        if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
+        if (hErr != INVALID_HANDLE_VALUE) CloseHandle(hErr);
+        throw runtime_error("Could not open xyce_stdout.log / xyce_stderr.log for writing.");
+    }
+
+    // CreateProcessA may modify lpCommandLine in place, so it needs a writable buffer.
+    // Quote the netlist path: the working directory can sit under "Mobile Documents".
+    string cmd = "Xyce \"" + filename + "\"";
+    vector<char> cmdline(cmd.begin(), cmd.end());
+    cmdline.push_back('\0');
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = hOut;
+    si.hStdError = hErr;
+    PROCESS_INFORMATION pi{};
+
+    // lpApplicationName = nullptr so that "Xyce" is still resolved via PATH, exactly as
+    // the shell did. CREATE_NO_WINDOW suppresses the console that would otherwise flash
+    // up once per WR iteration.
+    BOOL ok = CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr,
+                             TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    DWORD spawnErr = ok ? 0 : GetLastError();
+    CloseHandle(hOut);
+    CloseHandle(hErr);
+    if (!ok) {
+        throw runtime_error(
+            "Could not start Xyce (CreateProcess error " + to_string(spawnErr) +
+            "). Is Xyce on PATH?"
+        );
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    int ret = static_cast<int>(code);
+#else
     string cmd =
         string("Xyce ") + filename +
         " > xyce_stdout.log 2> xyce_stderr.log";
 
     int ret = system(cmd.c_str());
+#endif
 
     if (ret != 0) {
         throw runtime_error(
