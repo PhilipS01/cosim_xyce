@@ -44,3 +44,7 @@ package-lock.json
 
 # python venv (created by setup.sh)
 .venv/
+
+# editor / OS cruft
+.DS_Store
+tags
