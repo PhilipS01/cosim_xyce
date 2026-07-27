@@ -83,15 +83,22 @@ note() { printf '  %s%s%s\n' "$D" "$*" "$Z"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Prompting needs a terminal on *both* ends: with `./setup.sh > setup.log` stdin is
+# still a tty, but the question would land in the log file while the user watches a
+# terminal that looks hung.
+interactive() { [ -t 0 ] && [ -t 1 ]; }
+
 # ask <question> [auto-yes-flag]
 # Returns 0 for yes. The auto-yes flag defaults to --install, so `--install` answers
-# every prompt yes; --no-install answers no. Anything other than an interactive
-# terminal (pipes, CI, `curl | bash`) answers no rather than blocking on input.
+# every prompt yes; --no-install answers no and wins over --install, so that adding
+# the safe flag to an existing command line can never turn installs on. Anything
+# other than an interactive terminal (pipes, CI, `curl | bash`, redirected output)
+# answers no rather than blocking on input.
 ask() {
     local q="$1" auto="${2:-$DO_INSTALL}" reply
-    [ "$auto" = 1 ] && return 0
     [ "$ASSUME_NO" = 1 ] && return 1
-    [ -t 0 ] || return 1
+    [ "$auto" = 1 ] && return 0
+    interactive || return 1
     printf '  %s%s%s [y/N] ' "$Y" "$q" "$Z"
     read -r reply || { echo; return 1; }
     case "$reply" in [Yy]|[Yy][Ee][Ss]) return 0 ;; *) return 1 ;; esac
@@ -133,19 +140,30 @@ hint() {
     esac
 }
 
+# pkg_for <brew> <apt> <dnf> <pacman> <zypper>: echo the package list for the
+# detected manager (empty when it has none). Callers check this before prompting,
+# so we never ask a question we cannot act on.
+pkg_for() {
+    case "$PKG" in
+        brew)    printf '%s' "$1" ;;
+        apt-get) printf '%s' "$2" ;;
+        dnf)     printf '%s' "$3" ;;
+        pacman)  printf '%s' "$4" ;;
+        zypper)  printf '%s' "$5" ;;
+    esac
+}
+
 # install_pkgs <label> <brew> <apt> <dnf> <pacman> <zypper>
 # runs the detected manager's install command. Callers must use it in a
 # condition (if / ||) so that a failing install does not trip `set -e`.
 install_pkgs() {
-    local label="$1" brew="$2" apt="$3" dnf="$4" pac="$5" zyp="$6" pkgs=""
-    case "$PKG" in
-        brew)    pkgs="$brew" ;;
-        apt-get) pkgs="$apt"  ;;
-        dnf)     pkgs="$dnf"  ;;
-        pacman)  pkgs="$pac"  ;;
-        zypper)  pkgs="$zyp"  ;;
-        *) warn "cannot install $label -- no supported package manager detected"; return 1 ;;
-    esac
+    local label="$1" pkgs
+    shift
+    if [ -z "$PKG" ]; then
+        warn "cannot install $label -- no supported package manager detected"
+        return 1
+    fi
+    pkgs="$(pkg_for "$@")"
     if [ -z "$pkgs" ]; then
         warn "cannot install $label with $PKG -- no package for it"
         return 1
@@ -267,10 +285,13 @@ install_xyce() {
 ensure_tool() {
     local probe="$1" label="$2"
     have "$probe" && return 0
-    # Nothing to offer without a package manager -- let the caller print its hint.
-    [ -n "$PKG" ] || return 1
-    ask "$label is missing. Install it with $PKG?" || return 1
     shift 2
+    # Nothing to offer without a package manager, or when this one has no package
+    # for the tool -- let the caller print its hint instead of asking a question
+    # that can only end in "no package for it".
+    [ -n "$PKG" ] || return 1
+    [ -n "$(pkg_for "$@")" ] || return 1
+    ask "$label is missing. Install it with $PKG?" || return 1
     install_pkgs "$label" "$@" || return 1
     have "$probe"
 }
@@ -279,10 +300,13 @@ hdr "Environment"
 ok "OS: $OS${PKG:+  (package manager: $PKG)}"
 if [ "$ASSUME_NO" = 1 ]; then
     note "(--no-install: reporting only, nothing will be installed)"
+    if [ "$DO_INSTALL" = 1 ] || [ "$DO_INSTALL_XYCE" = 1 ]; then
+        warn "--no-install overrides --install/--install-xyce"
+    fi
 elif [ -z "$PKG" ]; then
     if [ "$DO_INSTALL" = 1 ]; then warn "--install given but no supported package manager found -- hints only"; fi
-elif [ ! -t 0 ] && [ "$DO_INSTALL" != 1 ]; then
-    note "(input is not a terminal: reporting only -- pass --install to install without prompts)"
+elif ! interactive && [ "$DO_INSTALL" != 1 ]; then
+    note "(not an interactive terminal: reporting only -- pass --install to install without prompts)"
 elif [ "$PKG" != brew ] && [ -n "$SUDO" ]; then
     note "installs run through sudo -- you may be prompted for your password"
 fi
@@ -301,9 +325,14 @@ if [ -z "$CXX" ]; then
     if [ "$OS" = Darwin ]; then
         if ask "No C++ compiler. Request the Xcode Command Line Tools?"; then
             note "a GUI installer opens ..."
-            xcode-select --install 2>/dev/null || true
-            DID_INSTALL=1
-            note "finish that dialog, then re-run ./setup.sh"
+            # Non-zero when the tools are already present (or the dialog was refused),
+            # in which case this was not an install and must not claim to be one.
+            if xcode-select --install 2>/dev/null; then
+                DID_INSTALL=1
+                note "finish that dialog, then re-run ./setup.sh"
+            else
+                warn "xcode-select --install did not start (already installed, or declined)"
+            fi
         fi
     elif [ -n "$PKG" ] && ask "No C++ compiler. Install one with $PKG?"; then
         install_pkgs "C++ compiler" "gcc" "g++ make" "gcc-c++ make" "base-devel" "gcc-c++ make" || true

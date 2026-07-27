@@ -80,13 +80,15 @@ $DidInstall = $false   # set once anything was actually installed (drives the fi
 
 # Confirm-Install <question> [<auto-yes>]
 # Returns $true for yes. The auto-yes flag defaults to -Install, so -Install answers
-# every prompt yes; -NoInstall answers no. Redirected input (CI) answers no rather
-# than blocking forever on Read-Host.
+# every prompt yes; -NoInstall answers no and wins over -Install, so that adding the
+# safe flag to an existing command line can never turn installs on. Redirected input
+# or output (CI, `... > setup.log`) answers no rather than blocking on Read-Host or
+# writing the question into a file nobody is watching.
 function Confirm-Install {
     param([Parameter(Mandatory)][string]$Question, [bool]$Auto = $Install.IsPresent)
-    if ($Auto) { return $true }
     if ($NoInstall) { return $false }
-    if ([Console]::IsInputRedirected) { return $false }
+    if ($Auto) { return $true }
+    if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { return $false }
     Write-Host "  $Question [y/N] " -ForegroundColor Yellow -NoNewline
     $reply = Read-Host
     return ($reply -match '^\s*y(es)?\s*$')
@@ -144,11 +146,18 @@ function Hint ($winget, $scoop, $choco) {
 
 # Install-Dep <label> <winget-id> <scoop-pkg> <choco-pkg> [-Probe cmd]: run the detected
 # manager's install command. Returns $true when the tool is usable afterwards.
+# Get-PkgName <winget-id> <scoop-pkg> <choco-pkg>: the package name for the detected
+# manager, or '' when it has none. Callers check this before prompting, so we never ask
+# a question we cannot act on.
+function Get-PkgName ($winget, $scoop, $choco) {
+    switch ($PKG) { 'winget' { $winget } 'scoop' { $scoop } 'choco' { $choco } default { '' } }
+}
+
 function Install-Dep {
     param([string]$Label, [string]$Winget, [string]$Scoop, [string]$Choco, [string]$Probe)
 
     if (-not $PKG) { Warn "cannot install $Label -- no winget/scoop/choco on this machine"; return $false }
-    $pkg = switch ($PKG) { 'winget' { $Winget } 'scoop' { $Scoop } 'choco' { $Choco } }
+    $pkg = Get-PkgName $Winget $Scoop $Choco
     if (-not $pkg) { Warn "cannot install $Label with $PKG -- no package for it"; Hint $Winget $Scoop $Choco; return $false }
 
     Note "installing $Label via $PKG ($pkg) ..."
@@ -160,9 +169,10 @@ function Install-Dep {
     }
     Update-PathFromRegistry
 
-    $script:DidInstall = $true
     $usable = if ($Probe) { Have $Probe } else { $code -eq 0 }
-    if ($usable) { Ok "$Label installed"; return $true }
+    # Only a successful install may set this: it drives the "open a new shell" hint,
+    # which is the wrong advice after an install that simply failed.
+    if ($usable) { $script:DidInstall = $true; Ok "$Label installed"; return $true }
     Warn "$Label not usable after install (exit $code) -- may need a new shell, admin rights, or a manual install"
     return $false
 }
@@ -174,9 +184,16 @@ function Install-Msys2Toolchain {
             Where-Object { Test-Path (Join-Path $_ 'usr\bin\bash.exe') } | Select-Object -First 1
     if (-not $root) { Warn 'MSYS2 not found after install -- cannot bootstrap gcc/make'; return $false }
 
-    Note 'bootstrapping the MSYS2 toolchain (pacman -S gcc make) -- this takes a few minutes'
+    Note 'bootstrapping the MSYS2 toolchain (pacman) -- this takes a few minutes'
     $bash = Join-Path $root 'usr\bin\bash.exe'
-    Invoke-Native $bash @('-lc', 'pacman -Syu --noconfirm --needed mingw-w64-ucrt-x86_64-gcc make') -Show | Out-Null
+    # A fresh MSYS2 needs its two-stage self-update first: the initial -Syu replaces
+    # msys2-runtime/pacman and kills the shell, so packages named in that same command
+    # would never be installed. Update (twice, the first run is expected to die), then
+    # install separately and actually look at the exit code.
+    Invoke-Native $bash @('-lc', 'pacman -Syu --noconfirm') -Show | Out-Null
+    Invoke-Native $bash @('-lc', 'pacman -Syu --noconfirm') -Show | Out-Null
+    $code = Invoke-Native $bash @('-lc', 'pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-gcc make') -Show
+    if ($code -ne 0) { Warn "pacman exited with code $code -- the toolchain may be incomplete" }
 
     $bins = @((Join-Path $root 'ucrt64\bin'), (Join-Path $root 'usr\bin')) | Where-Object { Test-Path $_ }
     foreach ($d in $bins) { if (($env:PATH -split ';') -notcontains $d) { $env:PATH = "$d;$env:PATH" } }
@@ -226,10 +243,17 @@ function Install-Xyce {
         $exe = Get-ChildItem -Path $tmp -Filter '*.exe' -Recurse | Select-Object -First 1
         if (-not $exe) { Err 'no .exe inside the archive'; return $false }
 
-        # NSIS installer: /S is its silent switch. It needs elevation for Program Files.
+        # NSIS installer: /S is its silent switch. Its manifest is requireAdministrator,
+        # so -Verb RunAs raises UAC. Declining that throws a Win32Exception which, under
+        # the script-wide 'Stop', would abort setup entirely -- catch it and carry on.
         if (-not $IsAdmin) { Note 'the installer needs elevation -- expect a UAC prompt' }
         Note "running $($exe.Name) /S ..."
-        $p = Start-Process -FilePath $exe.FullName -ArgumentList '/S' -Wait -PassThru -Verb RunAs
+        try {
+            $p = Start-Process -FilePath $exe.FullName -ArgumentList '/S' -Wait -PassThru -Verb RunAs
+        } catch {
+            Err "could not start the installer: $($_.Exception.Message)"
+            return $false
+        }
         if ($p.ExitCode -ne 0) { Err "installer exited with code $($p.ExitCode)"; return $false }
         $script:DidInstall = $true
 
@@ -237,7 +261,9 @@ function Install-Xyce {
         if (Have Xyce) { Ok "installed Xyce: $((Get-Command Xyce).Source)"; return $true }
 
         # Silent NSIS runs do not always touch PATH; look where it lands by default.
-        $bin = Get-ChildItem -Path @("$env:ProgramFiles", "${env:ProgramFiles(x86)}", $env:SystemDrive) `
+        # Note the trailing slash: bare "C:" is drive-*relative* in PowerShell and would
+        # search the current directory (this repo), not the root of the system drive.
+        $bin = Get-ChildItem -Path @("$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:SystemDrive\") `
                              -Filter 'Xyce*' -Directory -ErrorAction SilentlyContinue |
                ForEach-Object { Join-Path $_.FullName 'bin' } |
                Where-Object { Test-Path (Join-Path $_ 'Xyce.exe') } | Select-Object -First 1
@@ -259,10 +285,15 @@ function Install-Xyce {
 function Resolve-Tool {
     param([string[]]$Names, [string]$Label, [string]$Winget, [string]$Scoop, [string]$Choco)
     $found = $Names | Where-Object { Have $_ } | Select-Object -First 1
-    # Nothing to offer without a package manager -- let the caller print its hint.
-    if (-not $found -and $PKG -and (Confirm-Install "$Label is missing. Install it with $PKG`?")) {
-        Install-Dep $Label $Winget $Scoop $Choco -Probe $Names[0] | Out-Null
-        $found = $Names | Where-Object { Have $_ } | Select-Object -First 1
+    if (-not $found) {
+        # Nothing to offer without a package manager, or when this one has no package
+        # for the tool (winget carries neither a compiler nor make -- both come from the
+        # MSYS2 route above). Asking anyway would only end in "no package for it".
+        $pkg = Get-PkgName $Winget $Scoop $Choco
+        if ($pkg -and (Confirm-Install "$Label is missing. Install it with $PKG`?")) {
+            Install-Dep $Label $Winget $Scoop $Choco -Probe $Names[0] | Out-Null
+            $found = $Names | Where-Object { Have $_ } | Select-Object -First 1
+        }
     }
     return [string]$found
 }
@@ -271,10 +302,11 @@ Hdr 'Environment'
 Ok "OS: Windows$(if ($PKG) { "  (package manager: $PKG)" })"
 if ($NoInstall) {
     Note '(-NoInstall: reporting only, nothing will be installed)'
+    if ($Install -or $InstallXyce) { Warn '-NoInstall overrides -Install/-InstallXyce' }
 } elseif (-not $PKG) {
     if ($Install) { Warn '-Install given but no winget/scoop/choco found -- falling back to hints only' }
-} elseif ([Console]::IsInputRedirected -and -not $Install) {
-    Note '(input is redirected: reporting only -- pass -Install to install without prompts)'
+} elseif (([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) -and -not $Install) {
+    Note '(not an interactive console: reporting only -- pass -Install to install without prompts)'
 } elseif ($PKG -eq 'choco' -and -not $IsAdmin) {
     Warn 'choco installs need an elevated shell -- re-run as Administrator if they fail'
 } elseif ($PKG -eq 'scoop' -and $IsAdmin) {
