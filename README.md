@@ -23,7 +23,9 @@ Xyce transient — a reference to check the coupled WR solution against.
 - **C++17 compiler** + `make` (the `Makefile` uses `clang++`).
 - **Xyce** on `PATH` — the circuit solver.
 - *Optional:* **Node.js** + `npm install` (elkjs) and **pdflatex** + `circuitikz`
-  for the inline schematic and `.tex`/`.pdf` export.
+  for the inline schematic and `.tex`/`.pdf` export, plus **poppler**
+  (`pdftoppm`) to rasterize it at 300 dpi — macOS falls back to the built-in
+  `sips`, Linux has no fallback.
 
 ## Quick start
 
@@ -31,6 +33,35 @@ Xyce transient — a reference to check the coupled WR solution against.
 ./setup.sh                        # macOS/Linux: venv + deps + build + optional tools
 python3 sim_ui.py                 # serves http://127.0.0.1:8000
 ```
+
+When something is missing, `setup.sh` asks whether to install it with your
+package manager (brew / apt-get / dnf / pacman / zypper, via `sudo` where
+needed; on macOS the compiler comes from `xcode-select --install`). Answering no
+just prints the install command, as before. Flags skip the questions:
+
+```sh
+./setup.sh --install       # yes to everything except Xyce
+./setup.sh --no-install    # no to everything; only report what is missing
+```
+
+Redirected input — CI, `curl | bash` — never prompts and never installs, so
+unattended runs behave like `--no-install` unless you pass `--install`.
+
+Xyce is asked separately and is **not** covered by `--install`, since it means a
+download plus an elevated installer run. `--install-xyce` answers that one yes:
+
+```sh
+./setup.sh --install-xyce      # macOS Arm64: fetch Sandia's .pkg and install it
+```
+
+The archive's SHA-256 is pinned in the script and checked before anything runs; a
+mismatch aborts rather than installing. Coverage is limited by what Sandia ships:
+**macOS Arm64 only** — there is no Intel build, and the Linux binary is a RHEL8
+rpm that Sandia says does not work on Debian/Ubuntu (so not in WSL2) and is broken
+on Fedora. Elsewhere use `spack install xyce` or build from
+[github.com/Xyce/Xyce](https://github.com/Xyce/Xyce). The macOS build is not
+notarized, so after installing you must approve Xyce once under **System Settings
+→ Privacy & Security** before it will run.
 
 Or by hand:
 
@@ -56,6 +87,17 @@ Full usage, parameters, and the circuit-spec format: **[UI_README.md](UI_README.
   `main.exe` (the UI resolves the name automatically). The inline schematic PNG
   needs **poppler** (`pdftoppm`) on `PATH` — there is no `sips` on Windows — but
   simulations, plots, and `.tex`/`.pdf` export work without it.
+
+  Like `setup.sh`, it asks before installing anything, using the detected
+  package manager (winget / scoop / choco); on winget the toolchain comes from
+  MSYS2 plus a `pacman` bootstrap. `-Install` answers yes to everything except
+  Xyce, `-NoInstall` answers no to everything, and redirected input never
+  prompts. `choco` needs an elevated shell and `scoop` must not be elevated.
+
+  Xyce is asked separately — `-InstallXyce` answers it yes, downloading Sandia's
+  NSIS installer, verifying a pinned SHA-256, and running it silently (UAC
+  prompt). Decline and it stays manual: grab the Windows build from
+  [xyce.sandia.gov](https://xyce.sandia.gov) and put its `bin` on `PATH`.
 
 ## Run the solver directly
 
