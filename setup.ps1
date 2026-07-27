@@ -186,14 +186,29 @@ function Install-Msys2Toolchain {
 
     Note 'bootstrapping the MSYS2 toolchain (pacman) -- this takes a few minutes'
     $bash = Join-Path $root 'usr\bin\bash.exe'
-    # A fresh MSYS2 needs its two-stage self-update first: the initial -Syu replaces
-    # msys2-runtime/pacman and kills the shell, so packages named in that same command
-    # would never be installed. Update (twice, the first run is expected to die), then
-    # install separately and actually look at the exit code.
+
+    # The first -Syu swaps out msys2-runtime/msys-2.0.dll underneath itself, after which
+    # any process still holding the old DLL fails to fork with
+    #   "Could not fork child process: there are no available terminals"
+    # MSYS2's own instruction at that point is to terminate all its processes and start
+    # over, so do exactly that between passes rather than calling bash again blind.
+    $killMsys = {
+        Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+
     Invoke-Native $bash @('-lc', 'pacman -Syu --noconfirm') -Show | Out-Null
+    & $killMsys
     Invoke-Native $bash @('-lc', 'pacman -Syu --noconfirm') -Show | Out-Null
+    & $killMsys
     $code = Invoke-Native $bash @('-lc', 'pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-gcc make') -Show
-    if ($code -ne 0) { Warn "pacman exited with code $code -- the toolchain may be incomplete" }
+    if ($code -ne 0) {
+        Warn "pacman exited with code $code -- the toolchain may be incomplete"
+        Note 'if it reported "no available terminals", finish it in the MSYS2 UCRT64 terminal:'
+        Note '  pacman -Syu   (twice, closing the window when told)  then  pacman -S --needed mingw-w64-ucrt-x86_64-gcc make'
+    }
 
     $bins = @((Join-Path $root 'ucrt64\bin'), (Join-Path $root 'usr\bin')) | Where-Object { Test-Path $_ }
     foreach ($d in $bins) { if (($env:PATH -split ';') -notcontains $d) { $env:PATH = "$d;$env:PATH" } }
@@ -323,7 +338,12 @@ Hdr 'Core toolchain (required to build + run)'
 $CXX = @('g++', 'clang++') | Where-Object { Have $_ } | Select-Object -First 1
 if (-not $CXX -and $PKG -eq 'winget' -and
     (Confirm-Install 'No C++ compiler. Install MSYS2 and bootstrap gcc+make with pacman (several minutes)?')) {
-    if (Install-Dep 'MSYS2' 'MSYS2.MSYS2' '' '' -Probe '') { Install-Msys2Toolchain | Out-Null }
+    # The bootstrap must not be gated on the winget exit code: for an MSYS2 that is
+    # already present winget reports "no applicable upgrade" (non-zero), which would
+    # skip the pacman step -- exactly the case where only the compiler is missing.
+    # Install-Msys2Toolchain locates the install itself and reports if there is none.
+    Install-Dep 'MSYS2' 'MSYS2.MSYS2' '' '' -Probe '' | Out-Null
+    Install-Msys2Toolchain | Out-Null
     $CXX = @('g++', 'clang++') | Where-Object { Have $_ } | Select-Object -First 1
 }
 if (-not $CXX) { $CXX = Resolve-Tool @('g++', 'clang++') 'C++ compiler' '' 'gcc' 'mingw' }
