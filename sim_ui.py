@@ -72,11 +72,11 @@ PARAMS = [
     ("coupling_mode",                   "Coupling direction",           0,        "choice",
         {0: "voltage-driven", 1: "current-driven"}),
     ("reconstruct_mode",                "Field reconstruction",         0,        "choice",
-        {0: "pointwise (secant)", 1: "linear ramp"}),
+        {0: "pointwise (BDF-1)", 1: "linear ramp"}),
     ("interface_form",                  "Interface stamping",           0,        "choice",
         {0: "Thevenin (V source)", 1: "Norton (I source)"}),
     ("precondition",                    "Interface preconditioner",     1,        "choice",
-        {1: "on (matched secant)", 0: "off (classical WR)"}),
+        {1: "on (optimized)", 0: "off (classical WR)"}),
     ("use_t_floor",                     "Secant denominator",           1,        "choice",
         {1: "floored (guard 1/0)", 0: "bare dt", 2: "constant (Lrom/t_floor)"}),
     ("interface_consistency",           "Interface condition",          0,        "choice",
@@ -140,7 +140,7 @@ PRESETS = {
 # matches the current control values (OR-of-ANDs). Keys absent here are always visible. The circuit
 # side is always the custom node-graph spec (circuit_spec.txt); the run is absolute-end-time only
 # ("Sim duration" = t_end). What remains conditional: N_field_eval_intervals only matters for the
-# pointwise-secant reconstruction (0) -- linear (1) forces 1 solve/window and ignores it -- so it's
+# pointwise (BDF-1) reconstruction (0) -- linear (1) forces 1 solve/window and ignores it -- so it's
 # shown only then. t_floor_frac only matters when the secant t_floor guard is on (use_t_floor=1);
 # with bare dt (0) the floor is irrelevant. validation_mode=1 (monolithic reference: the true field
 # stamped as real R_FEM/L_FEM devices, one Xyce transient, no WR) makes the whole WR/coupling/secant
@@ -154,8 +154,8 @@ VISIBLE_WHEN = {
     # interface_form / t_floor / the secant ROM impedance only exist when the preconditioner is on.
     "interface_form":         [{"validation_mode": [0], "precondition": [1]}],
     "use_t_floor":            [{"validation_mode": [0], "precondition": [1]}],
-    # inconsistent split is the voltage-driven Thevenin V-form only.
-    "interface_consistency":  [{"validation_mode": [0], "precondition": [1], "coupling_mode": [0], "interface_form": [0]}],
+    # inconsistent split is the Thevenin form (both coupling directions).
+    "interface_consistency":  [{"validation_mode": [0], "precondition": [1], "interface_form": [0]}],
     "precondition":           [{"validation_mode": [0]}],
     "seam_average":           [{"validation_mode": [0]}],
     "wr_convergence_method":  [{"validation_mode": [0]}],
@@ -267,15 +267,15 @@ HELP = {
         "field <b>current</b> (voltage-driven) or the field <b>voltage</b> (current-driven).</div>"
         "<table>"
         "<tr><th>mode</th><th>reconstruction</th><th>solves/win</th><th>note</th></tr>"
-        "<tr><td>pointwise (secant)</td><td>value at each point, accumulated window secant</td>"
-        "<td>N_field_eval</td><td>curve-following; matches the Xyce Bfield secant exactly</td></tr>"
+        "<tr><td>pointwise (BDF-1)</td><td>value at each field node via a local backward-Euler step</td>"
+        "<td>N_field_eval</td><td>curve-following; a proper field-ODE integration</td></tr>"
         "<tr><td>linear ramp</td><td>straight line carried-start &rarr; window-end</td>"
         "<td><b>1</b></td><td>cheapest; pure coupling reconstruction</td></tr>"
         "</table>"
-        "<div class='hn'><b>pointwise (secant)</b> with <code>FEM eval intervals / window = 1</code> "
+        "<div class='hn'><b>pointwise (BDF-1)</b> with <code>FEM eval intervals / window = 1</code> "
         "collapses to <b>linear ramp</b>: one interval leaves only the carried start and the window end, "
-        "so the accumulated secant is a single straight segment. Raise the eval intervals for it to actually "
-        "follow the curve.</div>"
+        "so the single backward-Euler step is one straight segment. Raise the eval intervals for it to "
+        "actually follow the curve.</div>"
         "<div class='hn'>Both coupling directions. Both modes carry the seam (C0-continuous). Accuracy is "
         "within ~1&ndash;2% between them; the extra solves buy little. Recommend <b>linear</b> "
         "(1 field solve per window).</div>"
@@ -295,7 +295,7 @@ HELP = {
         "source); it still converges (no dt-collapse seen up to ~MHz). Provided to compare the two.</div>"
     ),
     "precondition": (
-        "<div class='hh'>Interface preconditioner (matched secant vs classical WR)</div>"
+        "<div class='hh'>Interface preconditioner (optimized-transmission vs classical WR)</div>"
         "<div class='hn'>Whether the field ROM impedance Z = Rrom + Lrom/dt enters the "
         "<code>Bfield</code> interface. <b>Same fixpoint either way</b> &mdash; only the WR "
         "<b>convergence rate</b> differs.<br>"
@@ -334,27 +334,34 @@ HELP = {
         "<b>constant</b> interface impedance (a fixed Robin/optimized-transmission coefficient) instead "
         "of the accumulated secant whose admittance grows across the window. Same fixpoint (the "
         "correction vanishes at convergence) &mdash; only conditioning / WR contraction rate change; the "
-        "FEM keeps its own accumulated secant. In practice a constant Z is usually a <b>weaker</b> "
+        "FEM keeps its own BDF-1 field integration. In practice a constant Z is usually a <b>weaker</b> "
         "preconditioner (contraction &rho; near 1) &rarr; slow, and a loose Cauchy tolerance may stop "
         "early below the true fixpoint (tighten WR_tolerance / add windows).</div>"
     ),
     "interface_consistency": (
         "<div class='hh'>Interface condition: consistent vs inconsistent secant denominator</div>"
-        "<div class='hn'>A study knob for the <b>voltage-driven Thevenin</b> interface only "
-        "(precondition=on, coupling-direction=voltage-driven, stamping=Thevenin); ignored otherwise. "
-        "The FEM side is unchanged.<br>"
+        "<div class='hn'>A study knob for the <b>Thevenin</b> interface (precondition=on, "
+        "stamping=Thevenin), <b>both coupling directions</b>; ignored otherwise. The FEM side is "
+        "unchanged.<br>"
         "<b>consistent</b> (default): one denominator dt for both currents in "
         "Z&middot;(I(Vmeas)&minus;i_prev), so the two Lrom/dt terms cancel at convergence &rarr; the true "
         "terminal fixpoint.<br>"
-        "<b>inconsistent</b>: split the denominator &mdash; the <b>circuit</b> inductive term uses the "
-        "circuit's own timestep dt_C, the <b>field</b> term keeps time&minus;t_abs_start (= dtf, still "
-        "honoring the secant-denominator choice):<br>"
-        "&nbsp;&nbsp;V_C = V_F + Rrom&middot;(I_C&minus;I_F) + Lrom&middot;(I_C&minus;I0)/dt_C &minus; "
-        "Lrom&middot;(I_F&minus;I0)/dtf.<br>"
+        "<b>inconsistent</b>: split the denominator &mdash; the <b>live-iterate</b> circuit-current term "
+        "uses the circuit's own timestep dt_C, the <b>lagged</b> term keeps time&minus;t_abs_start (= dtf, "
+        "still honoring the secant-denominator choice). Same emission both directions; the shifted "
+        "observable differs:<br>"
+        "&nbsp;&nbsp;<b>voltage-driven</b>: i_prev = I_field, so "
+        "V_C = V_F + Rrom&middot;(I_C&minus;I_F) + Lrom&middot;(I_C&minus;I0)/dt_C &minus; "
+        "Lrom&middot;(I_F&minus;I0)/dtf &rarr; the terminal <b>current</b> shifts (I_circuit vs I_field).<br>"
+        "&nbsp;&nbsp;<b>current-driven</b>: i_prev = lagged I(Vmeas), base = V_field, so at the fixpoint "
+        "V_C = V_field + Lrom&middot;(I_C&minus;I0)&middot;(1/dt_C &minus; 1/dtf) &rarr; the terminal "
+        "<b>voltage</b> shifts (V_circuit vs V_field).<br>"
         "The denominators differ &rarr; the Lrom terms no longer cancel &rarr; the fixpoint <b>shifts</b> "
         "(the effect being measured). dt_C is realized three ways:<br>"
         "<b>real RL</b>: Rrom+Lrom as real Xyce devices on the port (Lrom IC=I0) &mdash; dt_C is Xyce's "
-        "actual adaptive step (exact); Bfield carries only the lagged field correction.<br>"
+        "actual adaptive step (exact). Bfield carries only the field-side correction, and its inductive "
+        "term reads the field-grid BDF-1 derivative di_F/dt (didt_field_k.pwl) directly &mdash; so it "
+        "stays exact for &gt;1 FEM eval per window (no anchored secant).<br>"
         "<b>DDT</b>: circuit term = Lrom&middot;DDT(I(Vmeas)). Xyce supports DDT, but this stamping is "
         "<b>numerically fragile</b> &mdash; it tends to step-collapse on the Bfield branch and may abort "
         "the transient; prefer <b>real RL</b>. Kept for comparison.<br>"
@@ -399,8 +406,9 @@ HELP = {
         "<div class='hh'>WR convergence metric</div>"
         "<div class='hn'>What must drop below <code>WR_tolerance</code> to accept a window and stop "
         "iterating. <code>i</code> is the field-current waveform, k the WR iteration.</div>"
-        "<div class='hn'><b>waveform L1</b> &mdash; relative L1 norm of the iteration-to-iteration change "
-        "of the whole field-current waveform over the window (trapezoidal):"
+        "<div class='hn'><b>waveform L1</b> &mdash; L1 norm of the iteration-to-iteration change of the "
+        "whole field-current waveform over the window (trapezoidal), relative &mdash; or absolute when the "
+        "average current is &lt; 0.1 (the relative form is then ill-defined):"
         "<div class='hf'>&epsilon; = "
         "&int;|i<sup>(k)</sup>&minus;i<sup>(k&minus;1)</sup>|&nbsp;dt &nbsp;/&nbsp; "
         "&int;|i<sup>(k)</sup>|&nbsp;dt</div>"
@@ -414,8 +422,9 @@ HELP = {
         "&Delta;<sub>rel</sub>(I<sub>field</sub><sup>(k)</sup>,I<sub>field</sub><sup>(k&minus;1)</sup>) + "
         "&Delta;<sub>rel</sub>(V<sub>field</sub><sup>(k)</sup>,V<sub>field</sub><sup>(k&minus;1)</sup>)</div>"
         "Each &Delta;<sub>rel</sub>(a,b)=|a&minus;b| made relative (&divide;|a|) when |a|&gt;0.1, else "
-        "absolute. Converges from iteration&nbsp;1. Only the terminal scalars &mdash; cheaper, ignores the "
-        "waveform interior.</div>"
+        "absolute. Needs &ge;2 iterations (gated like waveform L1, so a window-start zero-crossing "
+        "cannot trigger a spurious converge after one solve). Only the terminal scalars &mdash; cheaper, "
+        "ignores the waveform interior.</div>"
     ),
 }
 
@@ -975,10 +984,12 @@ def _read_named_columns(path):
 
 
 def read_wr_error(path):
-    t, err, nit, conv = [], [], [], []
+    # Columns: Time, WR_TotalRelErr, N_iterations, Converged[, relI_FC, relV_FC]
+    # relI_FC/relV_FC (cross-solver transmission defect) are optional -> NaN for older files.
+    t, err, nit, conv, fcI, fcV = [], [], [], [], [], []
     if not os.path.exists(path):
-        return {"t": np.array([]), "err": np.array([]),
-                "nit": np.array([]), "conv": np.array([])}
+        return {"t": np.array([]), "err": np.array([]), "nit": np.array([]),
+                "conv": np.array([]), "fcI": np.array([]), "fcV": np.array([])}
     with open(path) as f:
         next(f, None)
         for line in f:
@@ -990,8 +1001,12 @@ def read_wr_error(path):
                 nit.append(float(parts[2])); conv.append(float(parts[3]))
             except ValueError:
                 continue
-    return {"t": np.array(t), "err": np.array(err),
-            "nit": np.array(nit), "conv": np.array(conv)}
+            try:
+                fcI.append(float(parts[4])); fcV.append(float(parts[5]))
+            except (ValueError, IndexError):
+                fcI.append(float("nan")); fcV.append(float("nan"))
+    return {"t": np.array(t), "err": np.array(err), "nit": np.array(nit),
+            "conv": np.array(conv), "fcI": np.array(fcI), "fcV": np.array(fcV)}
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1102,12 @@ def scalar_summary(data):
         s["total_xyce_solves"] = int(np.sum(wr["nit"]))  # cost proxy: one Xyce run per WR iter
         s["all_converged"] = bool(np.all(wr["conv"] >= 1.0))
         s["worst_WR_error"] = float(np.max(wr["err"]))
+        # Worst cross-solver transmission defect over all windows (field vs circuit terminal). Non-zero
+        # even when the WR loop "converges" under a metric blind to it (method 0, or the inconsistent
+        # interface). max of relI_FC/relV_FC; NaN-safe (older WR_error.txt files lack the columns).
+        fc = np.concatenate([wr.get("fcI", np.array([])), wr.get("fcV", np.array([]))])
+        if fc.size and not np.all(np.isnan(fc)):
+            s["worst_FC_defect"] = float(np.nanmax(fc))
     return s
 
 
@@ -2732,8 +2753,8 @@ function setStatus(msg, cls){
 function showSummary(sum){
   const el = document.getElementById('summary'); el.innerHTML = '';
   const fmt = v => (typeof v === 'number') ? (Number.isInteger(v) ? String(v) : (Math.abs(v)<1e-3||Math.abs(v)>=1e5 ? v.toExponential(4) : v.toPrecision(6))) : String(v);
-  const order = ['solver_seconds','total_xyce_solves','sec_per_xyce_solve','windows','max_WR_iterations','worst_WR_error','all_converged','final_time_s','final_V_field','final_I_field'];
-  const labels = {solver_seconds:'solver time (s)', total_xyce_solves:'Xyce solves', sec_per_xyce_solve:'s / Xyce solve', final_time_s:'final time (s)', final_V_field:'final V_field', final_I_field:'final I_field', max_WR_iterations:'max WR iters', worst_WR_error:'worst WR error', all_converged:'all converged'};
+  const order = ['solver_seconds','total_xyce_solves','sec_per_xyce_solve','windows','max_WR_iterations','worst_WR_error','worst_FC_defect','all_converged','final_time_s','final_V_field','final_I_field'];
+  const labels = {solver_seconds:'solver time (s)', total_xyce_solves:'Xyce solves', sec_per_xyce_solve:'s / Xyce solve', final_time_s:'final time (s)', final_V_field:'final V_field', final_I_field:'final I_field', max_WR_iterations:'max WR iters', worst_WR_error:'worst WR error', worst_FC_defect:'worst f-c defect', all_converged:'all converged'};
   for (const k of order){ if (k in sum){
     const c = document.createElement('div'); c.className='card';
     if (k === 'solver_seconds') c.classList.add('cost');

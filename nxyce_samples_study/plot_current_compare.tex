@@ -1,0 +1,24 @@
+% Interface current: monolithic reference vs coupled N=1 vs N=200 -- pgfplots
+% Standalone: pdflatex plot_current_compare.tex   (needs waveform_compare.csv in same dir)
+\documentclass[tikz,border=3pt]{standalone}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\begin{document}
+\begin{tikzpicture}
+  \begin{axis}[
+      width=13cm, height=7cm,
+      xlabel={time [ms]},
+      ylabel={interface current $I(V_{\mathrm{meas}})$ [A]},
+      grid=both, grid style={gray!20},
+      legend pos=south east, legend cell align=left,
+    ]
+    % columns: t,Vp_ref,Vp_n1,Vp_n200,I_ref,I_n1,I_n200   (t in seconds -> *1000 = ms)
+    \addplot[black,      line width=0.9pt]                table[col sep=comma, x expr=\thisrow{t}*1000, y=I_ref]{waveform_compare.csv};
+    \addlegendentry{monolithic reference (FEM)}
+    \addplot[red!75!black, densely dashed, line width=0.8pt] table[col sep=comma, x expr=\thisrow{t}*1000, y=I_n1]{waveform_compare.csv};
+    \addlegendentry{coupled, $N=1$}
+    \addplot[blue!60!black, dotted,  line width=0.8pt]    table[col sep=comma, x expr=\thisrow{t}*1000, y=I_n200]{waveform_compare.csv};
+    \addlegendentry{coupled, $N=200$}
+  \end{axis}
+\end{tikzpicture}
+\end{document}

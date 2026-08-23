@@ -282,6 +282,35 @@ void WriteInitialPwl(
     fclose(file);
 }
 
+// Backward-difference companion for i_prev_k.pwl, consumed ONLY by the naive/inconsistent "real RL"
+// interface arm (interface_consistency=1). On the SAME field grid as `current` (nodes t_r^F) it emits
+// the field-grid (h_F) BDF-1 backward difference of the interface current
+//     d_r = (i_F(t_r) - i_F(t_{r-1})) / (t_r - t_{r-1})     for r >= 1,
+// so the netlist can read L*di_F/dt directly as V(vdidtf) instead of reconstructing an anchored secant
+// (correct only for ONE field evaluation per window). The window-start node r=0 has no prior sample;
+// we forward-fill the first interval's slope using the carried window-start anchor I0:
+//     d_0 = (i_F(t_1) - I0) / (t_1 - t_0).
+// In the voltage-driven field solver i_F(t_0) == I0 by construction, so there d_0 == d_1 (a flat first
+// interval). Times are absolute, identical to i_prev_k.pwl, so the PWL FILE source aligns with it.
+void WriteFieldDidtPwl(const char* filename, const Waveform& current, double I0)
+{
+    const size_t N = current.t.size();
+    Waveform didt;
+    if (N < 2) {
+        // Degenerate single-sample window: no interval -> zero derivative.
+        didt.push(current.t.empty() ? 0.0 : current.t[0], 0.0);
+        writePWLFile(filename, didt);
+        return;
+    }
+    // r = 0: forward-filled first-interval slope, anchored to the window-start current I0.
+    didt.push(current.t[0], (current.y[1] - I0) / (current.t[1] - current.t[0]));
+    // r >= 1: plain backward difference between consecutive field nodes.
+    for (size_t r = 1; r < N; ++r) {
+        didt.push(current.t[r], (current.y[r] - current.y[r - 1]) / (current.t[r] - current.t[r - 1]));
+    }
+    writePWLFile(filename, didt);
+}
+
 // Reads a "time value" PWL table back into a Waveform (via pushOrReplaceDuplicateTime, so a repeated
 // final/edge timestamp collapses). Throws if the file cannot be opened or contains no data.
 Waveform readPWLFile(const string& filename)
@@ -332,7 +361,7 @@ void MasterProcess()
     fflush(file_Circuit);
 
     FILE* file_WR_error = fopen("WR_error.txt", "w");
-    fprintf(file_WR_error, "   Time, WR_TotalRelErr, N_iterations, Converged \n");
+    fprintf(file_WR_error, "   Time, WR_TotalRelErr, N_iterations, Converged, relI_FC, relV_FC \n");
     fflush(file_WR_error);
 
     // Optional user-probe output: one column per probe token (see LoadProbes/g_probes).
@@ -408,8 +437,13 @@ void MasterProcess()
         // because Xyce evaluates the PWL FILE sources at the absolute simulation time (restart starts
         // at t_start, not at 0).
         WriteInitialPwl("vf_prev_k.pwl", t_start, t_stop, V0, dVdt_0);
-        // i_prev_k.pwl: linear ramp with slope dIdt_0, matching the accumulated secant in the FEM.
+        // i_prev_k.pwl: linear warm-start ramp (start I0, slope dIdt_0 carried from the previous window end).
         WriteInitialPwl("i_prev_k.pwl",   t_start, t_stop, I0, dIdt_0);
+        // Companion for the naive "real RL" arm's V(vdidtf): the initial i_prev ramp has constant slope
+        // dIdt_0, so its field-grid backward difference is the constant dIdt_0. Written every window so
+        // didt_field_k.pwl already exists at WR iteration 1 (the circuit runs BEFORE the field solver).
+        // Only the real-RL arm reads it; harmless (tiny) for the other arms.
+        WriteInitialPwl("didt_field_k.pwl", t_start, t_stop, dIdt_0, 0.0);
 
         // Remove stale checkpoint candidates of this prefix so that CommitCheckpoint after the WR
         // loop is guaranteed to pick the freshly created candidate of this window.
@@ -423,6 +457,7 @@ void MasterProcess()
         Waveform i_prev_last_iter; // i_m^(k-1) for the L1 convergence criterion; empty at the window start
         double V_field_last_iter = 0.0; // for the terminal-scalar criterion (reference CoSimulation_WR.cpp)
         double I_field_last_iter = 0.0;
+        double V_circuit = 0.0, I_circuit = 0.0; // terminal circuit (V(nx), I(Vmeas)); FC transmission defect
         // WR iteration loop
         for (WR_iteration = 1; WR_iteration <= WRmaxSteps; WR_iteration++) {
             circuit_sol = CircuitWaveform{};
@@ -441,6 +476,10 @@ void MasterProcess()
             else
                 FEM_solver_voltage_driven_waveform(I0, N_field_eval_intervals);
             Read_Terminal_results("Field.txt", V_field, I_field);
+            // Terminal circuit values (V(nx), I(Vmeas)) written by ReadXyceResults above. Read every
+            // iteration so the field-vs-circuit transmission defect can be reported regardless of the
+            // gating metric (method 0 never reads them otherwise).
+            Read_Terminal_results("Circuit.txt", V_circuit, I_circuit);
 
             // i_prev = field-current waveform of this iteration (FEM output)
             Waveform i_prev = readPWLFile("i_prev_k.pwl");
@@ -452,15 +491,17 @@ void MasterProcess()
             //       iteration-to-iteration change of the terminal values V,I.
             bool can_converge;
             if (g_cfg.wr_convergence_method == 1) {
-                double V_circuit, I_circuit;
-                Read_Terminal_results("Circuit.txt", V_circuit, I_circuit);
                 WR_rel_Error = eval_WR_convergence_terminal(
                     V_field, I_field, V_circuit, I_circuit,
                     V_field_last_iter, I_field_last_iter, WR_iteration);
-                // reference allows convergence from iteration 1 (the FC terms alone can suffice).
-                can_converge = true;
+                // Require >= 2 iterations (like method 0). The reference allows convergence from
+                // iteration 1 on the FC terms alone, but near a window-start zero-crossing both solvers
+                // start ~0 so relI_FC+relV_FC < tol trivially -> a spurious "converged" after ONE solve
+                // with no actual coupling iteration. Gating on WR_iteration > 1 forces at least one real
+                // exchange before the window can be accepted.
+                can_converge = (WR_iteration > 1);
             } else {
-                // L1 relative norm of (i_m^(k) - i_m^(k-1)) / i_m^(k); needs >=2 iterations
+                // L1 norm (hybrid relative/absolute) of (i_m^(k) - i_m^(k-1)); needs >=2 iterations
                 // (iteration 1 returns the sentinel 1.0, no previous waveform).
                 WR_rel_Error = eval_WR_convergence(i_prev, i_prev_last_iter, WR_iteration);
                 can_converge = (WR_iteration > 1);
@@ -484,7 +525,17 @@ void MasterProcess()
         PRINT(t_stop);
         PRINT(WR_rel_Error);
 
-        fprintf(file_WR_error, "%12.3e ,  %12.3e ,  %d ,  %d \n", t_stop, WR_rel_Error, WR_iteration, int(WR_converged));
+        // Cross-solver TRANSMISSION DEFECT at the window terminal, reported independently of the gating
+        // metric (method 0 is blind to it; the inconsistent-interface fixpoint keeps it non-zero). Same
+        // hybrid-relative convention as eval_WR_convergence_terminal: normalise by the field value unless
+        // it is tiny (< 0.1). voltage-driven -> relI_FC is the shifted quantity; current-driven -> relV_FC.
+        const double dI_FC   = fabs(I_field - I_circuit);
+        const double relI_FC = (fabs(I_field) > 0.1) ? dI_FC / fabs(I_field) : dI_FC;
+        const double dV_FC   = fabs(V_field - V_circuit);
+        const double relV_FC = (fabs(V_field) > 0.1) ? dV_FC / fabs(V_field) : dV_FC;
+
+        fprintf(file_WR_error, "%12.3e ,  %12.3e ,  %d ,  %d ,  %12.3e ,  %12.3e \n",
+                t_stop, WR_rel_Error, WR_iteration, int(WR_converged), relI_FC, relV_FC);
         fflush(file_WR_error);
 
 
@@ -663,7 +714,7 @@ void MonolithicValidationSolve()
 
     // WR_error.txt: header only (no WR iterations) -> empty convergence plot, no WR summary cards.
     FILE* file_WR_error = fopen("WR_error.txt", "w");
-    fprintf(file_WR_error, "   Time, WR_TotalRelErr, N_iterations, Converged \n");
+    fprintf(file_WR_error, "   Time, WR_TotalRelErr, N_iterations, Converged, relI_FC, relV_FC \n");
     fclose(file_WR_error);
 
     // Probes_solution.prn: user probes are in the .print line, so copy their columns from the raw
@@ -689,17 +740,21 @@ void MonolithicValidationSolve()
          << (g_probes.empty() ? "" : " / Probes_solution.prn") << ")." << endl;
 }
 
-// FEM solver (voltage-driven): takes the port-voltage waveform V_p(t) from vf_prev_k.pwl
-// and computes the field current I_field(t) via an accumulated secant. Consistent with the Bfield
-// expression in wr_circuit.cir. Multi-rate: the FEM works on a coarser grid than Xyce internally.
+// FEM solver (voltage-driven): takes the port-voltage waveform V_p(t) from vf_prev_k.pwl and
+// computes the field current I_field(t) by integrating the field ODE V_p = R_FEM*I + L_FEM*dI/dt
+// with backward Euler (BDF-1) on the field grid: at each node I_ref = the PREVIOUS field node and
+// dt = the LOCAL step h_F (reconstruct_mode 0). This is a self-contained dummy field solver -- it
+// does NOT mirror the netlist Bfield's window-anchored secant (an earlier version did; that was an
+// interface-matching artifact, not physics). At N_field_eval_intervals = 1 the single BE step
+// reduces to the window secant. Multi-rate: the FEM works on a coarser grid than Xyce internally.
 void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eval_intervals)
 {
     // Reads the port voltage waveform stored by ReadXyceResults from V(p).
     const Waveform vport = readPWLFile("vf_prev_k.pwl");
 
-    // Time is now absolute (vport.t.front() = absolute window start, not 0). The
-    // FEM solver is offset-agnostic: t_acc is measured below as (t[j] - front), i.e.
-    // correct independent of the absolute start time. Hence no "starts at 0" check.
+    // Time is now absolute (vport.t.front() = absolute window start, not 0). The FEM solver is
+    // offset-agnostic: every backward-Euler step below uses a LOCAL difference (t[j] - t[j-1]), which
+    // is independent of the absolute start time. Hence no "starts at 0" check.
 
     const size_t Nv = vport.t.size();
     if (Nv < 2) {
@@ -732,20 +787,23 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     );
     const size_t N = V_eval.t.size(); // = N_field_eval_intervals + 1
 
-    // CRITICAL: the I_field computation must use exactly the same accumulated secant model as
-    // Bfield in wr_circuit.cir to guarantee a consistent WR fixpoint.
-    // Bfield: I_c = V(iprev) + (V(p) - V(vfprev)) / (Rrom + Lrom/(time - t_abs_start))
-    // FEM derivation: V_p = R_FEM*I_f + L_FEM*(I_f - I0)/t_acc
-    //   -> I_f = (V_p + L_FEM*I0/t_acc) / (R_FEM + L_FEM/t_acc)  for t_acc > 0
-    //   -> I_f = I_win_start                                     for t_acc = 0
+    // Backward-Euler (BDF-1) time stepping of the field ODE on the field grid. Per step the discrete
+    // constitutive relation is
+    //     V_p(t_j) = R_FEM*I_j + (lambda(I_j) - lambda(I_{j-1})) / (t_j - t_{j-1})
+    // i.e. I_ref = the PREVIOUS field node current and dt = the LOCAL step -> a consistent dI/dt. An
+    // earlier version anchored both to the window start (I_ref = I_win_start, dt = t - t_win_start) so
+    // the dummy would reproduce the netlist Bfield's accumulated secant; that is an interface-matching
+    // artifact, not a field-ODE integration, and is NOT correct for >1 field eval per window.
+    // The WR fixpoint stays clean: the default Bfield's correction Z*(I(Vmeas) - V(iprev)) vanishes at
+    // convergence regardless of Z's denominator, so switching the FEM to local BDF-1 changes the field
+    // response only for N_field_eval_intervals >= 2 (more accurate), not the fixpoint's existence. At
+    // N_field_eval_intervals = 1 the single BE step == the window secant (bit-for-bit unchanged).
     const double t_win_start = V_eval.t.front();
     const double t_win_end   = V_eval.t.back();
 
-    // Solve the constitutive relation V_p = R_FEM*I + (lambda(I) - lambda(I_ref))/dt for the field
-    // current I (linear closed form, then Newton if the core saturates). I_ref/dt select the flux
-    // secant: window-accumulated (I_ref = I_win_start, dt = t - t_win_start) exactly reproduces the
-    // Xyce Bfield model -> consistent WR fixpoint; local (I_ref = I_{j-1}, dt = t_j - t_{j-1}) is a
-    // BDF1 dummy-solver variant.
+    // Solve V_p = R_FEM*I + (lambda(I) - lambda(I_ref))/dt for the field current I (linear closed form,
+    // then Newton if the core saturates). I_ref/dt are the LOCAL backward-Euler pair (previous node,
+    // local step); reconstruct_mode 1 below reuses the same solve as a single BE step over the window.
     auto solve_I = [&](double V_p, double I_ref, double dt) -> double {
         if (dt <= 0.0) return I_ref;                       // singular window start: initial condition
         double I = (V_p + L_FEM * I_ref / dt) / (R_FEM + L_FEM / dt);
@@ -765,7 +823,8 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     // Field-current reconstruction within the window (reconstruct_mode; symmetric to the current-driven
     // field-voltage reconstruction). Both modes CARRY the window start = I_win_start (previous window's
     // end current) -> C0-continuous seam, no solve there.
-    //   0 pointwise (secant, DEFAULT): I at each point via the accumulated window secant (matches Bfield).
+    //   0 pointwise (BDF-1, DEFAULT): local backward-Euler step per field node (I_ref = previous node,
+    //     dt = local h_F). N solves/window; the physically correct dummy-solver field integration.
     //   1 linear : straight ramp from the carried start to the window-end current (ONE solve/window).
     Waveform current;
     if (g_cfg.reconstruct_mode == 1) {
@@ -778,13 +837,18 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
     } else {
         current.push(t_win_start, I_win_start);            // window start = carried initial condition
         for (size_t j = 1; j < N; ++j) {
-            const double dt = V_eval.t[j] - t_win_start;
-            current.push(V_eval.t[j], solve_I(V_eval.y[j], I_win_start, dt));
+            const double dt = V_eval.t[j] - V_eval.t[j - 1];                        // LOCAL field step h_F
+            current.push(V_eval.t[j], solve_I(V_eval.y[j], current.y.back(), dt));  // I_ref = previous node
         }
     }
 
     // This file is used by Xyce as V(iprev) in the next WR iteration.
     writePWLFile("i_prev_k.pwl", current);
+
+    // Companion for the naive "real RL" arm: the field-grid (h_F) BDF-1 backward difference of I_field,
+    // read by Xyce as V(vdidtf). Formed HERE on the field grid (over h_F), not reconstructed via DDT --
+    // this is what lets that arm run with >1 field evaluation per window. Anchor = I_win_start (== .PARAM I0).
+    WriteFieldDidtPwl("didt_field_k.pwl", current, I_win_start);
 
     // Terminal values at the window end for convergence propagation into the next window.
     Write_Terminal_results("Field.txt", vport.y.back(), current.y.back());
@@ -796,8 +860,9 @@ void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eva
 // field V-I characteristic in BOTH coupling directions; current-driven's difference is only that this
 // base voltage is the field's OWN directly-computed V (an accurate base), not the circuit's prior port
 // voltage -- so the amplified window-start term stays small. reconstruct_mode:
-//   0 pointwise (default): V computed at every field-eval point from I(t) -- symmetric to the
-//      voltage-driven solver, needs only I0 (V_field_last_time unused); follows the current's curve.
+//   0 pointwise (default): V computed at every field-eval point by a LOCAL backward-Euler step of the
+//      flux (dlambda/dt over consecutive interface samples) -- symmetric to the voltage-driven solver.
+//      Uses V_field_last_time as the carried window-start value (I_win_start only feeds mode 1's V_end).
 //   1 linear: replace the interior with a straight ramp from V_field_last_time (previous window end)
 //      to this window's end value (the 2-point reconstruction; uses V0).
 void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_time,
@@ -828,10 +893,12 @@ void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_
     // The window START field voltage is the carried previous-window END value (V_field_last_time):
     // reused -> the seam is C0-continuous by construction AND no solve is spent there. reconstruct_mode:
     //   1 linear: ONE new evaluation (the window end), straight-line interior => 1 solve/window.
-    //   0 secant: pointwise interior (N solves), start still carried for seam continuity.
+    //   0 BDF-1: pointwise interior via LOCAL backward Euler dlambda/dt (previous node, local step),
+    //     N solves, start still carried for seam continuity.
     const double I_end  = I_eval.y.back();
     const double dt_win = t_end - t_win_start;
-    // Window-end field voltage via the accumulated window secant.
+    // Window-end field voltage via a SINGLE backward-Euler step over the whole window (used by
+    // reconstruct_mode 1 only): flux difference lambda(I_end) - lambda(I_win_start) over dt_win.
     const double V_end = (dt_win > 0.0)
                          ? R_FEM * I_end + dlam(I_end, I_win_start) / dt_win
                          : R_FEM * I_end;
@@ -847,10 +914,10 @@ void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_
             vfield.push(I_eval.t[j], V_start_win + frac * (V_end - V_start_win));
         }
     } else {
-        // pointwise (0 secant): start carried (reuse the seam), interior/end computed.
+        // pointwise (0 BDF-1): start carried (reuse the seam); interior/end via LOCAL backward Euler.
         vfield.push(t_win_start, V_start_win);
         for (size_t j = 1; j < N; ++j) {
-            const double dl_dt = dlam(I_eval.y[j], I_win_start) / (I_eval.t[j] - t_win_start);
+            const double dl_dt = dlam(I_eval.y[j], I_eval.y[j - 1]) / (I_eval.t[j] - I_eval.t[j - 1]);
             vfield.push(I_eval.t[j], R_FEM * I_eval.y[j] + dl_dt);
         }
     }
@@ -864,9 +931,12 @@ void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_
 //
 //   ∫|i_m^(k)(t) - i_m^(k-1)(t)| dt   /   ∫|i_m^(k)(t)| dt   ≤   WR_tolerance
 //
-// Integration via the trapezoidal rule over the coupling grid (i_curr and i_prev_iter share
-// the same uniform time grid from resampleWaveformUniform). Because of the transmission condition
-// i_m^(k) = i_c^(k), the converged/just-computed circuit current is used here.
+// Integration via the trapezoidal rule over the coupling grid (i_curr and i_prev_iter share the same
+// uniform time grid from resampleWaveformUniform). The norm is HYBRID: relative (as written above) when
+// the average |i| over the window exceeds 0.1, absolute (numerator over the window length) when the
+// current is ~0 and the relative form is ill-defined. i_curr is the i_prev_k.pwl waveform of this
+// iteration -- the FEM field current in voltage-driven coupling, the circuit current I(Vmeas) in
+// current-driven; by the transmission condition i_m^(k) = i_c^(k) the two coincide at convergence.
 double eval_WR_convergence(const Waveform& i_curr, const Waveform& i_prev_iter, const unsigned WR_iteration)
 {
     if (WR_iteration < 2 || i_prev_iter.t.empty()) {
@@ -892,13 +962,22 @@ double eval_WR_convergence(const Waveform& i_curr, const Waveform& i_prev_iter, 
         den += 0.5 * (abs_a + abs_b) * dt;
     }
 
-    if (den <= 0.0) {
-        throw runtime_error("eval_WR_convergence: zero denominator (current waveform identically zero?).");
-    }
+    // Hybrid abs/rel norm (mirrors eval_WR_convergence_terminal). num = INT|di| dt, den = INT|i| dt;
+    // dividing both by the window duration T gives average currents. When the average |i| exceeds 0.1
+    // use the relative norm num/den (T cancels -> identical to the plain relative L1); when the current
+    // is (near-)zero over the whole window den->0 and the relative norm is ill-defined, so fall back to
+    // the ABSOLUTE average change num/T. This replaces the old hard throw on den==0, which aborted the
+    // whole run on any zero-current window (open switch, source not yet on, disconnected port).
+    const double T = i_curr.t.back() - i_curr.t.front();
+    const double avg_mag = (T > 0.0) ? den / T : den;
 
-    const double WR_relErr = num / den;
+    double WR_relErr;
+    if (avg_mag > 0.1)      WR_relErr = num / den;                 // relative L1 (unchanged behaviour)
+    else                    WR_relErr = (T > 0.0) ? num / T : num; // near-zero current: absolute avg change
+
     cout << "WR-step  " << WR_iteration
-         << ", L1 rel current error = " << WR_relErr << endl;
+         << (avg_mag > 0.1 ? ", L1 rel current error = " : ", L1 abs current error = ")
+         << WR_relErr << endl;
 
     return WR_relErr;
 }
@@ -1314,7 +1393,7 @@ void WriteCircuitNetlist(const string& filename)
     //       constant interface impedance (a fixed Robin/optimized-transmission coefficient) instead of
     //       the accumulated secant whose admittance grows across the window. Same terminal fixpoint (the
     //       correction vanishes at convergence -- see interface_form/precondition); only conditioning
-    //       and the WR contraction rate change. The FEM keeps its own accumulated secant (unchanged).
+    //       and the WR contraction rate change. The FEM keeps its own (BDF-1) field integration, unchanged.
     string dt_expr;
     if      (g_cfg.use_t_floor == 2) dt_expr = "t_floor";
     else if (g_cfg.use_t_floor == 1) dt_expr = "MAX(time - t_abs_start, t_floor)";
@@ -1342,27 +1421,42 @@ void WriteCircuitNetlist(const string& filename)
         out << "Bfield nx 0 I = {\n";
         out << "+ V(iprev) + (V(nx) - V(vfprev)) / (Rrom + Lrom/" << dt_expr << ")\n";
         out << "+ }\n\n";
-    } else if (g_cfg.interface_consistency != 0 && g_cfg.coupling_mode == 0) {
-        // INCONSISTENT interface (Thevenin, voltage-driven only). Split the single secant denominator:
-        // the CIRCUIT inductive term uses the circuit's own timestep dt_C, the FIELD term keeps dtf
-        // (= dt_expr = the accumulated window time time - t_abs_start, per use_t_floor). Since the two
-        // Lrom/. denominators differ they no longer cancel -> the WR fixpoint SHIFTS. R stays a
-        // consistent difference. I0 = I_C(t0) = I_F(t0) (the carried window-start current, .PARAM I0).
-        // The circuit term's dt_C is realized three ways (interface_consistency = 1/2/3):
+    } else if (g_cfg.interface_consistency != 0) {
+        // INCONSISTENT interface (Thevenin; BOTH coupling directions). Split the single secant
+        // denominator Z*(I(Vmeas) - V(iprev)) so the LIVE-iterate current term uses the circuit's own
+        // timestep dt_C while the LAGGED term keeps dtf (= dt_expr = time - t_abs_start, per use_t_floor).
+        // The netlist device lines are identical for both directions; only what the PWLs carry differs
+        // (FEM/ReadXyce side, untouched), so the SAME emission serves both -- but the shifted quantity
+        // differs:
+        //   voltage-driven (coupling_mode=0): V(iprev)=I_field (FEM), I(Vmeas)=live circuit current.
+        //     Consistent cancels the two Lrom terms at I_C=I_F; the split leaves I_C != I_F at the
+        //     fixpoint -> the terminal CURRENT is shifted (I_circuit vs I_field gap).
+        //   current-driven (coupling_mode=1): V(iprev)=I(Vmeas)_{k-1} (lagged circuit current, ReadXyce),
+        //     V(vfprev)=V_field (FEM base). Consistent cancels at I_C^k=I_C^{k-1}; the split leaves
+        //     V_C = V_field + Lrom*(I_C-I0)*(1/dt_C - 1/dtf) at the fixpoint -> the terminal VOLTAGE is
+        //     shifted (V_circuit vs V_field gap). Same mechanism, dual observable.
+        // R stays a consistent difference. I0 = the carried window-start current (.PARAM I0). The
+        // live-current term's dt_C is realized three ways (interface_consistency = 1/2/3):
         if (g_cfg.interface_consistency == 1) {
             // 1 = REAL RL: Rrom + Lrom as REAL Xyce devices in series on the port branch, carrying
             // I(Vmeas). The real Lromc (IC={I0}) contributes Lrom*(I_C - I0)/dt_C at Xyce's actual step;
-            // Bfield then carries ONLY the lagged field correction. Series branch is
-            // p-Vmeas-nx-Rromc-nrc-Lromc-nlc-Bfield-0, so I(Vmeas)=I(Lromc)=I_C. Window-1 UIC + restart
-            // carry Lromc's state across windows exactly like the authored circuit inductors.
-            out << "* interface_consistency=1 (inconsistent, real RL): Rrom+Lrom as real devices on port; Bfield = lagged field only\n";
+            // Bfield then carries ONLY the lagged correction (V_field base minus the lagged-current
+            // terms). Series branch is p-Vmeas-nx-Rromc-nrc-Lromc-nlc-Bfield-0, so I(Vmeas)=I(Lromc)=I_C.
+            // Window-1 UIC + restart carry Lromc's state across windows like the authored circuit inductors.
+            out << "* interface_consistency=1 (inconsistent, real RL): Rrom+Lrom as real devices on port; Bfield = lagged correction only\n";
+            out << "* vdidtf = the field-grid (h_F) BDF-1 backward difference di_F/dt, precomputed in the field\n";
+            out << "* solver into didt_field_k.pwl (NOT reconstructed here via DDT or an anchored secant). The\n";
+            out << "* field-side inductive correction reads it directly, so it stays exact for >1 field eval per\n";
+            out << "* window. No real inductor sits on this Bfield branch: the real Lromc above carries only the\n";
+            out << "* circuit-side current I(Vmeas) (h_C derivative); Bfield supplies just the field-side term.\n";
+            out << "Vdidtf vdidtf 0 PWL FILE \"didt_field_k.pwl\"\n";
             out << "Rromc nx nrc {Rrom}\n";
             out << "Lromc nrc nlc {Lrom} IC={I0}\n";
-            out << "Bfield nlc 0 V = { V(vfprev) - Rrom*V(iprev) - Lrom*(V(iprev) - I0)/" << dt_expr << " }\n\n";
+            out << "Bfield nlc 0 V = { V(vfprev) - Rrom*V(iprev) - Lrom*V(vdidtf) }\n\n";
         } else if (g_cfg.interface_consistency == 2) {
             // 2 = DDT: circuit inductive term = Lrom*DDT(I(Vmeas)), Xyce's time derivative at the circuit
             // step (I0 constant -> DDT(I_C) = DDT(I_C - I0)). Requires DDT() support in a B-source.
-            out << "* interface_consistency=2 (inconsistent, DDT): circuit term Lrom*DDT(I(Vmeas)), field term over dtf\n";
+            out << "* interface_consistency=2 (inconsistent, DDT): circuit term Lrom*DDT(I(Vmeas)), lagged term over dtf\n";
             out << "Bfield nx 0 V = {\n";
             out << "+ V(vfprev) + Rrom*(I(Vmeas) - V(iprev))\n";
             out << "+ + Lrom*DDT(I(Vmeas))\n";
@@ -1371,7 +1465,7 @@ void WriteCircuitNetlist(const string& filename)
         } else {
             // 3 = MEAN dt: circuit inductive term over dt_print = t_window/N_xyce_samples (existing .PARAM),
             // a fixed representative mean step instead of the true adaptive dt_C.
-            out << "* interface_consistency=3 (inconsistent, mean dt): circuit term over dt_print, field term over dtf\n";
+            out << "* interface_consistency=3 (inconsistent, mean dt): circuit term over dt_print, lagged term over dtf\n";
             out << "Bfield nx 0 V = {\n";
             out << "+ V(vfprev) + Rrom*(I(Vmeas) - V(iprev))\n";
             out << "+ + Lrom*(I(Vmeas) - I0)/dt_print\n";
@@ -1512,11 +1606,15 @@ void CommitCheckpoint(const string& prefix, const string& committed_file)
         const string name = entry.path().filename().string();
         if (name.rfind(prefix, 0) != 0) continue; // not our prefix
 
-        // Parse the time suffix after the prefix (e.g. "0", "0.02", "4e-04").
+        // Parse the time suffix after the prefix (e.g. "0", "0.02", "4e-04"). Require the ENTIRE suffix
+        // to be a clean number (*end == '\0'): a genuine Xyce checkpoint name is prefix + pure numeric
+        // time, whereas an iCloud conflict copy is "ckpt_out0.0002 2" -> strtod stops at " 2" and would
+        // otherwise be accepted with the SAME time as the real file, letting a stale copy win the commit
+        // nondeterministically. Rejecting trailing junk keeps only the real checkpoints.
         const string suffix = name.substr(prefix.size());
         char* end = nullptr;
         const double t = std::strtod(suffix.c_str(), &end);
-        if (end == suffix.c_str()) continue; // no numeric suffix -> skip
+        if (end == suffix.c_str() || *end != '\0') continue; // non-numeric or trailing junk -> skip
 
         if (!found || t > best_time) {
             best = entry.path();

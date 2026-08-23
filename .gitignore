@@ -22,6 +22,7 @@ _cfg_*.txt
 
 # scratch from other branches / builds
 genext_driver
+genext_ckpt_test
 wr_genext.cir
 wr_genext.cir.prn
 Field_flux.txt

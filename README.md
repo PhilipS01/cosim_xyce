@@ -171,7 +171,8 @@ but happen to be tracked). Deleting them is safe; the next run recreates them.
 - `Field_waveform_solution.prn` — the reconstructed/extrapolated field waveforms
   over each window (not only the endpoints).
 - `WR_error.txt` — per-window convergence log:
-  `Time, WR_TotalRelErr, N_iterations, Converged`.
+  `Time, WR_TotalRelErr, N_iterations, Converged, relI_FC, relV_FC` (the last two are the
+  field-vs-circuit terminal transmission defect, reported regardless of the gating metric).
 - `Probes_solution.prn` — the user-requested probe columns (from `probes.txt`),
   captured per converged window. Only written if probes are set.
 

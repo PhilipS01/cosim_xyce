@@ -1,0 +1,35 @@
+% WR iterations/window vs N_xyce_samples -- pgfplots
+% Standalone: pdflatex plot_iters_vs_N.tex   (needs iters_vs_N.csv in same dir)
+% Or paste the tikzpicture into your thesis (requires \usepackage{pgfplots}).
+\documentclass[tikz,border=3pt]{standalone}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{siunitx}
+\begin{document}
+\begin{tikzpicture}
+  \begin{axis}[
+      width=11cm, height=7cm,
+      xmode=log, log basis x=2,
+      xtick={1,2,4,8,16,32,64,128,200},
+      xticklabels={1,2,4,8,16,32,64,128,200},
+      xlabel={$N_{\mathrm{xyce\,samples}}$ (interface PWL intervals per window)},
+      ylabel={mean WR iterations / window},
+      ymin=3, ymax=15,
+      grid=both, grid style={gray!25},
+      legend pos=north east, legend cell align=left,
+      every axis plot/.append style={line width=1pt, mark size=2.2pt},
+    ]
+    % columns: N,pwl_pts,raw_xyce_med,it_mean_terminal_match,it_mean_L1_match,
+    %          it_mean_terminal_mis,it_mean_L1_mis,ok_terminal_mis,ok_L1_mis,wall_terminal_mis_s
+    \addplot+[mark=*,   color=orange!85!black] table[col sep=comma, x=N, y=it_mean_terminal_mis]{iters_vs_N.csv};
+    \addlegendentry{terminal metric}
+    \addplot+[mark=square*, color=blue!60!black] table[col sep=comma, x=N, y=it_mean_L1_mis]{iters_vs_N.csv};
+    \addlegendentry{L1 grid metric}
+    % annotations
+    \node[anchor=south west, font=\footnotesize, text=gray]
+      at (axis cs:1,4.3) {N=1: single linear segment};
+    \node[anchor=south, font=\footnotesize, text=orange!85!black]
+      at (axis cs:2,14.4) {N=2 worst};
+  \end{axis}
+\end{tikzpicture}
+\end{document}

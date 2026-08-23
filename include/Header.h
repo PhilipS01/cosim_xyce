@@ -109,21 +109,28 @@ struct SimConfig
     //       WR_tolerance can then stop early below the true fixpoint (tighten tol / add windows).
     unsigned use_t_floor = 1;
     // Interface CONSISTENCY -- consistent (default) vs an INCONSISTENT split of the secant denominator,
-    // for studying whether the mismatched-denominator scheme is really worse. Scope: the voltage-driven
-    // Thevenin V-form only (precondition=1, coupling_mode=0, interface_form=0); ignored otherwise (falls
-    // back to the consistent emission). The FEM solvers are UNCHANGED (they keep their own accumulated
-    // secant and still produce vf_prev/i_prev); only the circuit-side Bfield stamping changes.
+    // for studying whether the mismatched-denominator scheme is really worse. Scope: the Thevenin form
+    // (precondition=1, interface_form=0), BOTH coupling directions; ignored otherwise (falls back to the
+    // consistent emission). The FEM solvers are UNCHANGED (they keep their own accumulated secant and
+    // still produce vf_prev/i_prev); only the circuit-side Bfield stamping changes.
     // Consistent (=0) shares ONE denominator dt for both currents in Z*(I(Vmeas) - i_prev), so the two
     // Lrom/dt terms cancel at convergence -> true terminal fixpoint. Inconsistent (>0) splits it so the
-    // CIRCUIT inductive term uses the circuit's own timestep dt_C while the FIELD term keeps
-    // time - t_abs_start (= dtf, still honoring use_t_floor):
-    //   V_C = V_F + Rrom*(I_C - I_F) + Lrom*(I_C - I0)/dt_C - Lrom*(I_F - I0)/dtf,  I0 = I_C(t0) = I_F(t0).
-    // The denominators differ -> the Lrom terms no longer cancel -> the fixpoint SHIFTS (the measured
-    // effect). The circuit term's dt_C is realized three ways:
+    // LIVE-iterate current term uses the circuit's own timestep dt_C while the LAGGED term keeps
+    // time - t_abs_start (= dtf, still honoring use_t_floor). The device lines are identical for both
+    // coupling directions (only the PWL contents differ), so the SAME emission serves both, but the
+    // shifted observable differs:
+    //   voltage-driven (coupling_mode=0): i_prev = I_field (FEM). Consistent cancels at I_C = I_field;
+    //     the split leaves I_C != I_field -> the terminal CURRENT shifts:
+    //     V_C = V_field + Rrom*(I_C - I_field) + Lrom*(I_C - I0)/dt_C - Lrom*(I_field - I0)/dtf.
+    //   current-driven (coupling_mode=1): i_prev = I(Vmeas)_{k-1} (lagged circuit current), vf_prev =
+    //     V_field. Consistent cancels at I_C^k = I_C^{k-1}; the split leaves, at the fixpoint,
+    //     V_C = V_field + Lrom*(I_C - I0)*(1/dt_C - 1/dtf) -> the terminal VOLTAGE shifts (dual observable).
+    // I0 = the carried window-start current (.PARAM I0). Either way the Lrom terms no longer cancel ->
+    // the fixpoint SHIFTS (the measured effect). The live-current term's dt_C is realized three ways:
     //   0 = consistent (default): the single-denominator form, emitted byte-for-byte as before.
     //   1 = inconsistent, REAL RL: Rrom + Lrom stamped as REAL Xyce devices in series on the port branch
-    //       (carrying I(Vmeas), Lrom IC={I0}); Bfield carries only the lagged field correction. dt_C is
-    //       then Xyce's actual (adaptive) circuit timestep -- exact.
+    //       (carrying I(Vmeas), Lrom IC={I0}); Bfield carries only the lagged correction. dt_C is then
+    //       Xyce's actual (adaptive) circuit timestep -- exact.
     //   2 = inconsistent, DDT: circuit term = Lrom*DDT(I(Vmeas)) in the behavioral Bfield (Xyce time
     //       derivative at the circuit step). Xyce DOES support DDT(), but this stamping (a voltage source
     //       whose value depends on the derivative of its own branch current) is numerically fragile --
