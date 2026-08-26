@@ -228,8 +228,9 @@ HELP = {
         "<div class='hh'>Export sweep</div>"
         "<div class='hn'>Writes the whole sweep to CSV: one row per run (run index, one column per "
         "swept parameter, then the result metrics). Also writes <code>&lt;stem&gt;_iters.csv</code> "
-        "(WR iterations per window, one row per run) and the current plots (with reference lines) into "
-        "<code>&lt;stem&gt;_plots/</code>.</div>"
+        "(WR iterations per window, one row per run), <code>&lt;stem&gt;_constants.csv</code> (every "
+        "parameter held CONSTANT across the sweep, so the run is self-documenting), and the current "
+        "plots (with reference lines) into <code>&lt;stem&gt;_plots/</code>.</div>"
         "<div class='hn'>Server-side path, relative to where the studio runs. Overwrites an existing file.</div>"
     ),
     "sweep_vlines": (
@@ -1195,11 +1196,13 @@ def export_run_csv(path, params, summary, plots=None):
     return path
 
 
-def export_sweep_csv(path, keys, rows, plots=None):
+def export_sweep_csv(path, keys, rows, plots=None, base_params=None):
     """Write a whole parameter sweep: one CSV row per swept point (run index,
     one column per swept parameter, then the result metrics). Also writes a
-    companion '<stem>_iters.csv' (WR iterations per window: one row per run) and
-    dumps any plot PNGs into '<stem>_plots/'. Returns (csv_path, [written files])."""
+    companion '<stem>_iters.csv' (WR iterations per window: one row per run), a
+    '<stem>_constants.csv' recording every parameter that was HELD CONSTANT across
+    the sweep (so the run is self-documenting after the fact), and dumps any plot
+    PNGs into '<stem>_plots/'. Returns (csv_path, [written files])."""
     metric_cols = ["ok", "max_WR_iterations", "mean_WR_iterations", "total_xyce_solves",
                    "worst_WR_error", "all_converged", "solver_seconds",
                    "final_I_field", "final_V_field", "final_time_s", "windows", "error"]
@@ -1229,6 +1232,31 @@ def export_sweep_csv(path, keys, rows, plots=None):
                 wr.writerow([i] + [vals.get(k) for k in keys] +
                             [nit[w] if w < len(nit) else "" for w in range(wmax)])
         written.append(os.path.abspath(ipath))
+
+    # Constant parameters: everything in the base config that did NOT vary across the sweep. Exclude
+    # every key that appears as a swept column (`keys`) OR in any run's per-point `vals` (catches
+    # percentage-linked / parallel params that vary without being a primary key). Choice codes get
+    # their human-readable label appended; circuit_spec (the netlist text) is written verbatim.
+    if base_params:
+        varied = set(keys)
+        for r in rows:
+            varied |= set((r.get("vals") or {}).keys())
+        cpath = os.path.splitext(path)[0] + "_constants.csv"
+        with open(cpath, "w", newline="") as f:
+            wr = csv.writer(f)
+            wr.writerow(["parameter", "value", "label"])
+            for k in sorted(base_params):
+                if k in varied:
+                    continue
+                v = base_params[k]
+                lbl = ""
+                if k in CHOICES:
+                    try:
+                        lbl = CHOICES[k].get(int(round(float(v))), "")
+                    except (TypeError, ValueError):
+                        lbl = ""
+                wr.writerow([k, v, lbl])
+        written.append(os.path.abspath(cpath))
 
     if plots:
         stem = os.path.splitext(os.path.basename(path))[0]
@@ -1601,6 +1629,10 @@ def _make_grid_plots(kx, ky, rows, vlines=None):
         fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04)
         ax.set_title(title, fontsize=10)
         ax.set_xlabel(lx); ax.set_ylabel(ly)
+        # Pin ticks to the actually-sampled parameter values (cell CENTRES). Without this the
+        # auto-ticker labels the pcolormesh cell EDGES instead (e.g. values [1,6,10] -> edges
+        # [-1.5,3.5,8,12]), so the axis looks shifted / spans past the sampled range.
+        ax.set_xticks(xs); ax.set_yticks(ys)
         _draw_vlines(ax, vlines, data_x=True)   # x-axis is kx in real units
 
     fig.suptitle(f"Grid sweep: {LABELS.get(kx, kx)}  x  {LABELS.get(ky, ky)}", fontsize=12)
@@ -2014,7 +2046,8 @@ class Handler(BaseHTTPRequestHandler):
                 plots = make_sweep_plots(s["keys"], s["rows"], s["mode"],
                                          s["free_keys"], vl_eval)
                 csv_path, files = export_sweep_csv(body.get("path") or "results/sweeps/sweep.csv",
-                                                   s["keys"], s["rows"], plots)
+                                                   s["keys"], s["rows"], plots,
+                                                   base_params=s.get("params"))
                 self._send(200, json.dumps({"ok": True, "path": csv_path, "files": files}))
             except Exception as e:
                 self._send(200, json.dumps({"ok": False, "error": str(e),
