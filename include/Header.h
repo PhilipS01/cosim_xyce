@@ -153,6 +153,40 @@ struct SimConfig
     // Linear field only: a plain Xyce inductor cannot reproduce the saturation flux law, so
     // nonlin_model=1 is warned + ignored here.
     unsigned validation_mode = 0;
+    // Ceiling on Xyce's ADAPTIVE internal timestep, in seconds -- emitted as the 4th POSITIONAL field
+    // of the per-window .tran line (Xyce RG 2.1.38: .TRAN <initial step> <final time>
+    // [<start time> [<step ceiling>]] [NOOP] [UIC]). Bounds the integrator where the waveform is quiet,
+    // independently of the print cadence dt_print (= t_window/N_xyce_samples, which only controls how
+    // often a solved point is WRITTEN).
+    //   <= 0 (default) = unset: the field is omitted and Xyce keeps its OWN default ceiling, which is
+    //   (<final time> - <start time>)/10 = dt_window/10 here, auto-tightened where breakpoints demand
+    //   >= 10 steps between them (RG 2.1.38 Comments). So "unset" is NOT "unbounded" -- it is
+    //   dt_window/10. A user ceiling overrides any internally generated one.
+    //   Unset also means restart.inc is byte-for-byte what it was before this knob existed.
+    // NB the initial step is min(<initial step>, <step ceiling>, 1/200 of the time to the next
+    // breakpoint), so a ceiling below dt_print shrinks the first step of every window too.
+    // The .OPTIONS TIMEINT DELMAX route is deliberately NOT used: per RG table 2-5 it is scoped to
+    // ERROPTION=1 and merely combines as min(.TRAN ceiling, DELMAX), so .TRAN is the general knob.
+    // Scope: the WR windows only. validation_mode=1 keeps its own hardcoded {dt_print} ceiling (see
+    // MonolithicValidationSolve) so the monolithic reference stays as finely resolved as the stitched
+    // WR run; a value set here is reported as ignored there.
+    double xyce_max_step = 0.0;
+    // Xyce time-integration method (User Guide, Table 7-3 "Summary of Xyce-supported time integration
+    // methods"). Emitted ONCE as .OPTIONS TIMEINT into the netlist head, so unlike xyce_max_step it
+    // applies to BOTH the WR run and the monolithic validation solve (they share wr_circuit.cir) --
+    // deliberate, so the reference can be run on the same integrator as the coupled run.
+    // Per RG table 2-5, METHOD takes trap (or 7) / gear (or 8); MAXORD caps the order the integrator
+    // will attempt, MINORD forces it up to that order -- hence the MAXORD=1 / MINORD=2 spellings.
+    //   0 = Xyce default (trap: variable-order trapezoid, dynamically mixing BE and trapezoidal,
+    //       MAXORD=2 MINORD=1). Emits NOTHING -> netlist unchanged.
+    //   1 = Backward-Euler only   (METHOD=trap MAXORD=1)
+    //   2 = Trapezoidal only      (METHOD=trap MINORD=2)
+    //   3 = Gear                  (METHOD=gear: backward Euler + 2nd-order Gear)
+    //   4 = 2nd-order Gear only   (METHOD=gear MINORD=2)
+    // Code 1 matches the circuit side to the FEM dummy solver, which already integrates with BDF-1
+    // (see FEM_solver_voltage_driven_waveform) -- i.e. both halves on the same first-order method.
+    // Unknown codes fall through to "emit nothing", as elsewhere in the emission chains.
+    unsigned xyce_integration_method = 0;
 };
 
 extern SimConfig g_cfg;

@@ -197,6 +197,11 @@ driver. For each window `[t_start, t_stop]`:
      INITIAL_INTERVAL=<dt_window>` + `.tran ...` (no UIC) — restart from the
      previous window's committed state.
 
+   The `.tran` line is `.tran {dt_print} {t_stop} {t_abs_start} [<ceiling>] [UIC]`.
+   The optional 4th positional field is the **step ceiling**, emitted only when
+   `xyce_max_step > 0` (see `UI_README.md`); it must precede `UIC`. Left unset,
+   Xyce applies its own default ceiling of `t_window/10`.
+
    `INITIAL_INTERVAL = dt_window` makes Xyce drop **exactly one** checkpoint, at
    the (absolute) window end, named `ckpt_out<time>`.
 2. **Clear stale candidates** (`ClearCheckpoints("ckpt_out")`) so a leftover

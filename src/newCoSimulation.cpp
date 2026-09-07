@@ -128,6 +128,8 @@ bool LoadConfig(const string& filename)
         else if (key == "interface_consistency")            g_cfg.interface_consistency = (unsigned)val;
         else if (key == "seam_average")                     g_cfg.seam_average = (unsigned)val;
         else if (key == "validation_mode")                  g_cfg.validation_mode = (unsigned)val;
+        else if (key == "xyce_max_step")                    g_cfg.xyce_max_step = val;
+        else if (key == "xyce_integration_method")          g_cfg.xyce_integration_method = (unsigned)val;
         else cout << "LoadConfig: unknown key '" << key << "' ignored." << endl;
     }
     return true;
@@ -644,6 +646,11 @@ void MonolithicValidationSolve()
     if (g_cfg.nonlin_model != 0)
         cout << "  WARNING: nonlin_model=" << g_cfg.nonlin_model
              << " (saturation) is IGNORED in validation mode -- L_FEM is a linear inductor." << endl;
+    // The monolithic .tran keeps its own {dt_print} step ceiling (see below), so the WR-window knob
+    // does not apply here. Say so rather than dropping a set value silently.
+    if (g_cfg.xyce_max_step > 0.0)
+        cout << "  WARNING: xyce_max_step=" << g_cfg.xyce_max_step
+             << " is IGNORED in validation mode -- the monolithic .tran keeps its dt_print ceiling." << endl;
 
     if (g_cfg.t_end <= 0.0) throw runtime_error("MonolithicValidationSolve: t_end must be > 0.");
 
@@ -1343,6 +1350,20 @@ void WriteCircuitNetlist(const string& filename)
     out << "Generated circuit netlist (WriteCircuitNetlist from sim_config.txt) -- DO NOT EDIT BY HAND\n";
     out << ".INCLUDE sim_params.inc\n\n";
 
+    // Time-integration method (xyce_integration_method; Xyce User Guide Table 7-3). Written ONCE here
+    // rather than into the per-window restart.inc: the method is a global integrator setting, and the
+    // netlist is shared by the WR run and the monolithic validation solve, so one site covers both.
+    // Emitted as a LITERAL -- .OPTIONS must not rely on {param} expansion (same reason as the
+    // .OPTIONS RESTART line in WriteRestartDirectives). Code 0 emits nothing, so an unset knob leaves
+    // the deck byte-for-byte as it was.
+    switch (g_cfg.xyce_integration_method) {
+        case 1: out << ".OPTIONS TIMEINT METHOD=trap MAXORD=1\n\n"; break; // Backward-Euler only
+        case 2: out << ".OPTIONS TIMEINT METHOD=trap MINORD=2\n\n"; break; // Trapezoidal only
+        case 3: out << ".OPTIONS TIMEINT METHOD=gear\n\n";          break; // BE + 2nd-order Gear
+        case 4: out << ".OPTIONS TIMEINT METHOD=gear MINORD=2\n\n"; break; // 2nd-order Gear only
+        default: break;                                                     // 0 / unknown -> Xyce default (trap)
+    }
+
     out << "* === CIRCUIT SIDE (custom node-graph from circuit_spec.txt) ===\n";
     emitCustomTopology(out);
     out << "\n";
@@ -1546,6 +1567,8 @@ void WriteSimParams(
 //   Window k>1: restart from committed_file (FILE=...), writes new checkpoints.
 // INITIAL_INTERVAL = window length -> exactly one checkpoint at the (absolute) window end.
 // Written as a literal, since .OPTIONS should not rely on {param} expansion.
+// xyce_max_step > 0 adds the step CEILING as the 4th positional .tran field (before UIC, which must
+// stay last); unset -> the field is omitted and the line is byte-for-byte the pre-knob one.
 void WriteRestartDirectives(
     const string& filename,
     bool first_window,
@@ -1563,15 +1586,20 @@ void WriteRestartDirectives(
     if (first_window) {
         out << ".OPTIONS RESTART PACK=0 JOB=" << ckpt_out_prefix
             << " INITIAL_INTERVAL=" << dt_window << "\n";
-        // Fresh transient from 0; print from {t_abs_start} (=0 in the first window).
-        out << ".tran {dt_print} {t_stop} {t_abs_start} UIC\n";
     } else {
         out << ".OPTIONS RESTART FILE=" << committed_file
             << " JOB=" << ckpt_out_prefix
             << " INITIAL_INTERVAL=" << dt_window << "\n";
-        // Restart sets the integrator to the checkpoint time; no UIC.
-        out << ".tran {dt_print} {t_stop} {t_abs_start}\n";
     }
+
+    // RG 2.1.38: .TRAN <initial step> <final time> [<start time> [<step ceiling>]] [NOOP] [UIC]
+    // Emitted from one place because the ceiling is POSITIONAL: it must sit between the start time and
+    // UIC. Window 1 is a fresh transient (UIC); a restart takes its state from the checkpoint, no UIC.
+    // Unset ceiling -> Xyce's own default of (final - start)/10 = dt_window/10, breakpoint-adjusted.
+    out << ".tran {dt_print} {t_stop} {t_abs_start}";
+    if (g_cfg.xyce_max_step > 0.0) out << " " << g_cfg.xyce_max_step;
+    if (first_window) out << " UIC";
+    out << "\n";
 }
 
 // Deletes stale checkpoint candidates <prefix>* in the working directory. Prevents an
@@ -1640,10 +1668,29 @@ void CommitCheckpoint(const string& prefix, const string& committed_file)
     }
 }
 
-// Linear resampler onto a uniform grid with N_intervals+1 nodes over [t_start, t_stop].
-// Purpose: reduce the adaptive Xyce output to a fixed grid before it is reused as a PWL source
-// (V(vfprev) or V(iprev), depending on coupling_mode) in the next WR iteration (see the call in
-// ReadXyceResults).
+// Linear resampler onto a uniform grid with N_intervals+1 nodes over [t_start, t_stop]. Values
+// outside [raw.t.front(), raw.t.back()] are clamped to the end values (no extrapolation). It is the
+// generic grid-transfer helper of the multi-rate coupling, NOT only a down-sampler of Xyce output:
+// depending on the two grid sizes it may refine as well as coarsen. Three uses:
+//   1. ReadXyceResults: Xyce .prn -> coupling grid (N_xyce_eval_points = N_xyce_samples), so the
+//      result can be reused as a PWL source (V(vfprev) or V(iprev), depending on coupling_mode) in
+//      the next WR iteration. Near-identity in practice: WriteSimParams already sets the Xyce print
+//      cadence to dt_print = t_window/N_xyce_samples, so the .prn rows sit ON the coupling nodes and
+//      this pass mainly drops the extra breakpoint rows Xyce inserts between them.
+//   2. FEM_solver_{voltage,current}_driven_waveform: coupling grid -> field grid
+//      (N_field_eval_intervals). This is the multi-rate step; the FEM integrates on its own grid.
+//   3. Main WR loop, after convergence: the converged vf_prev_k.pwl and i_prev_k.pwl are both put on
+//      the field grid so appendFieldWaveformXyceStyle sees matching timestamps (it interpolates
+//      nothing itself and THROWS on a size or per-row time mismatch). Which of the two is the
+//      Xyce-side one flips with coupling_mode:
+//        mode 0 (voltage-driven): ReadXyceResults writes vf_prev_k.pwl, the FEM writes i_prev_k.pwl
+//        mode 1 (current-driven): ReadXyceResults writes i_prev_k.pwl,  the FEM writes vf_prev_k.pwl
+//      The FEM-side file is already on the field grid -> pass 3 is an exact identity for it. The
+//      Xyce-side file gets resampled twice (coupling grid here, after pass 1). Exact whenever the
+//      grids are nested (N_field_eval_intervals a multiple of N_xyce_samples, same [t_start,t_stop]);
+//      otherwise a coupling breakpoint falls strictly inside a field interval and the linear
+//      reconstruction cuts that corner. Affects the Field_waveform.prn diagnostic output only, never
+//      the WR fixpoint.
 Waveform resampleWaveformUniform(
     const Waveform& raw,
     double t_start,

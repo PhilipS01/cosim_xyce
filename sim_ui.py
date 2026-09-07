@@ -87,6 +87,10 @@ PARAMS = [
         {0: "one-sided (V<-ckt, I<-fld)", 1: "midpoint (average)"}),
     ("validation_mode",                 "Validation mode",              0,        "choice",
         {0: "WR co-sim", 1: "monolithic (real R_FEM/L_FEM)"}),
+    ("xyce_max_step",                   "Xyce max step (s, 0 = off)",   0.0,      "float", None),
+    ("xyce_integration_method",         "Xyce integration method",      0,        "choice",
+        {0: "trap (Xyce default)", 1: "Backward-Euler (maxord=1)", 2: "Trap only (minord=2)",
+         3: "Gear", 4: "Gear2 only (minord=2)"}),
 ]
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
 KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}
@@ -163,6 +167,10 @@ VISIBLE_WHEN = {
     "WR_tolerance":           [{"validation_mode": [0]}],
     "R_ROM":                  [{"validation_mode": [0], "precondition": [1]}],
     "L_ROM":                  [{"validation_mode": [0], "precondition": [1]}],
+    # The step ceiling is written into the per-window .tran only; the monolithic solve keeps its own
+    # dt_print ceiling, so the control would be inert there. (xyce_integration_method has no rule --
+    # it is emitted into the netlist head and DOES apply to the monolithic reference.)
+    "xyce_max_step":          [{"validation_mode": [0]}],
 }
 
 
@@ -426,6 +434,37 @@ HELP = {
         "absolute. Needs &ge;2 iterations (gated like waveform L1, so a window-start zero-crossing "
         "cannot trigger a spurious converge after one solve). Only the terminal scalars &mdash; cheaper, "
         "ignores the waveform interior.</div>"
+    ),
+    "xyce_max_step": (
+        "<div class='hh'>Xyce max step</div>"
+        "<div class='hn'>Ceiling on Xyce's <i>internal</i> adaptive timestep, in seconds &mdash; written "
+        "as the 4th positional field of the per-window <code>.tran</code> line. Distinct from "
+        "<b>Xyce solution samples</b>, which only sets how often a solved point is <i>printed</i> "
+        "(dt_print = t_window/N); this bounds how far the integrator may actually step.</div>"
+        "<div class='hn'><b>0 = off</b>, but off is <i>not</i> unbounded: Xyce then applies its own "
+        "default ceiling of (t_stop &minus; t_start)/10 = <code>t_window/10</code>, tightened further "
+        "where breakpoints require &ge;10 steps between them. A value set here overrides that. Note the "
+        "initial step is min(dt_print, ceiling, 1/200 of the time to the next breakpoint), so a ceiling "
+        "below dt_print also shrinks the first step of every window.</div>"
+        "<div class='hn'>WR windows only &mdash; the monolithic validation solve keeps its own dt_print "
+        "ceiling so the reference stays as finely resolved as the stitched WR run.</div>"
+    ),
+    "xyce_integration_method": (
+        "<div class='hh'>Xyce integration method</div>"
+        "<div class='hn'>Selects the implicit time-integration scheme via "
+        "<code>.OPTIONS TIMEINT</code> (Xyce UG table 7-3). <code>MAXORD</code> caps the order the "
+        "integrator will attempt; <code>MINORD</code> forces it up to that order.</div>"
+        "<div class='hn'><b>trap</b> (default) &mdash; variable-order trapezoid, dynamically mixing "
+        "backward Euler and the trapezoidal rule; 2nd order, no numerical dissipation. Emits nothing.<br>"
+        "<b>Backward-Euler</b> &mdash; <code>METHOD=trap MAXORD=1</code>; 1st order, numerically "
+        "dissipative. Matches the FEM dummy solver, which already integrates with BDF&#8209;1, so both "
+        "halves of the coupling run on the same method.<br>"
+        "<b>Trap only</b> &mdash; <code>METHOD=trap MINORD=2</code>, trapezoidal throughout.<br>"
+        "<b>Gear</b> &mdash; <code>METHOD=gear</code>; <b>Gear2 only</b> &mdash; adds "
+        "<code>MINORD=2</code>.</div>"
+        "<div class='hn'>Written once into the netlist head, so unlike the step ceiling this "
+        "<b>also applies to the monolithic validation solve</b> &mdash; letting the reference be run on "
+        "the same integrator as the coupled run.</div>"
     ),
 }
 
@@ -2177,6 +2216,7 @@ _PROP_GROUPS = [
     ("Interface & secant", False, [["precondition", "interface_form", "use_t_floor",
                                     "interface_consistency", "t_floor_frac", "seam_average"]]),
     ("Field / ROM model",  False, [["R_ROM", "L_ROM", "R_FEM", "L_FEM", "nonlin_model"]]),
+    ("Xyce integrator",    False, [["xyce_integration_method", "xyce_max_step"]]),
 ]
 _PROP_HIDDEN = ["I_sat"]  # config-only (emitted as a hidden input so presets/reset/collect keep working)
 
