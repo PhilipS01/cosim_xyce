@@ -1402,7 +1402,7 @@ def make_plots(data):
 # use, plus the reference-line red from _draw_vlines.
 _PGF_COLORS = {"C0": "1f77b4", "C1": "ff7f0e", "C2": "2ca02c", "C3": "d62728",
                "Ccyan": "17becf", "Cpurple": "9467bd", "Cgray": "7f7f7f",
-               "Cvline": "e63946"}
+               "Cpink": "e377c2", "Cvline": "e63946"}
 
 
 def _pgf_colordefs():
@@ -1636,7 +1636,11 @@ def scalar_summary(data):
         s["mean_WR_iterations"] = float(np.mean(wr["nit"]))
         s["total_xyce_solves"] = int(np.sum(wr["nit"]))  # cost proxy: one Xyce run per WR iter
         s["all_converged"] = bool(np.all(wr["conv"] >= 1.0))
+        # wr["err"] is the FINAL relative error each window converged to, one entry per window.
+        # worst = the window that ended furthest from tolerance; mean = the typical window, which
+        # is the one that moves when accuracy changes globally rather than at a single hard window.
         s["worst_WR_error"] = float(np.max(wr["err"]))
+        s["mean_WR_error"] = float(np.mean(wr["err"]))
         # Worst cross-solver transmission defect over all windows (field vs circuit terminal). Non-zero
         # even when the WR loop "converges" under a metric blind to it (method 0, or the naive BDF-1/BE
         # interface). max of relI_FC/relV_FC; NaN-safe (older WR_error.txt files lack the columns).
@@ -2392,10 +2396,12 @@ def _make_line_plots(keys, rows, mode, vlines=None):
     a2.tick_params(axis="y", labelcolor="tab:green")
     ax.set_title("Cost"); setx(ax)
 
-    # (1,0) worst WR error (log y)
+    # (1,0) WR error, worst + mean over the windows (log y)
     ax = axes[1, 0]
-    ax.semilogy(x, np.maximum(col("worst_WR_error"), 1e-16), "o-", color="tab:red")
-    ax.set_ylabel("worst WR rel. error"); ax.set_title("WR accuracy"); setx(ax)
+    ax.semilogy(x, np.maximum(col("worst_WR_error"), 1e-16), "o-", color="tab:red", label="worst")
+    ax.semilogy(x, np.maximum(col("mean_WR_error"), 1e-16), "s--", color="tab:pink", label="mean")
+    ax.set_ylabel("WR rel. error"); ax.set_title("WR accuracy")
+    ax.legend(fontsize=8, loc="upper right"); setx(ax)
 
     # (1,1) final interface values
     ax = axes[1, 1]
@@ -2445,13 +2451,19 @@ def _make_grid_plots(kx, ky, rows, vlines=None):
         return np.concatenate([[2 * v[0] - mid[0]], mid, [2 * v[-1] - mid[-1]]])
 
     xe, ye = edges(xs), edges(ys)
+    # Bottom row is the accuracy pair: worst vs mean final WR error over the windows. Each keeps its
+    # own colour normalisation -- they differ by orders of magnitude, and a shared scale would flatten
+    # the mean panel to one colour.
     panels = [
         ("max_WR_iterations", "WR iterations / window (max)", "viridis", False),
         ("total_xyce_solves", "total Xyce solves", "magma", False),
-        ("worst_WR_error", "worst WR rel. error (log)", "inferno", True),
         ("final_I_field", "final I_field (A)", "cividis", False),
+        ("worst_WR_error", "worst WR rel. error (log)", "inferno", True),
+        ("mean_WR_error", "mean WR rel. error (log)", "inferno", True),
     ]
-    fig, axes = plt.subplots(2, 2, figsize=(10, 6.6))
+    fig, axes = plt.subplots(2, 3, figsize=(14.4, 6.6))
+    for ax in axes.flat[len(panels):]:
+        ax.set_visible(False)                  # 5 panels in a 2x3 grid -> hide the empty cell
     for ax, (name, title, cmap, log) in zip(axes.flat, panels):
         g = grid(name, log)
         norm = None
@@ -2602,29 +2614,49 @@ def _pgf_matrix_panel(title, xlabel, ylabel, xs, ys, M, bar_label, log=False, re
     # reference line's endpoint astronomically outside the axis ("Dimension too large").
     yv = np.asarray(sorted(float(v) for v in ys), dtype=float)
     pad = float(np.min(np.diff(yv))) / 2.0 if yv.size > 1 else (abs(float(yv[0])) * 0.5 or 0.5)
+
+    # pgfplots has no logarithmic COLOUR scale, so for a log panel the point meta carries
+    # log10(value) and the colourbar is relabelled in powers of ten. Without this an error heatmap
+    # spanning decades collapses to a single flat colour, while the PNG (matplotlib LogNorm) shows
+    # the structure -- the two views have to agree.
+    meta, bar_ticks = M, []
+    if log:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            meta = np.where(np.isfinite(M) & (M > 0.0),
+                            np.log10(np.maximum(M, 1e-16)), np.nan)
+        lo = max(float(finite[finite > 0.0].min()), 1e-16) if (finite > 0.0).any() else 1e-16
+        hi = max(float(finite.max()), lo * 10.0)
+        bar_ticks = list(range(int(math.floor(math.log10(lo))),
+                               int(math.floor(math.log10(hi))) + 1))
+
     rows_out = []
     for i in range(M.shape[0]):
         for j in range(M.shape[1]):
-            v = M[i, j]
+            v = meta[i, j]
             cell = f"{v:.8g}" if np.isfinite(v) else "nan"
             rows_out.append(f"    {float(xs[j]):.8g} {float(ys[i]):.8g} {cell}")
+
+    bar_style = [f"ylabel={{{_tex_escape(bar_label)}}}",
+                 "ylabel style={font=\\footnotesize}", "tick label style={font=\\footnotesize}"]
+    if bar_ticks:
+        bar_style += ["ytick={" + ",".join(str(t) for t in bar_ticks) + "}",
+                      "yticklabels={" + ",".join(f"$10^{{{t}}}$" for t in bar_ticks) + "}"]
     opts = [r"width=\linewidth", "height=6.4cm",
             f"title={{{_tex_escape(title)}}}",
             f"xlabel={{{_tex_escape(xlabel)}}}", f"ylabel={{{_tex_escape(ylabel)}}}",
             "tick label style={font=\\footnotesize}", "label style={font=\\small}",
             "title style={font=\\small}",
             "colorbar", "colormap/viridis", "unbounded coords=jump",
-            f"colorbar style={{ylabel={{{_tex_escape(bar_label)}}}, "
-            "ylabel style={font=\\footnotesize}, tick label style={font=\\footnotesize}}",
+            "colorbar style={" + ", ".join(bar_style) + "}",
             "enlargelimits=false", "axis on top"]
     if annotate:   # print the value in each cell, as the PNG does for small grids
+        # NB: meta is log10(value) when log=True, so annotate+log would print exponents.
         opts += ["nodes near coords={\\pgfmathprintnumber[precision=0]{\\pgfplotspointmeta}}",
                  "every node near coord/.append style={font=\\footnotesize, anchor=center, "
                  "text=white}"]
     if log:
-        opts.append("colormap/viridis")
-        opts.append(f"point meta min={max(float(finite.min()), 1e-16):.8g}")
-        opts.append(f"point meta max={float(finite.max()):.8g}")
+        opts.append(f"point meta min={math.log10(lo):.8g}")
+        opts.append(f"point meta max={math.log10(hi):.8g}")
     if reverse_y:
         opts.append("y dir=reverse")
     body = (["\\begin{axis}[", "  " + ",\n  ".join(opts), "]",
@@ -2753,8 +2785,9 @@ def pgf_sweep_tex(which, sweep, vlines=None):
 
         spec = [("max_WR_iterations", "WR iterations / window (max)", "iterations", False),
                 ("total_xyce_solves", "Total Xyce solves", "solves", False),
+                ("final_I_field", "Final I_field", "A", False),
                 ("worst_WR_error", "Worst WR rel. error", "rel. error", True),
-                ("final_I_field", "Final I_field", "A", False)]
+                ("mean_WR_error", "Mean WR rel. error", "rel. error", True)]
         pics, names = [], []
         for nm, title, bar, log in spec:
             pic = _pgf_matrix_panel(title, kx, ky, xs, ys, grid(nm, log), bar, log=log,
@@ -2805,9 +2838,11 @@ def pgf_sweep_tex(which, sweep, vlines=None):
         ("Cost: solver time", "solver time (s)",
          [("solver s", x, col("solver_seconds"), {**dash, "color": "C2", "mark": "triangle*"})],
          xopt),
-        ("WR accuracy", "worst WR rel. error",
-         [("worst WR rel. error", x, np.maximum(col("worst_WR_error"), 1e-16),
-           {**solid, "color": "C3", "mark": "*"})],
+        ("WR accuracy", "WR rel. error",
+         [("worst", x, np.maximum(col("worst_WR_error"), 1e-16),
+           {**solid, "color": "C3", "mark": "*"}),
+          ("mean", x, np.maximum(col("mean_WR_error"), 1e-16),
+           {**dash, "color": "Cpink", "mark": "square*"})],
          xopt + ["ymode=log"]),
         ("Final interface current", "final I_field (A)",
          [("I_field", x, col("final_I_field"), {**solid, "color": "C1", "mark": "*"})],
@@ -2984,7 +3019,7 @@ def sweep_table(keys, rows):
         keys = [keys]
     valcols = [f"p:{k}" for k in keys]         # one column per swept parameter
     metric = ["ok", "max_WR_iterations", "mean_WR_iterations",
-              "total_xyce_solves", "worst_WR_error", "all_converged",
+              "total_xyce_solves", "worst_WR_error", "mean_WR_error", "all_converged",
               "solver_seconds", "final_I_field", "final_V_field"]
 
     def rowout(r):

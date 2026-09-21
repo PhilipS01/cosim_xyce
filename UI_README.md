@@ -137,8 +137,19 @@ metrics vs the swept parameter in a 2×2 figure:
 
 - **Convergence speed** — max & mean WR iterations per window
 - **Cost** — total Xyce solves and wall-clock solver time
-- **WR accuracy** — worst WR relative error (log axis)
+- **WR accuracy** — worst **and mean** WR relative error (log axis)
 - **Final interface values** — final `I_field` and `V_field`
+
+`WR_error.txt` holds the *final* relative error each window converged to, one
+entry per window. **Worst** is the window that ended furthest from tolerance —
+sensitive to one hard window (a switching edge, say); **mean** is the typical
+window, which is what moves when accuracy changes across the whole run. Reading
+them together separates "one window struggles" from "everything got worse".
+
+A 2-parameter grid sweep draws these as **five heatmaps** (2×3, last cell blank):
+max WR iterations, total Xyce solves, final `I_field`, and the accuracy pair —
+worst and mean WR relative error, each on its own log colour scale (they differ
+by orders of magnitude, so a shared scale would flatten the mean panel).
 
 plus a WR-iterations-per-window colormap and a per-point table (rows that
 failed / didn't fully converge are red).
@@ -219,8 +230,10 @@ independent `tikzpicture` per panel** — copy the one you want into its own fil
 or `\input` the whole file to typeset them in sequence. The two twin-axis panels
 are split so each quantity gets its own axis (six panels: WR iterations, Xyce
 solves, solver time, WR accuracy, final `I_field`, final `V_field`); a 2-parameter
-grid sweep exports its four heatmaps instead, and the iterations colormap exports
-on its own. Reference lines are drawn from whatever is in the reference-line box
+grid sweep exports its five heatmaps instead, and the iterations colormap exports
+on its own. Error heatmaps carry `log10(value)` as the colour meta with the
+colourbar relabelled in powers of ten — pgfplots has no logarithmic colour scale,
+and without that a heatmap spanning decades exports as one flat colour. Reference lines are drawn from whatever is in the reference-line box
 at export time. Heatmaps use pgfplots' built-in `viridis` for every panel, where
 the PNG varies the colormap.
 
