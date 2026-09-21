@@ -38,9 +38,23 @@ python3 sim_ui.py sweep --param L_FEM --min 1e-7 --max 1e-5 --steps 8 --scale lo
 2. The backend writes `sim_config.txt`, `circuit_spec.txt`, `probes.txt`, runs
    `./main`, parses the `.prn` outputs, and renders three plots server-side as
    PNGs (fully offline — no internet/CDN needed):
-   - **Port / field voltage** vs time
-   - **Interface current** (circuit `I(Vmeas)` vs field `I_field`) vs time
+   - **Interface voltage** vs time (circuit `V(p)` vs field `V_field`)
+   - **Interface current** vs time (circuit `I(Vmeas)` vs field `I_field`)
    - **WR convergence** per window (final rel. error + iteration count)
+
+   With `reference_overlay` on, the monolithic reference is re-solved and drawn on
+   the two interface plots as a dotted black curve.
+
+   Hovering a results plot reveals a **TikZ** button that downloads that one plot
+   as `pgfplots` LaTeX (`interface_voltage.tex`, `interface_current.tex`,
+   `wr_convergence.tex`, `probe_voltages.tex`, `probe_currents.tex`). The file is
+   a bare `tikzpicture` — no `\documentclass` — so it drops into a thesis with
+   `\input{...}`; the two preamble lines it needs (`\usepackage{pgfplots}`,
+   `\pgfplotsset{compat=1.18}`) and the run's key parameters are written as
+   comments at the top. It re-renders from the last run's parsed data (no
+   re-solve), and each series is thinned to ~2000 points by min/max decimation so
+   narrow spikes survive while `pdflatex` stays fast (`_PGF_MAX_PTS` in
+   `sim_ui.py`).
 3. A summary card row shows final values, window count, max WR iterations, and
    whether every window converged.
 
@@ -92,16 +106,16 @@ the user circuit.
 | `WRmaxSteps`, `WR_tolerance` | WR iteration cap and tolerance |
 | `wr_convergence_method` | `0` = waveform-L1 of the field current, `1` = terminal-scalar metric |
 | `coupling_mode` | `0` = voltage-driven (circuit sets `V(p)`, field returns `I`), `1` = current-driven (circuit sets `I(Vmeas)`, field returns `V_field`) |
-| `reconstruct_mode` | field reconstruction within a window: `0` pointwise (BDF-1: a local backward-Euler step per field node), `1` linear ramp |
 | `interface_form` | WR interface stamping: `0` = Thevenin (V source), `1` = Norton (I source) — algebraic duals, same terminal fixpoint |
 | `precondition` | interface preconditioner: `1` = on (default, the matched-secant ROM impedance `Z = R_ROM + L_ROM/dt` in `Bfield` — an optimized/Robin transmission that accelerates the WR contraction); `0` = **classical Gauss–Seidel (Dirichlet–Neumann) WR** — drop the `Z` correction, drive the port with a *pure* source of the field's own response (`I_field` current source when voltage-driven, `V_field` voltage source when current-driven). Same fixpoint (the `Z`-term vanishes at convergence), slower contraction, may not converge for stiff coupling. Disables `interface_form`/`use_t_floor`/`R_ROM`/`L_ROM`. **Well-posedness:** an inductive port (series `L` to `p`) needs the voltage source → use `coupling_mode=1` (a pure current source in series with `L` is degenerate and Xyce aborts at `t=0`); a capacitive port is the dual (voltage-driven) |
 | `use_t_floor` | secant denominator `dt` in `Z = R_ROM + L_ROM/dt`: `1` = floored `MAX(dt, t_floor)` (default, guards the window-start `1/0`); `0` = bare `dt` (test); `2` = **constant** `t_floor` → fixed interface impedance `Z = R_ROM + L_ROM/t_floor` (a constant Robin/optimized-transmission coefficient instead of the growing-admittance accumulated secant; same fixpoint, different WR rate) |
-| `interface_consistency` | **study knob** for the Thevenin interface (`precondition=1`, `interface_form=0`), **both coupling directions**; ignored otherwise; FEM unchanged. `0` = **consistent** (default) — one secant denominator `dt` for both currents, so the two `Lrom/dt` terms cancel at convergence → true fixpoint; `1`/`2`/`3` = **inconsistent** — split it so the live-iterate circuit-current term uses the circuit's own step `dt_C` while the lagged term keeps `time−t_abs_start` (`= dtf`, still per `use_t_floor`). Same emission both directions; the shifted observable differs: **voltage-driven** (`i_prev=I_field`) `V_C = V_F + Rrom·(I_C−I_F) + Lrom·(I_C−I0)/dt_C − Lrom·(I_F−I0)/dtf` → terminal **current** shifts (`I_circuit` vs `I_field`); **current-driven** (`i_prev=` lagged `I(Vmeas)`, base `V_field`) → at the fixpoint `V_C = V_field + Lrom·(I_C−I0)·(1/dt_C − 1/dtf)` → terminal **voltage** shifts. `dt_C` realized as: `1` real `R_ROM`/`L_ROM` Xyce devices on the port (`IC=I0`, exact adaptive step; `Bfield`'s inductive term reads the field-grid BDF-1 derivative `di_F/dt` from `didt_field_k.pwl` directly — exact for >1 FEM eval/window, no anchored secant); `2` `Lrom·DDT(I(Vmeas))` (Xyce supports `DDT`, but this stamping is numerically fragile — tends to step-collapse on the `Bfield` branch and may abort; prefer real RL); `3` over `dt_print = t_window/N_xyce_samples` (a fixed mean step) |
+| `interface_consistency` | **study knob** for the Thevenin interface (`precondition=1`, `interface_form=0`), **both coupling directions**; ignored otherwise; FEM unchanged. `0` = **accumulated** (default) — one secant denominator `dt` for both currents, so the two `Lrom/dt` terms cancel at convergence → true fixpoint; `1` = **BDF-1/BE (naive)** — split it so the live-iterate circuit-current term uses the circuit's own step `dt_C` while the lagged term keeps `time−t_abs_start` (`= dtf`, still per `use_t_floor`). Same emission both directions; the shifted observable differs: **voltage-driven** (`i_prev=I_field`) `V_C = V_F + Rrom·(I_C−I_F) + Lrom·(I_C−I0)/dt_C − Lrom·(I_F−I0)/dtf` → terminal **current** shifts (`I_circuit` vs `I_field`); **current-driven** (`i_prev=` lagged `I(Vmeas)`, base `V_field`) → at the fixpoint `V_C = V_field + Lrom·(I_C−I0)·(1/dt_C − 1/dtf)` → terminal **voltage** shifts. `dt_C` is realized with **real devices**: `R_ROM`/`L_ROM` stamped as real Xyce devices on the port branch (`IC=I0`), so `dt_C` is Xyce's actual adaptive step and the inductive term is the genuine BDF-1/BE backward difference; `Bfield`'s own inductive term reads the field-grid BDF-1 derivative `di_F/dt` from `didt_field_k.pwl` directly — exact for >1 FEM eval/window, no anchored secant |
 | `t_floor_frac` | `t_floor = t_floor_frac · t_window` (window-scaled); the secant-denominator floor (`use_t_floor=1`) **or** the constant denominator (`use_t_floor=2`) |
 | `seam_average` | window-seam handoff: `0` = one-sided (V←circuit, I←field), `1` = midpoint |
 | `validation_mode` | `0` = WR co-sim (default). `1` = **monolithic reference**: replace the behavioral `Bfield` with the *true* field as real Xyce devices (`R_FEM` + `L_FEM` in series on the port branch) and solve the whole circuit as one transient over `[0, t_end]` — no WR loop, no field solver, no coupling. Gives a reference to validate the coupled run against; the WR/coupling/secant knobs are disabled and the convergence plot is empty. Linear field only (saturation ignored) |
 | `xyce_max_step` | ceiling (s) on Xyce's **internal adaptive timestep**, emitted as the 4th positional field of the per-window `.tran` (`.TRAN <initial step> <final time> [<start time> [<step ceiling>]] [NOOP] [UIC]`, Xyce RG 2.1.38). Distinct from `N_xyce_samples`, which only sets how often a solved point is *printed*. `0` = off — but off is **not unbounded**: Xyce then applies its own default ceiling of `(t_stop − t_start)/10 = t_window/10`, tightened where breakpoints require ≥10 steps between them. WR windows only; the monolithic solve keeps its own `dt_print` ceiling (a value set here is reported as ignored) |
 | `xyce_integration_method` | implicit time-integration scheme via `.OPTIONS TIMEINT` (Xyce UG table 7-3). `0` = trap, Xyce's default variable-order trapezoid (emits nothing); `1` = **Backward-Euler** (`METHOD=trap MAXORD=1`) — 1st order, matches the FEM dummy solver's own BDF-1 stepping; `2` = trap only (`METHOD=trap MINORD=2`); `3` = Gear (`METHOD=gear`); `4` = Gear2 only (`METHOD=gear MINORD=2`). Written into the netlist head, so unlike `xyce_max_step` it **also applies to the monolithic reference** |
+| `reference_overlay` | **studio-only** (never reaches the solver — `write_config` round-trips it as a `# ui:` comment). `0` = off, `1` = re-solve the same circuit with `validation_mode=1` in a temp directory and draw its interface voltage/current on the **Interface voltage** / **Interface current** plots as a dotted black curve. Costs one extra full solve per run; a failed reference is dropped with a note in the log. The reference is a linear field, so it is not the truth the coupled run converges to when `nonlin_model=1` |
 
 Output **probes** (extra Xyce `.print` tokens like `V(a)`, `I(Rr1)`) are written
 to `probes.txt` and captured per window into `Probes_solution.prn`.
@@ -126,7 +140,28 @@ metrics vs the swept parameter in a 2×2 figure:
 - **WR accuracy** — worst WR relative error (log axis)
 - **Final interface values** — final `I_field` and `V_field`
 
-plus a per-point table (rows that failed / didn't fully converge are red).
+plus a WR-iterations-per-window colormap and a per-point table (rows that
+failed / didn't fully converge are red).
+
+A **2-parameter grid sweep** adds one more figure: a heatmap of the **total WR
+iterations** (summed over every window) with the first swept parameter on x and
+the second on y — the "how expensive is this corner of the parameter space" view.
+The per-window colormap above resolves iterations per window but collapses the
+two parameters to a flat run index, so the 2-D structure is only visible here.
+Cells are labelled with their count while the grid is at most 144 cells; a blank
+cell is a combination whose solve failed (a window hit `WRmaxSteps` and the run
+aborted).
+
+Both sweep figures carry the same **TikZ** button as the results plots. Because
+the on-screen figures are composites, the exported `.tex` holds **one
+independent `tikzpicture` per panel** — copy the one you want into its own file,
+or `\input` the whole file to typeset them in sequence. The two twin-axis panels
+are split so each quantity gets its own axis (six panels: WR iterations, Xyce
+solves, solver time, WR accuracy, final `I_field`, final `V_field`); a 2-parameter
+grid sweep exports its four heatmaps instead, and the iterations colormap exports
+on its own. Reference lines are drawn from whatever is in the reference-line box
+at export time. Heatmaps use pgfplots' built-in `viridis` for every panel, where
+the PNG varies the colormap.
 
 Headless (writes a PNG):
 
@@ -141,6 +176,89 @@ python3 sim_ui.py sweep --param WR_tolerance --min 1e-4 --max 1e-2 --steps 6 --s
 
 > Note: a sweep overwrites `sim_config.txt` with each point's values and leaves
 > it holding the last swept value when it finishes.
+
+## A-priori convergence estimate (port impedance `x_P`)
+
+The **A-priori estimate** fold in the *Run* section answers, before any transient
+runs, whether the WR iteration contracts for this circuit and this ROM.
+
+**`x_P(f)`** is the impedance the field sees looking *into* the circuit at the
+interface, with the circuit's own independent sources zeroed — the port voltage
+response to a 1 A injection at the port. It comes from a Xyce `.AC` sweep of a
+probe deck built from your `circuit_spec.txt`:
+
+| spec element | in the probe deck |
+| --- | --- |
+| `R` / `L` / `C` | kept (without the transient deck's `IC=`) |
+| any V source (`VSIN`, `VDC`, `VPULSE`, `VPWM`, `VPWL`) | zeroed → a 0 V source, i.e. a short that keeps the node names |
+| any I source (`ISIN`, `IDC`, …) | removed → an open circuit |
+| `SW` | frozen to `Ron`/`Roff` at **switch t** — an AC analysis needs a time-invariant circuit |
+| the whole field branch (`R_ROM`/`L_ROM`/`Bfield`/`Vmeas`) | absent; replaced by `I_xp_inj 0 p AC 1 0` |
+
+The port voltage is read from the `.prn` **by node name** (`VR(p)`/`VI(p)`), never
+by column position.
+
+**`ρ(f)`** is the WR contraction factor built on top of it,
+
+```
+β(f) = 1 / (R_ROM + j2πf·L_ROM)      ROM (preconditioner) admittance
+Y(f) = 1 / (R_FEM + j2πf·L_FEM)      true field admittance
+ρ(f) = (1 + β·x_P)⁻¹ (β − Y) x_P
+```
+
+`|ρ| < 1` over the band the circuit actually excites is the a-priori statement
+that WR contracts there; `ρ ≡ 0` when the ROM matches the field exactly. The panel
+prints `max |ρ|`, the band where `|ρ| ≥ 1`, and every `|ρ| = 1` crossing.
+
+- **Compute x_P (Xyce .AC)** runs the sweep (`f start`/`f stop`, `dec`/`oct`/`lin`,
+  points) and then `ρ` on top of it.
+- **Update ρ only** recomputes `ρ` from the *stored* `x_P` using the current
+  `R_ROM`/`L_ROM`/`R_FEM`/`L_FEM` — no Xyce solve. `x_P` depends only on the
+  circuit, so re-tuning the ROM is free.
+- Both sweeps are written to the CSV paths in the panel (blank = skip):
+  `f_Hz, Re_xP_ohm, Im_xP_ohm, abs_xP_ohm` and the same plus
+  `Re_rho, Im_rho, abs_rho`.
+- Two plots appear in *Results*: `|x_P(f)|` on a log-log axis, and `|x_P|` with
+  `|ρ|` against the same frequency axis (`|ρ|` on the right-hand scale, with the
+  `|ρ| = 1` level and its crossings marked). Both carry the same hover **TikZ**
+  button as the other results plots, exporting `port_impedance.tex` and
+  `wr_contraction.tex` — bare `tikzpicture`s re-rendered from the stored sweep (no
+  Xyce re-run), with the sweep settings and the ROM/field values recorded as
+  comments. `wr_contraction.tex` reproduces the twin-axis figure: `|x_P|` in ohms
+  on the left, `|ρ|` on the right, the dashed `|ρ| = 1` rule and its crossing
+  markers. AC sweeps are a few hundred points, so these two are **not** decimated.
+
+**Sanity checks** run automatically and are printed under the buttons:
+
+- *low f* — `|x_P(f_start)|` is compared against the network's DC resistance
+  (for a series-R port, `R_s`), solved independently of Xyce by shorting every
+  inductor and zeroed source and opening every capacitor. A mismatch usually means
+  `f_start` is too high for `2πf·L ≪ R` to still hold.
+- *high f* — with a capacitor directly across the port (as in preset P1), the cap
+  shorts the port, so `|x_P|` must roll off as `1/f`. Tested against that
+  capacitor's *own* `|Z_C| = 1/(2πf·C)` at `f_stop` — everything else at the port
+  is in parallel with it, so `|x_P|` can only sit at or below `|Z_C|` once it
+  dominates. Not tested as `|x_P| ≈ 0`: at a finite `f_stop` a `1/(2πf·C)` tail is
+  still a visible number. A sweep that stops below the port resonance is reported
+  **INCONCLUSIVE** (raise `f_stop`), not as a failure — the band is your choice.
+  The top-decade log-log slope is printed alongside (`−1` once the cap dominates).
+
+### Outside the studio
+
+The same two steps are standalone CLIs, deliberately split so the `ρ` sweep can be
+re-run with new ROM values without touching Xyce:
+
+```sh
+python3 scripts/xp_extract.py --fstart 1 --fstop 1e7 --points 200 \
+        --out results/xp.csv --plot results/xp.png --deck results/xp_probe.cir
+python3 scripts/rho_contraction.py --xp results/xp.csv --plot results/rho.png \
+        --r-rom 0.9 --l-rom 0.9e-3        # ROM defaults come from sim_config.txt
+```
+
+`xp_extract.py` exits non-zero if a sanity check fails (`--no-check` to skip).
+A bare current source on the port (preset P2) has no `x_P`: removing it leaves the
+port open-circuit, and the script says so instead of letting Xyce report an empty
+matrix.
 
 ## Config file
 
@@ -166,8 +284,10 @@ unknown keys ignored; missing keys keep defaults). Run the solver directly:
   error grow and the iteration count rise (the ROM no longer matches the field).
 - **Coupling direction** — flip `coupling_mode`; current-driven suits voltage-source-like
   ROMs.
-- **Field reconstruction** — raise `N_field_eval_intervals` above `1` and change
-  `reconstruct_mode` to alter the field-current waveform and cost.
+- **Field resolution** — raise `N_field_eval_intervals` above `1` to let the
+  dummy field follow the curve within a window instead of taking a single
+  backward-Euler step across it (one field solve per interval). At `1` the
+  window reduces to the straight carried-start → window-end ramp.
 - **Saturation** — `nonlin_model=1`, then sweep `I_sat` (log) down toward the
   operating current under two-way coupling: once saturation bites the iteration
   count climbs (operating-point / amplitude dependent, unlike the linear field).
@@ -178,16 +298,16 @@ unknown keys ignored; missing keys keep defaults). Run the solver directly:
   (Dirichlet–Neumann) coupling, then compare WR iteration counts (and whether it
   converges at all) against the default `precondition=1` for the same circuit —
   the fixpoint is identical, only the contraction rate changes. Match the source
-  to the port: an inductive port (series `L` to `p`, e.g. presets P1/P3) needs
+  to the port: an inductive port (series `L` to `p`, e.g. preset P5) needs
   `coupling_mode=1` so the circuit sees a voltage source; a pure current source
   in series with `L` is degenerate.
-- **Consistent vs inconsistent interface** — with the Thevenin interface
+- **Accumulated vs naive BDF-1/BE interface** — with the Thevenin interface
   (`precondition=1`, `interface_form=0`, either coupling direction), flip
-  `interface_consistency` from `0` (consistent) to `1`/`2`/`3` (inconsistent: real
-  RL / DDT / mean dt). The consistent scheme shares one secant denominator so the
-  `Lrom` terms cancel at convergence (true fixpoint); the inconsistent ones give
-  the live-iterate and lagged terms different denominators, so they no longer
-  cancel and the fixpoint **shifts** — the terminal **current** (`I_circuit` vs
+  `interface_consistency` from `0` (accumulated) to `1` (BDF-1/BE, naive: `R_ROM`
+  and `L_ROM` as real devices on the port). The accumulated scheme shares one
+  secant denominator so the `Lrom` terms cancel at convergence (true fixpoint);
+  the naive one gives the live-iterate and lagged terms different denominators, so
+  they no longer cancel and the fixpoint **shifts** — the terminal **current** (`I_circuit` vs
   `I_field`) under voltage-driven, the terminal **voltage** (`V_circuit` vs
   `V_field`) under current-driven. Compare the converged terminal values (and the
   WR iteration count) against `interface_consistency=0` on the same circuit — the

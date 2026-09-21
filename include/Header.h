@@ -61,12 +61,6 @@ struct SimConfig
     //   1 = current-driven: circuit sets I(Vmeas), field returns V_field; Bfield = plain V source.
     // Current-driven suits current-source circuits (no Lrom/t_floor secant -> no window-start spike).
     unsigned coupling_mode = 0;
-    // Field-voltage reconstruction within a window (current-driven mode). Both modes CARRY the
-    // window start = the previous window's end V_field (reused -> C0-continuous seam, no solve there):
-    //   0 = pointwise (default, secant): interior V from the accumulated secant (N field solves).
-    //   1 = linear: straight ramp carried-start -> window-end value (ONE field solve / window).
-    // The window-end value uses the accumulated window secant (I_end - I0)/dt_win.
-    unsigned reconstruct_mode = 0;
     // WR interface stamping (orthogonal to coupling_mode): how the field ROM's linearised V-I law
     // (the matched secant, Z = Rrom + Lrom/dt) enters the circuit. Algebraic DUALS -- same TERMINAL
     // fixpoint (the window-boundary V,I the WR metric checks), but the two stampings give a DIFFERENT
@@ -108,36 +102,30 @@ struct SimConfig
     //       NB: a constant Z is usually a WEAKER preconditioner (rho -> 1) -> slow; a loose Cauchy
     //       WR_tolerance can then stop early below the true fixpoint (tighten tol / add windows).
     unsigned use_t_floor = 1;
-    // Interface CONSISTENCY -- consistent (default) vs an INCONSISTENT split of the secant denominator,
-    // for studying whether the mismatched-denominator scheme is really worse. Scope: the Thevenin form
-    // (precondition=1, interface_form=0), BOTH coupling directions; ignored otherwise (falls back to the
-    // consistent emission). The FEM solvers are UNCHANGED (they keep their own accumulated secant and
-    // still produce vf_prev/i_prev); only the circuit-side Bfield stamping changes.
-    // Consistent (=0) shares ONE denominator dt for both currents in Z*(I(Vmeas) - i_prev), so the two
-    // Lrom/dt terms cancel at convergence -> true terminal fixpoint. Inconsistent (>0) splits it so the
-    // LIVE-iterate current term uses the circuit's own timestep dt_C while the LAGGED term keeps
+    // Interface CONSISTENCY -- ACCUMULATED (default) vs the NAIVE BDF-1/BE split of the secant
+    // denominator, for studying whether the mismatched-denominator scheme is really worse. Scope: the
+    // Thevenin form (precondition=1, interface_form=0), BOTH coupling directions; ignored otherwise
+    // (falls back to the accumulated emission). The FEM solvers are UNCHANGED (they keep their own
+    // accumulated secant and still produce vf_prev/i_prev); only the circuit-side Bfield stamping changes.
+    // ACCUMULATED (=0) shares ONE denominator dt for both currents in Z*(I(Vmeas) - i_prev), so the two
+    // Lrom/dt terms cancel at convergence -> true terminal fixpoint. NAIVE (=1) splits it so the
+    // LIVE-iterate current term uses the circuit's own BDF-1/BE timestep dt_C while the LAGGED term keeps
     // time - t_abs_start (= dtf, still honoring use_t_floor). The device lines are identical for both
     // coupling directions (only the PWL contents differ), so the SAME emission serves both, but the
     // shifted observable differs:
-    //   voltage-driven (coupling_mode=0): i_prev = I_field (FEM). Consistent cancels at I_C = I_field;
+    //   voltage-driven (coupling_mode=0): i_prev = I_field (FEM). Accumulated cancels at I_C = I_field;
     //     the split leaves I_C != I_field -> the terminal CURRENT shifts:
     //     V_C = V_field + Rrom*(I_C - I_field) + Lrom*(I_C - I0)/dt_C - Lrom*(I_field - I0)/dtf.
     //   current-driven (coupling_mode=1): i_prev = I(Vmeas)_{k-1} (lagged circuit current), vf_prev =
-    //     V_field. Consistent cancels at I_C^k = I_C^{k-1}; the split leaves, at the fixpoint,
+    //     V_field. Accumulated cancels at I_C^k = I_C^{k-1}; the split leaves, at the fixpoint,
     //     V_C = V_field + Lrom*(I_C - I0)*(1/dt_C - 1/dtf) -> the terminal VOLTAGE shifts (dual observable).
     // I0 = the carried window-start current (.PARAM I0). Either way the Lrom terms no longer cancel ->
-    // the fixpoint SHIFTS (the measured effect). The live-current term's dt_C is realized three ways:
-    //   0 = consistent (default): the single-denominator form, emitted byte-for-byte as before.
-    //   1 = inconsistent, REAL RL: Rrom + Lrom stamped as REAL Xyce devices in series on the port branch
+    // the fixpoint SHIFTS (the measured effect). Codes:
+    //   0 = ACCUMULATED (default): the single-denominator form, emitted byte-for-byte as before.
+    //   1 = NAIVE (BDF-1/BE): Rrom + Lrom stamped as REAL Xyce devices in series on the port branch
     //       (carrying I(Vmeas), Lrom IC={I0}); Bfield carries only the lagged correction. dt_C is then
-    //       Xyce's actual (adaptive) circuit timestep -- exact.
-    //   2 = inconsistent, DDT: circuit term = Lrom*DDT(I(Vmeas)) in the behavioral Bfield (Xyce time
-    //       derivative at the circuit step). Xyce DOES support DDT(), but this stamping (a voltage source
-    //       whose value depends on the derivative of its own branch current) is numerically fragile --
-    //       observed to step-collapse on the BFIELD branch and abort the transient (exit 256). Prefer the
-    //       real-RL realization (=1); mode 2 is kept for comparison but may not converge.
-    //   3 = inconsistent, MEAN dt: circuit term = Lrom*(I(Vmeas) - I0)/dt_print, dt_print = t_window/
-    //       N_xyce_samples (the existing .PARAM) -- a fixed representative mean step instead of dt_C.
+    //       Xyce's actual (adaptive) circuit timestep -- the genuine BDF-1/BE backward difference, not a
+    //       reconstruction. Any nonzero code selects this arm.
     unsigned interface_consistency = 0;
     // Window-seam handoff: how the carried terminal values (V0, I0 seeding the next window) are picked
     // from the converged iterate (the two solvers agree to within WR_tolerance there):
@@ -218,8 +206,8 @@ void MonolithicValidationSolve();
 void FEM_solver_voltage_driven_waveform(double I_win_start, unsigned N_field_eval_intervals);
 
 // Current-driven (Neumann) field solver: reads the interface current waveform I(t) from i_prev_k.pwl,
-// computes the field voltage V_field(t) = R_FEM*I + L_FEM*dI/dt (+ saturation) on the field-eval grid,
-// pointwise-secant or linear per reconstruct_mode, and writes it to vf_prev_k.pwl for the circuit's
+// computes the field voltage V_field(t) = R_FEM*I + L_FEM*dI/dt (+ saturation) pointwise on the
+// field-eval grid (local backward Euler), and writes it to vf_prev_k.pwl for the circuit's
 // Bfield voltage source. V_field_last_time = the field voltage carried from the previous window end.
 void FEM_solver_current_driven_waveform(double I_win_start, double V_field_last_time,
                                         unsigned N_field_eval_intervals);

@@ -49,6 +49,25 @@ MAIN_EXE = "main.exe" if os.name == "nt" else "main"
 def main_binary():
     return os.path.join(HERE, MAIN_EXE)
 
+
+# scripts/ holds the standalone analysis CLIs (x_P extraction, WR contraction factor). They are
+# plain files, not a package, so the studio loads them by path the way tests/ loads sim_ui itself;
+# the module name is registered in sys.modules because rho_contraction imports xp_extract by name.
+_SCRIPT_CACHE = {}
+
+
+def load_script(name):
+    """Import scripts/<name>.py as a module (cached)."""
+    if name not in _SCRIPT_CACHE:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            name, os.path.join(HERE, "scripts", name + ".py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        _SCRIPT_CACHE[name] = mod
+    return _SCRIPT_CACHE[name]
+
 # --- Parameter spec: (key, label, default, kind, slider min/max/step or None) ---
 # kind: "float" or "int". slider tuple => render a range slider alongside the box.
 PARAMS = [
@@ -71,8 +90,6 @@ PARAMS = [
         {0: "waveform L1", 1: "terminal scalar"}),
     ("coupling_mode",                   "Coupling direction",           0,        "choice",
         {0: "voltage-driven", 1: "current-driven"}),
-    ("reconstruct_mode",                "Field reconstruction",         0,        "choice",
-        {0: "pointwise (BDF-1)", 1: "linear ramp"}),
     ("interface_form",                  "Interface stamping",           0,        "choice",
         {0: "Thevenin (V source)", 1: "Norton (I source)"}),
     ("precondition",                    "Interface preconditioner",     1,        "choice",
@@ -80,8 +97,7 @@ PARAMS = [
     ("use_t_floor",                     "Secant denominator",           1,        "choice",
         {1: "floored (guard 1/0)", 0: "bare dt", 2: "constant (Lrom/t_floor)"}),
     ("interface_consistency",           "Interface condition",          0,        "choice",
-        {0: "consistent (matched dt)", 1: "inconsistent: real RL", 2: "inconsistent: DDT",
-         3: "inconsistent: mean dt"}),
+        {0: "accumulated", 1: "BDF-1/BE (naive)"}),
     ("t_floor_frac",                    "t_floor / window",             0.01,     "float", None),
     ("seam_average",                    "Window-seam handoff",          0,        "choice",
         {0: "one-sided (V<-ckt, I<-fld)", 1: "midpoint (average)"}),
@@ -91,6 +107,8 @@ PARAMS = [
     ("xyce_integration_method",         "Xyce integration method",      0,        "choice",
         {0: "trap (Xyce default)", 1: "Backward-Euler (maxord=1)", 2: "Trap only (minord=2)",
          3: "Gear", 4: "Gear2 only (minord=2)"}),
+    ("reference_overlay",               "Monolithic reference",         0,        "choice",
+        {0: "off", 1: "overlay on plots"}),
 ]
 DEFAULTS = {k: d for (k, _l, d, _kind, _s) in PARAMS}
 KINDS = {k: kind for (k, _l, _d, kind, _s) in PARAMS}
@@ -99,6 +117,10 @@ LABELS = {k: l for (k, l, _d, _kind, _s) in PARAMS}
 CHOICES = {k: s for (k, _l, _d, kind, s) in PARAMS if kind == "choice"}
 # Numeric params are sweepable (a "choice" metric switch is not a continuum).
 SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
+# Studio-only switches: they drive what the UI does with a run, not what the solver computes, so they
+# must NOT reach sim_config.txt as real lines (the C++ LoadConfig would log "unknown key ... ignored").
+# write_config round-trips them as "# ui:" comments instead; LoadConfig strips everything after '#'.
+UI_ONLY = {"reference_overlay"}
 
 # Circuit-side presets (hybrid model): a preset seeds the editable primitive fields; the user
 # may then tweak any field. Increment 1 covers the three source kinds + series R/L; presets 4-6
@@ -107,33 +129,43 @@ SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
 # side is a simplified spec: reserved nodes p=port, 0=gnd; one element/line (VSIN/ISIN/VPULSE/R/L/C and
 # SW name a b tclose topen [Ron Roff trise]).
 PRESETS = {
-    "P1: Sine V + RL": {"coupling_mode": 0,
-                        "circuit_spec": "VSIN Bemf s 0 1 50\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
+    # Series R+L feeding the port with a shunt C across it; the field (R_FEM + L_FEM) is the main
+    # inductance, so the loop is an RLC. Note this field is ~4 decades larger than the other presets'
+    # 168 nH coil, and the ROM is deliberately 10% BELOW the FEM (0.9 mH / 0.9 Ohm vs 1 mH / 1 Ohm):
+    # the interface secant is then an imperfect preconditioner, which is the realistic case -- a ROM
+    # never matches the true field exactly. Two undamped resonances sit well above the 2 kHz drive:
+    # the field against C at 1/(2*pi*sqrt(L_FEM*C)) = 20 kHz, and the source branch L_s against C at
+    # 284 kHz with Q = sqrt(L_s/C)/R_s ~ 18. Neither is excited by the smooth sine drive (measured: no
+    # spectral content above 50 kHz); they would ring if the source were switched.
+    "P1: RLC (sine U, series RL, shunt C)": {"t_end": 2.0e-3, "N_field_windows": 100,
+        "coupling_mode": 0, "WRmaxSteps": 40,
+        "L_FEM": 1.0e-3, "R_FEM": 1.0, "L_ROM": 0.9e-3, "R_ROM": 0.9,
+        "circuit_spec": "VSIN Bemf s 0 1 2000\nR Rs s a 0.5\nL Ls a p 5e-6\nC Cs p 0 63e-9\n"},
     # Bare current source directly on the port: series R/L/C are meaningless for a current drive
     # (the current is forced regardless) and an ideal I-source in series with L is degenerate.
     "P2: Sine I (bare)": {"coupling_mode": 1,
                           "circuit_spec": "ISIN Bemf 0 p 1 50\n"},
-    # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters (WRmaxSteps=40)
-    "P3: Step/ramp V + RL": {"t_end": 2.0e-2, "N_field_windows": 50,
-                             "coupling_mode": 0, "WRmaxSteps": 40,
-                             "circuit_spec": "VPULSE Vemf s 0 0 1 0 1e-4\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
     # Switch circuits (SW = time-gated switch, closed during [tclose, topen); emitted as a Xyce native
     # Generic Switch, S device + .MODEL SWITCH). 2-way (SPDT) switch: wiper w throws between the source
     # branch (node a, drv closed early) and the freewheel branch (fw closed after), with cap w->0.
-    # P4 freewheels directly w->p; P5 via a short branch (node b -> R shrt -> p). Ron/C set the damping:
+    # P3 and P6 share that topology and differ only in the source (sine / DC); Ron/C set the damping --
     # an undamped cap<->coil freewheel driven on resonance rings hard (see the validation-vs-cosim study).
-    "P4: 2-way switch (sine U, C)": {"t_end": 1.6e-3, "N_field_windows": 100,
+    "P3: 2-way switch (sine U, C)": {"t_end": 1.6e-3, "N_field_windows": 100,
         "coupling_mode": 0, "WRmaxSteps": 40, "L_FEM": 1.68e-7, "R_FEM": 5e-4,
         "circuit_spec": "VSIN Bemf a p 1 20000\nC Csw 0 w 0.37e-3\n"
                         "SW drv w a 0 1e-3 1e-3 1e12 0.1e-3\nSW fw w p 1e-3 1e30 1e-3 1e12 0.1e-3\n"},
-    "P5: 2-way switch (DC U, C)": {"t_end": 1.6e-3, "N_field_windows": 100,
-        "coupling_mode": 0, "WRmaxSteps": 40, "L_FEM": 1.68e-7, "R_FEM": 5e-4,
-        "circuit_spec": "VDC Vemf a p 1\nC Csw 0 w 0.37e-3\n"
-                        "SW drv w a 0 1e-3 1e-3 1e12 0.1e-3\nSW fw w p 1e-3 1e30 1e-3 1e12 0.1e-3\n"},
-    "P6: 2-way switch (AC vs R)": {"t_end": 2.0e-2, "N_field_windows": 50,
+    "P4: 2-way switch (AC vs R)": {"t_end": 2.0e-2, "N_field_windows": 50,
         "coupling_mode": 0, "WRmaxSteps": 40,
         "circuit_spec": "VSIN Bemf p bac 1 50\nR Rload p br 1e4\n"
                         "SW ac bac 0 0 6e-3 1e-3 1e9 1e-5\nSW rd br 0 6e-3 1e30 1e-3 1e9 1e-5\n"},
+    # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters (WRmaxSteps=40)
+    "P5: Step/ramp V + RL": {"t_end": 2.0e-2, "N_field_windows": 50,
+                             "coupling_mode": 0, "WRmaxSteps": 40,
+                             "circuit_spec": "VPULSE Vemf s 0 0 1 0 1e-4\nR Rs s cm0 6e-3\nL Ls cm0 p 1.6e-7\n"},
+    "P6: 2-way switch (DC U, C)": {"t_end": 1.6e-3, "N_field_windows": 100,
+        "coupling_mode": 0, "WRmaxSteps": 40, "L_FEM": 1.68e-7, "R_FEM": 5e-4,
+        "circuit_spec": "VDC Vemf a p 1\nC Csw 0 w 0.37e-3\n"
+                        "SW drv w a 0 1e-3 1e-3 1e12 0.1e-3\nSW fw w p 1e-3 1e30 1e-3 1e12 0.1e-3\n"},
 }
 
 
@@ -143,25 +175,25 @@ PRESETS = {
 # Conditional visibility: key -> list of AND-condition dicts; a control is shown iff ANY dict fully
 # matches the current control values (OR-of-ANDs). Keys absent here are always visible. The circuit
 # side is always the custom node-graph spec (circuit_spec.txt); the run is absolute-end-time only
-# ("Sim duration" = t_end). What remains conditional: N_field_eval_intervals only matters for the
-# pointwise (BDF-1) reconstruction (0) -- linear (1) forces 1 solve/window and ignores it -- so it's
-# shown only then. t_floor_frac only matters when the secant t_floor guard is on (use_t_floor=1);
+# ("Sim duration" = t_end). What remains conditional: t_floor_frac only matters when the secant
+# t_floor guard is on (use_t_floor=1);
 # with bare dt (0) the floor is irrelevant. validation_mode=1 (monolithic reference: the true field
 # stamped as real R_FEM/L_FEM devices, one Xyce transient, no WR) makes the whole WR/coupling/secant
 # machinery irrelevant, so those controls are disabled while it is on -- only t_end/windows/samples
 # (the tran grid), R_FEM/L_FEM (the devices) and the nonlinearity fields stay live.
 VISIBLE_WHEN = {
-    "N_field_eval_intervals": [{"reconstruct_mode": [0], "validation_mode": [0]}],
+    "N_field_eval_intervals": [{"validation_mode": [0]}],
     "t_floor_frac":           [{"use_t_floor": [1, 2], "validation_mode": [0], "precondition": [1]}],
     "coupling_mode":          [{"validation_mode": [0]}],
-    "reconstruct_mode":       [{"validation_mode": [0]}],
     # interface_form / t_floor / the secant ROM impedance only exist when the preconditioner is on.
     "interface_form":         [{"validation_mode": [0], "precondition": [1]}],
     "use_t_floor":            [{"validation_mode": [0], "precondition": [1]}],
-    # inconsistent split is the Thevenin form (both coupling directions).
+    # the naive BDF-1/BE split is the Thevenin form (both coupling directions).
     "interface_consistency":  [{"validation_mode": [0], "precondition": [1], "interface_form": [0]}],
     "precondition":           [{"validation_mode": [0]}],
     "seam_average":           [{"validation_mode": [0]}],
+    # In validation mode the run already IS the monolithic reference -- nothing to overlay against.
+    "reference_overlay":      [{"validation_mode": [0]}],
     "wr_convergence_method":  [{"validation_mode": [0]}],
     "WRmaxSteps":             [{"validation_mode": [0]}],
     "WR_tolerance":           [{"validation_mode": [0]}],
@@ -252,6 +284,31 @@ HELP = {
         "outside the swept range are skipped. On the WR-iterations heatmap and line plots the line marks "
         "that x-location; on grid heatmaps it's drawn on the first (x) parameter axis.</div>"
     ),
+    "xp_panel": (
+        "<div class='hh'>A-priori estimate (port impedance)</div>"
+        "<div class='hn'><b>x<sub>P</sub>(f)</b> is the impedance the field sees looking INTO the circuit "
+        "at the interface, with the circuit's own sources zeroed: the port voltage response to 1 A "
+        "injected at the port. It is computed by a Xyce <code>.AC</code> sweep of a probe deck built "
+        "from your circuit spec &mdash; passives kept, voltage sources shorted, current sources removed, "
+        "the whole field branch (R<sub>ROM</sub>/L<sub>ROM</sub>/B<sub>field</sub>) replaced by the "
+        "1 A injection. Time-gated <code>SW</code> elements are frozen to R<sub>on</sub>/R<sub>off</sub> "
+        "at <b>switch t</b>, since an AC analysis needs a time-invariant circuit.</div>"
+        "<div class='hn'><b>&rho;(f)</b> = (1 + &beta;x<sub>P</sub>)<sup>-1</sup>(&beta; &minus; Y)"
+        "x<sub>P</sub> is the WR contraction factor, with the ROM admittance "
+        "&beta; = 1/(R<sub>ROM</sub> + j&omega;L<sub>ROM</sub>) and the true field admittance "
+        "Y = 1/(R<sub>FEM</sub> + j&omega;L<sub>FEM</sub>). <code>|&rho;| &lt; 1</code> over the band the "
+        "circuit actually excites is the a-priori statement that the iteration contracts; "
+        "&rho; &equiv; 0 when the ROM matches the field exactly.</div>"
+        "<div class='hn'><b>Update &rho; only</b> re-runs the formula against the stored x<sub>P</sub> "
+        "with the current R/L values &mdash; no Xyce solve. Both sweeps are saved to the CSV paths "
+        "below (leave one blank to skip it); the same two steps are available outside the studio as "
+        "<code>scripts/xp_extract.py</code> and <code>scripts/rho_contraction.py</code>.</div>"
+        "<div class='hn'>Sanity checks are printed under the buttons: at low f, |x<sub>P</sub>| must "
+        "match the network's DC resistance (for a series-R port, R<sub>s</sub>), computed independently "
+        "of Xyce; with a capacitor across the port, |x<sub>P</sub>| at <b>f stop</b> must have fallen to "
+        "that capacitor's own |Z<sub>C</sub>| = 1/(2&pi;fC). A sweep that stops below the port resonance "
+        "reports INCONCLUSIVE rather than a failure &mdash; raise <b>f stop</b>.</div>"
+    ),
     "lcapy_export": (
         "<div class='hh'>LaTeX / PDF export</div>"
         "<div class='hn'>Downloads the schematic as <code>circuit.tex</code> (a standalone circuitikz "
@@ -269,25 +326,6 @@ HELP = {
         "window count is set to <code>round(t_end / width)</code> (&ge;1), then the width snaps to the true "
         "<code>t_end / N</code> (it may not divide evenly). Narrower windows = more windows = more "
         "checkpoint/restart seams but easier per-window WR convergence.</div>"
-    ),
-    "reconstruct_mode": (
-        "<div class='hh'>Field reconstruction</div>"
-        "<div class='hn'>How the dummy field reconstructs its output waveform within a window &mdash; the "
-        "field <b>current</b> (voltage-driven) or the field <b>voltage</b> (current-driven).</div>"
-        "<table>"
-        "<tr><th>mode</th><th>reconstruction</th><th>solves/win</th><th>note</th></tr>"
-        "<tr><td>pointwise (BDF-1)</td><td>value at each field node via a local backward-Euler step</td>"
-        "<td>N_field_eval</td><td>curve-following; a proper field-ODE integration</td></tr>"
-        "<tr><td>linear ramp</td><td>straight line carried-start &rarr; window-end</td>"
-        "<td><b>1</b></td><td>cheapest; pure coupling reconstruction</td></tr>"
-        "</table>"
-        "<div class='hn'><b>pointwise (BDF-1)</b> with <code>FEM eval intervals / window = 1</code> "
-        "collapses to <b>linear ramp</b>: one interval leaves only the carried start and the window end, "
-        "so the single backward-Euler step is one straight segment. Raise the eval intervals for it to "
-        "actually follow the curve.</div>"
-        "<div class='hn'>Both coupling directions. Both modes carry the seam (C0-continuous). Accuracy is "
-        "within ~1&ndash;2% between them; the extra solves buy little. Recommend <b>linear</b> "
-        "(1 field solve per window).</div>"
     ),
     "interface_form": (
         "<div class='hh'>Interface stamping (Thevenin vs Norton)</div>"
@@ -348,17 +386,17 @@ HELP = {
         "early below the true fixpoint (tighten WR_tolerance / add windows).</div>"
     ),
     "interface_consistency": (
-        "<div class='hh'>Interface condition: consistent vs inconsistent secant denominator</div>"
+        "<div class='hh'>Interface condition: accumulated vs naive BDF-1/BE secant denominator</div>"
         "<div class='hn'>A study knob for the <b>Thevenin</b> interface (precondition=on, "
         "stamping=Thevenin), <b>both coupling directions</b>; ignored otherwise. The FEM side is "
         "unchanged.<br>"
-        "<b>consistent</b> (default): one denominator dt for both currents in "
+        "<b>accumulated</b> (default): one denominator dt for both currents in "
         "Z&middot;(I(Vmeas)&minus;i_prev), so the two Lrom/dt terms cancel at convergence &rarr; the true "
         "terminal fixpoint.<br>"
-        "<b>inconsistent</b>: split the denominator &mdash; the <b>live-iterate</b> circuit-current term "
-        "uses the circuit's own timestep dt_C, the <b>lagged</b> term keeps time&minus;t_abs_start (= dtf, "
-        "still honoring the secant-denominator choice). Same emission both directions; the shifted "
-        "observable differs:<br>"
+        "<b>BDF-1/BE (naive)</b>: split the denominator &mdash; the <b>live-iterate</b> circuit-current "
+        "term uses the circuit's own BDF-1/BE timestep dt_C, the <b>lagged</b> term keeps "
+        "time&minus;t_abs_start (= dtf, still honoring the secant-denominator choice). Same emission both "
+        "directions; the shifted observable differs:<br>"
         "&nbsp;&nbsp;<b>voltage-driven</b>: i_prev = I_field, so "
         "V_C = V_F + Rrom&middot;(I_C&minus;I_F) + Lrom&middot;(I_C&minus;I0)/dt_C &minus; "
         "Lrom&middot;(I_F&minus;I0)/dtf &rarr; the terminal <b>current</b> shifts (I_circuit vs I_field).<br>"
@@ -366,16 +404,12 @@ HELP = {
         "V_C = V_field + Lrom&middot;(I_C&minus;I0)&middot;(1/dt_C &minus; 1/dtf) &rarr; the terminal "
         "<b>voltage</b> shifts (V_circuit vs V_field).<br>"
         "The denominators differ &rarr; the Lrom terms no longer cancel &rarr; the fixpoint <b>shifts</b> "
-        "(the effect being measured). dt_C is realized three ways:<br>"
-        "<b>real RL</b>: Rrom+Lrom as real Xyce devices on the port (Lrom IC=I0) &mdash; dt_C is Xyce's "
-        "actual adaptive step (exact). Bfield carries only the field-side correction, and its inductive "
-        "term reads the field-grid BDF-1 derivative di_F/dt (didt_field_k.pwl) directly &mdash; so it "
-        "stays exact for &gt;1 FEM eval per window (no anchored secant).<br>"
-        "<b>DDT</b>: circuit term = Lrom&middot;DDT(I(Vmeas)). Xyce supports DDT, but this stamping is "
-        "<b>numerically fragile</b> &mdash; it tends to step-collapse on the Bfield branch and may abort "
-        "the transient; prefer <b>real RL</b>. Kept for comparison.<br>"
-        "<b>mean dt</b>: circuit term over dt_print = t_window/N_xyce_samples &mdash; a fixed "
-        "representative step instead of the true dt_C.</div>"
+        "(the effect being measured). dt_C is realized with <b>real devices</b>: Rrom+Lrom are stamped as "
+        "real Xyce devices on the port branch (Lrom IC=I0), so dt_C is Xyce's actual adaptive step and the "
+        "inductive term is the genuine BDF-1/BE backward difference &mdash; not a reconstruction. Bfield "
+        "then carries only the field-side correction, whose inductive term reads the field-grid BDF-1 "
+        "derivative di_F/dt (didt_field_k.pwl) directly &mdash; exact for &gt;1 FEM eval per window (no "
+        "anchored secant).</div>"
     ),
     "t_floor_frac": (
         "<div class='hh'>t_floor as a fraction of the window</div>"
@@ -410,6 +444,21 @@ HELP = {
         "reproduces it. WR/coupling/secant knobs are disabled here (irrelevant) and the convergence plot "
         "is empty. Linear field only &mdash; magnetic saturation is ignored (a plain inductor can't "
         "reproduce the flux law).</div>"
+    ),
+    "reference_overlay": (
+        "<div class='hh'>Monolithic reference overlay</div>"
+        "<div class='hn'>Adds the monolithic reference to the <b>Interface voltage</b> and <b>Interface "
+        "current</b> plots as a dotted black curve, so the coupled solution can be read against the truth "
+        "on the same axes instead of by flipping between two runs.<br>"
+        "The reference is the same circuit re-solved with <b>Validation mode = monolithic</b> "
+        "(<code>R_FEM</code> + <code>L_FEM</code> as real devices, one transient over [0, t_end]); every "
+        "other parameter is left exactly as set, so the two curves are comparable. Its print grid is "
+        "already <code>N_field_windows &times; N_xyce_samples</code>, i.e. the coupled run's total "
+        "resolution.<br>"
+        "<b>Costs one extra full solve per run</b> (it runs in its own temp directory, so nothing in the "
+        "working folder is overwritten). If it fails, the overlay is simply dropped and a note appears in "
+        "the log. Same caveat as validation mode: the reference is a <b>linear</b> field, so with "
+        "<b>nonlin_model = saturating</b> it is not the truth the coupled run is converging to.</div>"
     ),
     "wr_convergence_method": (
         "<div class='hh'>WR convergence metric</div>"
@@ -469,16 +518,31 @@ HELP = {
 }
 
 
+def _ui_flag(params, key):
+    """Truthiness of a 0/1 choice param coming back from the form (values arrive as strings)."""
+    try:
+        return int(round(float(params.get(key, DEFAULTS.get(key, 0))))) != 0
+    except (TypeError, ValueError):
+        return False
+
+
 def write_config(params, workdir=HERE):
     path = os.path.join(workdir, "sim_config.txt")
     with open(path, "w") as f:
         f.write("# generated by sim_ui.py\n")
         for k in DEFAULTS:
+            if k in UI_ONLY:
+                continue
             v = params.get(k, DEFAULTS[k])
             if KINDS[k] in ("int", "choice"):
                 f.write(f"{k} = {int(round(float(v)))}\n")
             else:
                 f.write(f"{k} = {float(v):.10g}\n")
+        for k in sorted(UI_ONLY):                 # studio-only switches, hidden from the solver
+            v = params.get(k, DEFAULTS[k])
+            val = (f"{int(round(float(v)))}" if KINDS[k] in ("int", "choice")
+                   else f"{float(v):.10g}")
+            f.write(f"# ui: {k} = {val}\n")
         # The circuit side is always authored via the text spec (circuit_spec.txt); the C++ generator
         # reads circuit_spec.txt directly, so no circuit-kind/source keys are needed here.
     return path
@@ -494,7 +558,9 @@ def read_config():
         return cfg
     with open(path) as f:
         for line in f:
-            s = line.split("#", 1)[0].strip()
+            raw = line.strip()
+            # "# ui: key = value" carries a studio-only switch past the solver (see write_config).
+            s = raw[5:].strip() if raw.startswith("# ui:") else line.split("#", 1)[0].strip()
             if "=" not in s:
                 continue
             k, v = (x.strip() for x in s.split("=", 1))
@@ -656,11 +722,11 @@ def _lcapy_records(parsed, params):
         elif t == "resistor" and expr.strip().startswith("R="):
             emit(f"SW{u} {a} {b}", a, b)                      # behavioral gate -> switch
         elif t == "resistor":
-            emit(f"R{u} {a} {b} {val(expr)}", a, b)
+            emit(f"R{u} {a} {b} {num(val(expr))}", a, b)
         elif t == "inductor":
-            emit(f"L{u} {a} {b} {val(expr)}", a, b)
+            emit(f"L{u} {a} {b} {num(val(expr))}", a, b)
         elif t == "capacitor":
-            emit(f"C{u} {a} {b} {val(expr)}", a, b)
+            emit(f"C{u} {a} {b} {num(val(expr))}", a, b)
         elif nm[:1].upper() == "S":                           # native VC switch device
             emit(f"SW{u} {a} {b}", a, b)
         elif t in ("behavioral V", "voltage src"):
@@ -681,6 +747,13 @@ def _lcapy_records(parsed, params):
 # orthogonal placement + wire-routing engine -- and drawn with circuitikz (LaTeX), so the inline PNG
 # and the LaTeX/PDF export are the SAME render for every topology. Nets are ELK nodes; each 2-terminal
 # element is an ELK edge whose routed polyline becomes the wire, with the component symbol placed on it.
+# Drawn length of a component symbol, in cm. circuitikz sizes a bipole from \ctikzvalof{bipoles/length}
+# and draws it CENTRED on its path at that natural size -- so if the path we hand it is shorter, the lead
+# wires poke back inside the symbol (visible as a line straight through the european resistor box). Keep
+# this equal to the bipoles/length set in the preamble so the leads are exactly zero-length.
+_DEV_LEN_CM = 1.4
+
+
 def _ck_component(rec):
     """(circuitikz to[] type, label) for a device record."""
     dev = rec["line"].split()[0]
@@ -747,7 +820,7 @@ def _elk_layout(recs, gnd="0", port="p"):
 # convention (y DOWN, ~40 px = 1 cm); `routes` are per-element orthogonal polylines keyed by the
 # element's unordered node pair (the component symbol lands on the polyline's longest segment).
 _MANUAL_LAYOUTS = {
-    # P1 / P3: source(left) - R - L - port; interface (ammeter over field ROM) on the right.
+    # P5: source(left) - R - L - port; interface (ammeter over field ROM) on the right.
     frozenset({"s", "cm0", "p", "nx", "0"}): {
         "nets": {"s": (0, 0), "cm0": (120, 0), "p": (240, 0), "nx": (240, 120), "0": (120, 240)},
         "routes": {frozenset({"s", "0"}): [(0, 0), (0, 240), (120, 240)],
@@ -759,7 +832,20 @@ _MANUAL_LAYOUTS = {
         "routes": {frozenset({"0", "p"}): [(0, 0), (0, 120), (60, 120)],
                    frozenset({"nx", "0"}): [(120, 0), (120, 120), (60, 120)]},
         "size": (120, 120)},
-    # P4 / P5: SPDT wiper w (cap w->gnd) throws between the source branch (a, up) and the freewheel
+    # P1 (RLC): source column (left) - R then L along the top rail - port; the shunt C drops from the
+    # port and the interface column sits to its right, so p is a 3-way junction (L in, C down, ammeter
+    # across). The intermediate node is `a` (not `cm0`) so this key cannot collide with P5's
+    # source-R-L-port set, whose layout has no shunt branch and would route the C diagonally.
+    # Ground sits directly under the shunt C, so the cap's bottom leg runs straight into the ground
+    # symbol and the source/field returns meet it along the rail from either side.
+    frozenset({"s", "a", "p", "nx", "0"}): {
+        "nets": {"s": (0, 0), "a": (120, 0), "p": (240, 0), "nx": (360, 120), "0": (240, 360)},
+        "routes": {frozenset({"s", "0"}): [(0, 0), (0, 360), (240, 360)],
+                   frozenset({"p", "0"}): [(240, 0), (240, 360)],
+                   frozenset({"p", "nx"}): [(240, 0), (360, 0), (360, 120)],
+                   frozenset({"nx", "0"}): [(360, 120), (360, 360), (240, 360)]},
+        "size": (360, 360)},
+    # P3 / P6: SPDT wiper w (cap w->gnd) throws between the source branch (a, up) and the freewheel
     # straight to the port (fw: w->p); same topology, source differs (sine / DC). Interface on the right.
     frozenset({"a", "w", "p", "nx", "0"}): {
         "nets": {"w": (40, 120), "a": (160, 40), "p": (300, 120),
@@ -770,7 +856,7 @@ _MANUAL_LAYOUTS = {
                    frozenset({"a", "p"}): [(160, 40), (300, 40), (300, 120)],
                    frozenset({"nx", "0"}): [(420, 120), (420, 240), (330, 240)]},
         "size": (420, 240)},
-    # P6: two parallel branches from port p to gnd -- (V + switch) and (R + switch) -- plus the
+    # P4: two parallel branches from port p to gnd -- (V + switch) and (R + switch) -- plus the
     # interface (ammeter + field ROM) as the third column. Top rail = p, bottom rail = gnd.
     # Verticals are 140 (> the 120 top-rail reach) so each column's device (V / R / ammeter) lands on
     # its vertical segment at the same height, not up on the top rail.
@@ -784,26 +870,121 @@ _MANUAL_LAYOUTS = {
 }
 
 
+# The naive (BDF-1/BE) interface condition stamps Rrom+Lrom as REAL devices, inserting extra series nets
+# into the interface column (p - nx - nrc - nlc - 0) that the preset keys above don't know about. Rather
+# than duplicating every preset layout per interface variant, the preset is matched WITHOUT those nets and
+# the column is stretched back out: one row per inserted net down the nx column, with the bottom (ground)
+# rail dropping by the same amount so the circuit side keeps its shape.
+_IFACE_EXTRA_NETS = ("nrc", "nlc")
+_ROW = 120                                                 # one layout row, ELK px (~40 px = 1 cm)
+
+
+def _iface_chain(recs, extras, start="nx", gnd="0"):
+    """Order `extras` along the series chain start -> ... -> gnd, or None if they don't form one."""
+    adj = {}
+    for r in recs:
+        a, b = r["nodes"]
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+    chain, cur, left = [], start, set(extras)
+    while left:
+        nxt = next((n for n in adj.get(cur, []) if n in left), None)
+        if nxt is None:
+            return None
+        chain.append(nxt); left.discard(nxt); cur = nxt
+    return chain if gnd in adj.get(cur, []) else None
+
+
+def _stretch_iface_column(P, routes, H, chain, start="nx", gnd="0"):
+    """Open len(chain) extra rows in the interface column: drop the bottom rail (every point at the old
+    height H) and hang the chain nets off `start`, re-routing start -> ... -> gnd as one straight column.
+    Mutates P/routes in place; returns the new height."""
+    drop = _ROW * len(chain)
+    for xy in P.values():
+        if xy[1] >= H:
+            xy[1] += drop
+    for poly in routes.values():
+        for pt in poly:
+            if pt[1] >= H:
+                pt[1] += drop
+    x, y = P[start]
+    for i, n in enumerate(chain):
+        P[n] = [x, y + _ROW * (i + 1)]
+    routes.pop(frozenset((start, gnd)), None)              # the old one-element nx->0 drop
+    prev = start
+    for n in chain:
+        routes[frozenset((prev, n))] = [list(P[prev]), list(P[n])]
+        prev = n
+    tail = [list(P[prev]), [x, H + drop]]                  # down the column, then along the ground rail
+    if P[gnd] != tail[-1]:
+        tail.append(list(P[gnd]))
+    routes[frozenset((prev, gnd))] = tail
+    return H + drop
+
+
 def _manual_layout(recs):
-    """Hand-placed layout for a known preset topology, matched by its physical net-name set; returns
-    the same {nets, routes, size} shape as `_elk_layout`, or None (unknown/edited circuit -> ELK)."""
+    """Hand-placed layout for a known preset topology, matched by its physical net-name set (the extra
+    nets of a naive-BDF-1 interface column are matched out, then stretched back in); returns the same
+    {nets, routes, size} shape as `_elk_layout`, or None (unknown/edited circuit -> ELK)."""
     present = frozenset(n for r in recs for n in r["nodes"])
-    spec = _MANUAL_LAYOUTS.get(present)
+    extras = [n for n in _IFACE_EXTRA_NETS if n in present]
+    spec = _MANUAL_LAYOUTS.get(present - frozenset(extras))
     if spec is None:
         return None
-    P = spec["nets"]
+    P = {k: list(v) for k, v in spec["nets"].items()}
+    polys = {k: [list(pt) for pt in v] for k, v in spec["routes"].items()}
+    W, H = spec["size"]
+    if extras:
+        chain = _iface_chain(recs, extras)
+        if chain is None:
+            return None
+        H = _stretch_iface_column(P, polys, H, chain)
     if any(n not in P for r in recs for n in r["nodes"]):
         return None
     routes = {}
     for i, r in enumerate(recs):
         a, b = r["nodes"]
-        poly = spec["routes"].get(frozenset((a, b)))
+        poly = polys.get(frozenset((a, b)))
         if poly is None:
             poly = [P[a], P[b]]                            # axis-aligned pair -> straight wire
         elif list(poly[0]) != list(P[a]):
             poly = poly[::-1]                              # orient a->b (keeps source polarity sane)
         routes[f"c{i}"] = [list(pt) for pt in poly]
-    return {"nets": {k: list(v) for k, v in P.items()}, "routes": routes, "size": list(spec["size"])}
+    return {"nets": P, "routes": routes, "size": [W, H]}
+
+
+def _wire_junctions(polylines):
+    """Points where three or more distinct wire segments meet, EXCLUDING the plain corners of a single
+    route. Net positions are dotted by their connection count (below); this catches the joins that land
+    between them -- a branch dropping onto the middle of a shared rail, where the rail wire continues
+    past the join. Without a dot there the drawing reads as two wires crossing, not connecting.
+    Routes are orthogonal, so only axis-aligned overlap has to be considered."""
+    import collections
+    segs = set()
+    for poly in polylines:
+        for a, b in zip(poly, poly[1:]):
+            a, b = tuple(a), tuple(b)
+            if a != b:
+                segs.add(tuple(sorted((a, b))))     # undirected; overlapping routes collapse to one
+    pts = {p for seg in segs for p in seg}
+
+    def interior(p, a, b):
+        if p == a or p == b:
+            return False
+        if a[0] == b[0] == p[0]:
+            return min(a[1], b[1]) < p[1] < max(a[1], b[1])
+        if a[1] == b[1] == p[1]:
+            return min(a[0], b[0]) < p[0] < max(a[0], b[0])
+        return False
+
+    # Split every segment at the points lying inside it, then count how many pieces touch each point.
+    deg = collections.Counter()
+    for a, b in segs:
+        cuts = sorted({a, b} | {p for p in pts if interior(p, a, b)})
+        for u, v in zip(cuts, cuts[1:]):
+            deg[u] += 1
+            deg[v] += 1
+    return {p for p, d in deg.items() if d >= 3}
 
 
 def _circuitikz(recs, gnd="0", port="p"):
@@ -836,7 +1017,7 @@ def _circuitikz(recs, gnd="0", port="p"):
         a, b = pts[k], pts[k + 1]
         L = seg[k] or 1e-9
         ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
-        cl = min(L, 1.0)                                  # component drawn length (cm)
+        cl = min(L, _DEV_LEN_CM)                          # component drawn length (cm)
         mx, my = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
         c0 = (mx - ux * cl / 2, my - uy * cl / 2)
         c1 = (mx + ux * cl / 2, my + uy * cl / 2)
@@ -848,12 +1029,20 @@ def _circuitikz(recs, gnd="0", port="p"):
         if len(post) >= 2:
             body.append("\\draw " + " -- ".join(ps(p) for p in post) + ";")
     deg = collections.Counter(n for r in recs for n in r["nodes"])
+    placed = set()
     for n, xy in P.items():
         pt = ps(T(xy))
+        placed.add(tuple(xy))
+        # A ground net can itself be a 3-way join (rail in from both sides plus a branch dropping on
+        # it): dot it as well, then stack the ground symbol on top.
+        if deg[n] >= 3:
+            body.append(f"\\draw {pt} node[circ]{{}};")
         if n == gnd:
             body.append(f"\\draw {pt} node[ground]{{}};")
-        elif deg[n] >= 3:
-            body.append(f"\\draw {pt} node[circ]{{}};")
+    # Joins that fall between net positions (a branch meeting a rail the wire continues along).
+    routes = [R.get(f"c{i}") or [P[r["nodes"][0]], P[r["nodes"][1]]] for i, r in enumerate(recs)]
+    for xy in sorted(_wire_junctions(routes) - placed):
+        body.append(f"\\draw {ps(T(xy))} node[circ]{{}};")
     return "\\begin{circuitikz}\n" + "\n".join(body) + "\n\\end{circuitikz}"
 
 
@@ -862,8 +1051,13 @@ def _compile_circuitikz(tikz):
     Degrades gracefully: returns the .tex even if pdflatex/converters are missing."""
     import tempfile
     import subprocess
-    tex = ("\\documentclass[border=4pt]{standalone}\n\\usepackage{circuitikz}\n"
-           "\\usepackage{textcomp}\n\\begin{document}\n" + tikz + "\n\\end{document}\n")
+    # european R/L footprints (IEC box resistor, solid-bar inductor); sources stay american so the
+    # sinusoidal source keeps its ~ glyph.
+    tex = ("\\documentclass[border=4pt]{standalone}\n"
+           "\\usepackage[europeanresistor, europeaninductor]{circuitikz}\n"
+           "\\usepackage{textcomp}\n"
+           f"\\ctikzset{{bipoles/length={_DEV_LEN_CM}cm}}\n"
+           "\\begin{document}\n" + tikz + "\n\\end{document}\n")
     d = tempfile.mkdtemp()
     with open(os.path.join(d, "c.tex"), "w") as f:
         f.write(tex)
@@ -993,6 +1187,37 @@ def read_outputs(workdir=HERE):
     return out
 
 
+def run_reference(params):
+    """Solve the monolithic reference (validation_mode=1, real R_FEM/L_FEM devices) for the SAME
+    circuit and timing, and return its interface waveforms {"t", "V", "I"} for overlay on the
+    co-simulation plots. Costs one extra full solve.
+
+    Runs in its own temp directory so the co-simulation run's outputs in HERE are never clobbered --
+    validation mode writes the same Circuit_solution.prn / Field_*.prn names. Returns None if the
+    reference solve fails or produces nothing, so the caller just plots without it."""
+    d = tempfile.mkdtemp(prefix="wr_ref_")
+    try:
+        for fn in ("circuit_spec.txt", "probes.txt"):
+            src = os.path.join(HERE, fn)
+            if os.path.exists(src):
+                shutil.copy(src, os.path.join(d, fn))
+        ref = dict(params)
+        ref["validation_mode"] = 1
+        write_config(ref, d); write_spec(ref, d); write_probes(ref, d)
+        rc, _out, _err, _sec = run_solver(d)
+        if rc != 0:
+            return None
+        # Circuit_solution.prn: Index TIME V(P) V(NX) I(VMEAS). The interface terminal is the port:
+        # V(P) is its voltage and I(VMEAS) its current (Vmeas is the 0 V ammeter in series with the
+        # real FEM branch, so V(P) == V(NX) here).
+        t, c = _read_columns(os.path.join(d, "Circuit_solution.prn"), 5)
+        if not t.size or len(c) < 3:
+            return None
+        return {"t": t, "V": c[0], "I": c[2]}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _read_named_columns(path):
     """Read a whitespace .prn whose header names the data columns after Index/TIME.
     Returns {"t": array, "names": [...], "series": {name: array}} (empty if absent)."""
@@ -1063,6 +1288,8 @@ def _png(fig):
 def make_plots(data):
     plots = {}
     c, fw, fld, wr = data["circuit"], data["field_wave"], data["field"], data["wr"]
+    ref = data.get("ref")                      # monolithic reference (optional overlay)
+    has_ref = bool(ref) and ref["t"].size > 0
 
     # 1) Voltage vs time
     fig, ax = plt.subplots(figsize=(8, 3.2))
@@ -1072,8 +1299,10 @@ def make_plots(data):
         ax.plot(fw["t"], fw["V"], "--", lw=1.1, label="V field (reconstructed)")
     if fld["t"].size:
         ax.plot(fld["t"], fld["V"], "o", ms=4, label="V field (window end)")
+    if has_ref:
+        ax.plot(ref["t"], ref["V"], ":", lw=1.4, color="k", label="V monolithic reference")
     ax.set_xlabel("time (s)"); ax.set_ylabel("voltage (V)")
-    ax.set_title("Port / field voltage"); ax.grid(True, alpha=.3); ax.legend(fontsize=8)
+    ax.set_title("Interface voltage"); ax.grid(True, alpha=.3); ax.legend(fontsize=8, loc="upper right")
     plots["voltage"] = _png(fig)
 
     # 2) Current vs time
@@ -1084,9 +1313,11 @@ def make_plots(data):
         ax.plot(fw["t"], fw["I"], "--", lw=1.1, label="I field (reconstructed)")
     if fld["t"].size:
         ax.plot(fld["t"], fld["I"], "o", ms=4, label="I field (window end)")
+    if has_ref:
+        ax.plot(ref["t"], ref["I"], ":", lw=1.4, color="k", label="I monolithic reference")
     ax.set_xlabel("time (s)"); ax.set_ylabel("current (A)")
-    ax.set_title("Interface current (circuit vs field)")
-    ax.grid(True, alpha=.3); ax.legend(fontsize=8)
+    ax.set_title("Interface current")
+    ax.grid(True, alpha=.3); ax.legend(fontsize=8, loc="upper right")
     plots["current"] = _png(fig)
 
     # 3) WR convergence
@@ -1116,17 +1347,254 @@ def make_plots(data):
             for n in v_names:
                 ax.plot(pr["t"], pr["series"][n], lw=0.9, label=n)
             ax.set_xlabel("time (s)"); ax.set_ylabel("voltage (V)")
-            ax.set_title("Probe voltages"); ax.grid(True, alpha=.3); ax.legend(fontsize=8)
+            ax.set_title("Probe voltages"); ax.grid(True, alpha=.3); ax.legend(fontsize=8, loc="upper right")
             plots["probe_v"] = _png(fig)
         if i_names:
             fig, ax = plt.subplots(figsize=(8, 3.2))
             for n in i_names:
                 ax.plot(pr["t"], pr["series"][n], lw=0.9, label=n)
             ax.set_xlabel("time (s)"); ax.set_ylabel("current (A)")
-            ax.set_title("Probe currents"); ax.grid(True, alpha=.3); ax.legend(fontsize=8)
+            ax.set_title("Probe currents"); ax.grid(True, alpha=.3); ax.legend(fontsize=8, loc="upper right")
             plots["probe_i"] = _png(fig)
     return plots
 
+
+
+# ---------------------------------------------------------------------------
+# pgfplots export (thesis-ready LaTeX for one results plot)
+# ---------------------------------------------------------------------------
+# The exported .tex is the tikzpicture ALONE (no \documentclass / \begin{document}), so it drops
+# straight into a thesis with \input{...}; the required preamble lines are listed in a comment at the
+# top of the file. Series here mirror make_plots() above -- keep the two in step when a curve is
+# added or relabelled.
+
+# matplotlib's default cycle / tab: colours, so an exported figure matches the PNG it was read from.
+# Only our own C-prefixed names are defined -- redefining xcolor's `black`/`red`/`gray` would leak
+# into the document this file is \input into. Styles that want plain black use xcolor's built-in name.
+# C0..C3 are matplotlib's first four cycle colours; the rest are the tab: colours the sweep figures
+# use, plus the reference-line red from _draw_vlines.
+_PGF_COLORS = {"C0": "1f77b4", "C1": "ff7f0e", "C2": "2ca02c", "C3": "d62728",
+               "Ccyan": "17becf", "Cpurple": "9467bd", "Cgray": "7f7f7f",
+               "Cvline": "e63946"}
+
+
+def _pgf_colordefs():
+    r"""\definecolor lines for the palette, emitted above the picture(s) in every exported file."""
+    return [f"\\definecolor{{{k}}}{{HTML}}{{{v.upper()}}}" for k, v in _PGF_COLORS.items()]
+
+_PGF_MAX_PTS = 2000        # per series; keeps pdflatex compile times sane for a thesis build
+
+
+def _pgf_decimate(x, y, max_pts=_PGF_MAX_PTS):
+    """Thin a series to ~max_pts points for LaTeX. Uses min/max decimation -- each bucket keeps its
+    first point and its extremes -- so narrow features (the window-start V(p) spikes) survive, which
+    plain striding would drop."""
+    n = int(np.asarray(x).size)
+    if n <= max_pts:
+        return x, y
+    edges = np.linspace(0, n, max(1, max_pts // 3) + 1).astype(int)
+    keep = set()
+    for a, b in zip(edges[:-1], edges[1:]):
+        if b <= a:
+            continue
+        seg = y[a:b]
+        keep.update((a, a + int(np.argmin(seg)), a + int(np.argmax(seg))))
+    keep.add(n - 1)
+    idx = np.array(sorted(keep))
+    return x[idx], y[idx]
+
+
+def _pgf_coords(x, y, decimate=True):
+    """`(x,y)` pairs for an \\addplot coordinates block; non-finite samples are dropped (pgfplots
+    cannot parse nan/inf)."""
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    if x.size == 0 or y.size == 0:
+        return ""
+    n = min(x.size, y.size)
+    x, y = x[:n], y[:n]
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if x.size == 0:
+        return ""
+    if decimate:
+        x, y = _pgf_decimate(x, y)
+    return " ".join(f"({xi:.8g},{yi:.8g})" for xi, yi in zip(x, y))
+
+
+def _pgf_plot(series, wrap=4):
+    """One \\addplot + legend entry from a (label, x, y, style) series tuple."""
+    label, x, y, style = series
+    coords = _pgf_coords(x, y, decimate=style.get("decimate", True))
+    if not coords:
+        return []
+    opts = [f"color={style.get('color', 'C0')}"]
+    if style.get("only_marks"):
+        opts += ["only marks", f"mark={style.get('mark', '*')}", "mark size=1.6pt"]
+    else:
+        opts += ["line width=" + style.get("lw", "0.8pt")]
+        if style.get("dash"):
+            opts.append(style["dash"])
+        opts += ([f"mark={style['mark']}", "mark size=1.6pt"] if style.get("mark")
+                 else ["mark=none"])
+    # coordinates wrap at ~6 per line so the file stays diff-able and editor-friendly
+    toks = coords.split(" ")
+    body = "\n".join("    " + " ".join(toks[i:i + 6]) for i in range(0, len(toks), 6))
+    plot = f"  \\addplot[{', '.join(opts)}] coordinates {{\n{body}\n  }};"
+    # `nolegend` draws the curve but leaves the legend entry to another axis (the twin-axis figure
+    # collects both series into ONE legend on the right-hand axis).
+    if style.get("nolegend"):
+        return [plot]
+    return [plot, f"  \\addlegendentry{{{_tex_escape(label)}}}"]
+
+
+def _tex_escape(s):
+    """Escape the characters that appear in our own labels (probe tokens carry _ and ( )).
+
+    A label already wrapped in `$...$` is passed through VERBATIM: the a-priori figures label their
+    axes and series in math ($|x_P|$, $|\rho(f)|$), and escaping those would print the source.
+    Nothing else in the studio wraps a label in dollars, so the sentinel is unambiguous."""
+    if len(s) > 1 and s.startswith("$") and s.endswith("$"):
+        return s
+    for a, b in (("\\", r"\textbackslash "), ("_", r"\_"), ("&", r"\&"), ("%", r"\%"),
+                 ("#", r"\#"), ("$", r"\$"), ("{", r"\{"), ("}", r"\}")):
+        s = s.replace(a, b)
+    return s
+
+
+def _pgf_axis(title, xlabel, ylabel, plots, extra=()):
+    """A single pgfplots axis holding the given \\addplot lines."""
+    opts = [r"width=\linewidth", "height=6.4cm",
+            f"title={{{_tex_escape(title)}}}",
+            f"xlabel={{{_tex_escape(xlabel)}}}", f"ylabel={{{_tex_escape(ylabel)}}}",
+            "grid=both", "grid style={line width=.2pt, draw=gray!25}",
+            "legend pos=north east", "legend cell align=left",
+            "legend style={font=\\footnotesize, fill=white, fill opacity=0.85, "
+            "text opacity=1, draw=gray!40}",
+            "tick label style={font=\\footnotesize}", "label style={font=\\small}",
+            "title style={font=\\small}", "scaled x ticks=true"]
+    opts += list(extra)
+    return (["\\begin{axis}[", "  " + ",\n  ".join(opts), "]"] + plots + ["\\end{axis}"])
+
+
+def pgfplots_tex(name, data, params=None):
+    """Render ONE results plot as a standalone-\\input-able pgfplots figure. `name` is a make_plots()
+    key (voltage / current / wr / probe_v / probe_i). Returns (filename, tex) or (None, None) when
+    that plot has no data in this run."""
+    c, fw, fld, wr = data["circuit"], data["field_wave"], data["field"], data["wr"]
+    ref = data.get("ref")
+    has_ref = bool(ref) and np.asarray(ref["t"]).size > 0
+    pr = data.get("probes") or {"t": np.array([]), "names": [], "series": {}}
+
+    solid, dash, dot = {}, {"dash": "dashed"}, {"dash": "dotted", "lw": "1.1pt"}
+    body, fname = [], None
+
+    if name in ("voltage", "current"):
+        volt = name == "voltage"
+        q, unit = ("V", "voltage (V)") if volt else ("I", "current (A)")
+        ckt = c["Vp"] if volt else c["I"]
+        series = []
+        if c["t"].size:
+            series.append((f"{'V(p) circuit (port)' if volt else 'I(Vmeas) circuit'}",
+                           c["t"], ckt, {**solid, "color": "C0"}))
+        if fw["t"].size:
+            series.append((f"{q} field (reconstructed)", fw["t"], fw[q],
+                           {**dash, "color": "C1", "lw": "1.0pt"}))
+        if fld["t"].size:
+            series.append((f"{q} field (window end)", fld["t"], fld[q],
+                           {"color": "C2", "only_marks": True, "decimate": False}))
+        if has_ref:
+            series.append((f"{q} monolithic reference", ref["t"], ref[q],
+                           {**dot, "color": "black"}))
+        plots = [ln for s in series for ln in _pgf_plot(s)]
+        if not plots:
+            return None, None
+        title = "Interface voltage" if volt else "Interface current"
+        body = _pgf_axis(title, "time (s)", unit, plots)
+        fname = "interface_voltage.tex" if volt else "interface_current.tex"
+
+    elif name == "wr":
+        if not wr["t"].size:
+            return None, None
+        err = np.maximum(np.asarray(wr["err"], dtype=float), 1e-16)
+        # Twin axes, as in the PNG: log-scale WR error on the left, iteration count on the right.
+        # Two overlaid axes is the pgfplots idiom -- the second draws only its own y line. Both get
+        # the same explicit x range so the overlay registers exactly.
+        t0, t1 = float(np.min(wr["t"])), float(np.max(wr["t"]))
+        pad = 0.02 * (t1 - t0) or 1e-12
+        xr = [f"xmin={t0 - pad:.8g}", f"xmax={t1 + pad:.8g}"]
+        left = _pgf_axis("Waveform-relaxation convergence per window",
+                         "window end time (s)", "WR rel. error",
+                         _pgf_plot(("final WR rel. error", wr["t"], err,
+                                    {"color": "C3", "mark": "*", "decimate": False,
+                                     "nolegend": True})),
+                         extra=xr + ["ymode=log", "axis y line*=left", "ylabel style={color=C3}",
+                                     "yticklabel style={color=C3}"])
+        # Both curves share ONE legend, carried by the right-hand axis (drawn last, so it sits on
+        # top): \addlegendimage fakes the entry for the series that lives in the other axis.
+        right = _pgf_axis("", "", "WR iterations",
+                          ["  \\addlegendimage{color=C3, line width=0.8pt, mark=*, mark size=1.6pt}",
+                           "  \\addlegendentry{final WR rel. error}"]
+                          + _pgf_plot(("WR iterations", wr["t"], wr["nit"],
+                                       {**dash, "color": "C0", "mark": "square*",
+                                        "decimate": False})),
+                          extra=xr + ["axis y line*=right", "axis x line=none",
+                                      "ylabel style={color=C0}", "yticklabel style={color=C0}"])
+        body = left + right
+        fname = "wr_convergence.tex"
+
+    elif name in ("probe_v", "probe_i"):
+        want = "V(" if name == "probe_v" else "I("
+        names = [n for n in pr["names"] if n.upper().startswith(want)]
+        plots = [ln for n in names
+                 for ln in _pgf_plot((n, pr["t"], pr["series"][n],
+                                      {**solid, "color": "C0"}))]
+        if not plots:
+            return None, None
+        body = _pgf_axis("Probe voltages" if name == "probe_v" else "Probe currents",
+                         "time (s)",
+                         "voltage (V)" if name == "probe_v" else "current (A)", plots)
+        fname = "probe_voltages.tex" if name == "probe_v" else "probe_currents.tex"
+
+    else:
+        return None, None
+
+    head = [f"% {'Interface' if name in ('voltage', 'current') else 'WR'} figure exported by sim_ui.py"
+            f" -- {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "%",
+            r"% Preamble (once, in your thesis):",
+            r"%   \usepackage{pgfplots}",
+            r"%   \pgfplotsset{compat=1.18}",
+            "%",
+            r"% Use:",
+            r"%   \begin{figure}[htbp]\centering",
+            "%     \\input{" + fname[:-4] + "}",
+            r"%     \caption{...}\label{fig:...}",
+            r"%   \end{figure}",
+            "%",
+            r"% \input nests (unlike \include), so this works inside a chapter file the root",
+            r"% already \includes. Pasting the body below inline works too -- the \definecolor",
+            r"% lines may then be hoisted into the preamble and dropped from each figure.",
+            "%",
+            f"% Series are thinned to ~{_PGF_MAX_PTS} points each (min/max decimation, so spikes are",
+            "% preserved); edit _PGF_MAX_PTS in sim_ui.py for the full-resolution data."]
+    if params:
+        keys = ("coupling_mode", "precondition", "interface_form", "use_t_floor",
+                "interface_consistency", "N_field_windows", "N_xyce_samples",
+                "xyce_integration_method")
+        bits = []
+        for k in keys:
+            if k in params:
+                v = params[k]
+                if k in CHOICES:
+                    try:
+                        v = CHOICES[k].get(int(round(float(v))), v)
+                    except (TypeError, ValueError):
+                        pass
+                bits.append(f"{k}={v}")
+        if bits:
+            head += ["%", "% Run: " + "; ".join(bits)]
+    return fname, "\n".join(head + [""] + _pgf_colordefs() + ["", "\\begin{tikzpicture}"]
+                            + body + ["\\end{tikzpicture}", ""])
 
 def scalar_summary(data):
     fld, wr = data["field"], data["wr"]
@@ -1143,7 +1611,7 @@ def scalar_summary(data):
         s["all_converged"] = bool(np.all(wr["conv"] >= 1.0))
         s["worst_WR_error"] = float(np.max(wr["err"]))
         # Worst cross-solver transmission defect over all windows (field vs circuit terminal). Non-zero
-        # even when the WR loop "converges" under a metric blind to it (method 0, or the inconsistent
+        # even when the WR loop "converges" under a metric blind to it (method 0, or the naive BDF-1/BE
         # interface). max of relI_FC/relV_FC; NaN-safe (older WR_error.txt files lack the columns).
         fc = np.concatenate([wr.get("fcI", np.array([])), wr.get("fcV", np.array([]))])
         if fc.size and not np.all(np.isnan(fc)):
@@ -1309,6 +1777,198 @@ def export_sweep_csv(path, keys, rows, plots=None, base_params=None):
 
 
 # ---------------------------------------------------------------------------
+# A-priori convergence estimate: port impedance x_P(f) and contraction factor rho(f)
+# ---------------------------------------------------------------------------
+# Both computations live in scripts/ as standalone CLIs and the studio only drives them, so the
+# thesis workflow (re-run the rho sweep against a saved x_P CSV, with no Xyce in the loop) works
+# identically in and out of the browser. That split is also why /xp and /rho are separate
+# endpoints: x_P costs one Xyce .AC solve and depends only on the CIRCUIT, while rho is arithmetic
+# on top of it and changes with every R_ROM/L_ROM/R_FEM/L_FEM edit.
+_LAST_XP = {}      # {"f", "xp", "opts", "spec"} -- the last extracted x_P, so /rho needs no re-solve
+
+
+def xp_options(body):
+    """Read the studio's x_P panel fields off a request body, falling back to the defaults."""
+    def num(key, default, cast=float):
+        v = body.get(key)
+        if v in (None, ""):
+            return default
+        try:
+            return cast(float(v))
+        except (TypeError, ValueError):
+            return default
+    sweep = str(body.get("sweep") or "dec").lower()
+    return {"fstart": num("fstart", 1.0), "fstop": num("fstop", 1.0e6),
+            "points": num("points", 200, int), "switch_time": num("switch_time", 0.0),
+            "sweep": sweep if sweep in ("dec", "oct", "lin") else "dec",
+            "port": str(body.get("port") or "p"), "gnd": str(body.get("gnd") or "0")}
+
+
+def contraction_from_params(f, xp, params):
+    """rho(f) for the ROM/field impedances currently set in the Properties panel."""
+    rho_mod = load_script("rho_contraction")
+
+    def g(k):
+        return float(params.get(k, DEFAULTS[k]))
+    rho, _beta, _y = rho_mod.contraction(f, xp, g("R_ROM"), g("L_ROM"), g("R_FEM"), g("L_FEM"))
+    return rho, rho_mod.unity_crossings(f, rho), rho_mod
+
+
+def make_xp_plots(f, xp, rho=None, crossings=None):
+    """{"xp": data-URI, "rho": data-URI} -- the scripts build the figures, _png renders them."""
+    plots = {"xp": _png(load_script("xp_extract").plot_xp(f, xp))}
+    if rho is not None:
+        plots["rho"] = _png(load_script("rho_contraction").plot_rho(
+            f, xp, rho, crossings=crossings))
+    return plots
+
+
+# Exported figure names, mirroring the two PNGs the panel shows.
+_XP_TEX = {"xp":  ("port_impedance.tex", "Circuit port impedance"),
+           "rho": ("wr_contraction.tex", "Port impedance and WR contraction")}
+
+
+def _xp_loglog_ok(f, y):
+    """Mask of samples a log-log axis can carry: pgfplots cannot plot f <= 0 or y <= 0 there."""
+    f, y = np.asarray(f, dtype=float), np.asarray(y, dtype=float)
+    return np.isfinite(f) & np.isfinite(y) & (f > 0.0) & (y > 0.0)
+
+
+def pgf_xp_tex(which, store):
+    r"""One a-priori figure as an \input-able pgfplots picture, rendered from the stored sweep.
+
+    `which` is "xp" (|x_P| alone) or "rho" (|x_P| + |rho| on twin axes, as in the PNG); `store` is
+    _LAST_XP. Returns (filename, tex), or (None, None) when there is nothing to draw."""
+    f = np.asarray(store.get("f") if store.get("f") is not None else [], dtype=float)
+    xp = np.asarray(store.get("xp") if store.get("xp") is not None else [])
+    if f.size == 0 or xp.size == 0 or which not in _XP_TEX:
+        return None, None
+    fname, title = _XP_TEX[which]
+    mag = np.abs(xp)
+    ok = _xp_loglog_ok(f, mag)
+    if not ok.any():
+        return None, None
+    # Both axes of the twin figure must share EXACTLY this x range or the overlay will not register.
+    xr = [f"xmin={float(f[ok].min()):.8g}", f"xmax={float(f[ok].max()):.8g}"]
+    logx = ["xmode=log", "log basis x=10"]
+    xlab = r"$f\;\mathrm{(Hz)}$"
+    # No decimation: an AC sweep is a few hundred points already, and thinning a resonance peak
+    # would move it.
+    xp_series = ("$|x_P(f)|$", f[ok], mag[ok], {"color": "C0", "decimate": False})
+
+    if which == "xp":
+        body = _pgf_axis(title, xlab, r"$|x_P|\;(\Omega)$", _pgf_plot(xp_series),
+                         extra=xr + logx + ["ymode=log"])
+        notes = []
+    else:
+        rho = store.get("rho")
+        if rho is None:
+            return None, None
+        rho = np.asarray(rho)
+        rok = _xp_loglog_ok(f, np.abs(rho))
+        if not rok.any():
+            return None, None
+        rmag = np.abs(rho)
+        # Twin axes, as in the PNG and the WR-convergence export: |x_P| in ohms on the left,
+        # the dimensionless |rho| on its own right-hand log scale. The right axis draws the grid
+        # off (grid=none overrides _pgf_axis's grid=both, last option wins) so the figure does not
+        # carry two different sets of horizontal grid lines.
+        left = _pgf_axis(title, xlab, r"$|x_P|\;(\Omega)$",
+                         _pgf_plot((xp_series[0], xp_series[1], xp_series[2],
+                                    {**xp_series[3], "nolegend": True})),
+                         extra=xr + logx + ["ymode=log", "axis y line*=left",
+                                            "ylabel style={color=C0}",
+                                            "yticklabel style={color=C0}"])
+        r0, r1 = float(rmag[rok].min()), float(rmag[rok].max())
+        # The |rho| = 1 level must be inside the right axis or the rule and its crossing markers
+        # would be clipped away -- widen the range to contain it before padding.
+        r0, r1 = min(r0, 1.0) / 1.6, max(r1, 1.0) * 1.6
+        x0, x1 = float(f[ok].min()), float(f[ok].max())
+        rule = [f"  \\addplot[C3, dashed, line width=0.9pt, mark=none, forget plot] coordinates "
+                f"{{({x0:.8g},1) ({x1:.8g},1)}};"]
+        marks = []
+        for k, fc in enumerate(np.asarray(store.get("crossings") if store.get("crossings")
+                                          is not None else [], dtype=float)):
+            if not (x0 <= fc <= x1):
+                continue
+            marks.append(f"  \\addplot[black, only marks, mark=o, mark size=2.4pt, forget plot] "
+                         f"coordinates {{({fc:.8g},1)}};")
+            # Alternate above/below, exactly as the PNG staggers its annotations. A crossing in
+            # the right-hand quarter of the (log) x span hangs its label to the LEFT instead --
+            # pgfplots clips to the axis box, so a west-anchored label there would be cut off.
+            frac = ((math.log10(fc) - math.log10(x0)) / (math.log10(x1) - math.log10(x0))
+                    if x1 > x0 else 0.0)
+            side = "east" if frac > 0.72 else "west"
+            marks.append(f"  \\node[anchor={'south' if k % 2 == 0 else 'north'} {side}, "
+                         f"font=\\tiny, fill=white, fill opacity=0.75, text opacity=1, "
+                         f"inner sep=1pt] at (axis cs:{fc:.8g},1) "
+                         f"{{$|\\rho|=1$ @ {fc:.4g} Hz}};")
+        # One legend for both axes, carried by the right-hand axis (drawn last, so it sits on top):
+        # \addlegendimage fakes the entry for the curve that lives in the other axis.
+        right = _pgf_axis("", "", r"$|\rho|\;\mathrm{(contraction)}$",
+                          ["  \\addlegendimage{color=C0, line width=0.8pt, mark=none}",
+                           "  \\addlegendentry{$|x_P(f)|$}"]
+                          + _pgf_plot((r"$|\rho(f)|$", f[rok], rmag[rok],
+                                       {"color": "C3", "decimate": False}))
+                          + rule + marks,
+                          extra=xr + logx + ["ymode=log", f"ymin={r0:.8g}", f"ymax={r1:.8g}",
+                                             "axis y line*=right", "axis x line=none",
+                                             "grid=none", "ylabel style={color=C3}",
+                                             "yticklabel style={color=C3}"])
+        body = left + right
+        notes = [r"The dashed red rule is the break-even level $|\rho| = 1$; open circles mark "
+                 "where the", "% contraction factor crosses it."]
+
+    opts = store.get("opts") or {}
+    head = [f"% A-priori estimate exported by sim_ui.py -- {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "%",
+            r"% Preamble (once, in your thesis):",
+            r"%   \usepackage{pgfplots}",
+            r"%   \pgfplotsset{compat=1.18}",
+            "%",
+            r"% Use:",
+            r"%   \begin{figure}[htbp]\centering",
+            "%     \\input{" + fname[:-4] + "}",
+            r"%     \caption{...}\label{fig:...}",
+            r"%   \end{figure}",
+            "%",
+            "% x_P(f) = the circuit's port impedance at the field interface, with the circuit's own",
+            "% sources zeroed (1 A injected at the port). rho(f) = (1 + beta*x_P)^-1 (beta - Y) x_P",
+            "% with beta = 1/(R_ROM + jwL_ROM) and Y = 1/(R_FEM + jwL_FEM); |rho| < 1 is the",
+            "% a-priori statement that the WR iteration contracts."]
+    for n in notes:
+        head += ["%", "% " + n]
+    if opts:
+        head += ["%", f"% Sweep: {opts.get('sweep', 'dec')} {opts.get('points', '')} points, "
+                      f"{opts.get('fstart', '')} .. {opts.get('fstop', '')} Hz, "
+                      f"port '{opts.get('port', 'p')}', switch freeze t = "
+                      f"{opts.get('switch_time', 0)} s"]
+    prm = store.get("params") or {}
+    bits = [f"{k}={prm[k]}" for k in ("R_ROM", "L_ROM", "R_FEM", "L_FEM") if k in prm]
+    if bits and which == "rho":
+        head += ["% ROM/field: " + "; ".join(bits)]
+    return fname, "\n".join(head + [""] + _pgf_colordefs() + ["", "\\begin{tikzpicture}"]
+                            + body + ["\\end{tikzpicture}", ""])
+
+
+def write_xp_csvs(body, f, xp, rho=None):
+    """Save the sweeps to the CSV paths the panel names (blank = skip). Returns what was written."""
+    written = []
+
+    def dest(key):
+        path = str(body.get(key) or "").strip()
+        return os.path.abspath(os.path.expanduser(path)) if path else None
+
+    path = dest("xp_csv")
+    if path:
+        written.append(load_script("xp_extract").write_xp_csv(path, f, xp))
+    path = dest("rho_csv")
+    if path and rho is not None:
+        written.append(load_script("rho_contraction").write_rho_csv(path, f, xp, rho))
+    return written
+
+
+# ---------------------------------------------------------------------------
 # Parameter sweep / convergence study
 # ---------------------------------------------------------------------------
 def sweep_values(lo, hi, steps, scale, kind):
@@ -1368,6 +2028,8 @@ def _spec_element_values(spec):
 # Last completed sweep, kept so Results-section reference lines can be re-drawn
 # without re-solving: {"keys","rows","mode","free_keys","params"}.
 _LAST_SWEEP = {}
+# Last /run parsed outputs + params, so a pgfplots export re-renders without re-solving.
+_LAST_RUN = {}
 
 
 def _vline_env(params):
@@ -1550,6 +2212,7 @@ def make_sweep_plots(keys, rows, mode="single", free_keys=None, vlines=None):
     else:
         out = _make_line_plots(keys, rows, mode, vlines)
     out.update(_make_iters_heatmap(dims, rows, mode, vlines))  # WR-iterations-per-window colormap
+    out.update(_make_total_iters_heatmap(dims, rows, mode, vlines))  # 2-D grid: total iterations
     return out
 
 
@@ -1583,7 +2246,7 @@ def _make_line_plots(keys, rows, mode, vlines=None):
     ax.plot(x, col("max_WR_iterations"), "o-", color="tab:blue", label="max")
     ax.plot(x, col("mean_WR_iterations"), "s--", color="tab:cyan", label="mean")
     ax.set_ylabel("WR iterations / window"); ax.set_title("Convergence speed")
-    ax.legend(fontsize=8); setx(ax)
+    ax.legend(fontsize=8, loc="upper right"); setx(ax)
 
     # (0,1) cost: total Xyce solves + solver time
     ax = axes[0, 1]
@@ -1697,7 +2360,7 @@ def _make_index_plots(keys, rows, vlines=None):
     ax.plot(x, col("max_WR_iterations"), "o-", color="tab:blue", label="max")
     ax.plot(x, col("mean_WR_iterations"), "s--", color="tab:cyan", label="mean")
     ax.set_ylabel("WR iterations / window"); ax.set_title("Convergence speed")
-    ax.legend(fontsize=8); ax.grid(True, alpha=.3)
+    ax.legend(fontsize=8, loc="upper right"); ax.grid(True, alpha=.3)
 
     ax = axes[0, 1]
     ax.plot(x, col("total_xyce_solves"), "o-", color="tab:purple")
@@ -1719,6 +2382,326 @@ def _make_index_plots(keys, rows, vlines=None):
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     return {"sweep": _png(fig)}
 
+
+
+# ---------------------------------------------------------------------------
+# pgfplots export for the sweep figures
+# ---------------------------------------------------------------------------
+# The on-screen sweep figures are 2x2 (or 3x2) composites, two panels of which use twin y-axes. A
+# thesis wants them one at a time, so the export emits ONE tikzpicture PER PANEL into a single .tex:
+# every panel is an independent, \input-able figure, and the twin-axis panels are split into one
+# panel per quantity (no hidden dual scale). Mirrors _make_line_plots / _make_grid_plots /
+# _make_index_plots / _make_iters_heatmap above -- keep in step when a panel changes.
+
+def _pgf_ylimits(series, logy=False):
+    """(ymin, ymax) with a margin over every finite sample in `series`, or None if there are none.
+    Needed because a reference line is drawn between EXPLICIT y coordinates: mixing `axis cs` with
+    `rel axis cs` makes TeX evaluate y=0, which overflows ("Dimension too large") whenever the panel's
+    y range sits far from zero and is narrow -- e.g. final I_field spanning 45.195..45.200."""
+    vals = []
+    for _label, _x, y, _style in series:
+        y = np.asarray(y, dtype=float)
+        y = y[np.isfinite(y)]
+        if logy:
+            y = y[y > 0.0]
+        if y.size:
+            vals.append(y)
+    if not vals:
+        return None
+    v = np.concatenate(vals)
+    lo, hi = float(v.min()), float(v.max())
+    if logy:
+        return (lo / 1.6, hi * 1.6) if lo > 0.0 else None
+    pad = (hi - lo) * 0.08 if hi > lo else (abs(hi) * 0.05 or 1.0)
+    return lo - pad, hi + pad
+
+
+def _pgf_vlines(vlines, ylim, colvals=None, data_x=True):
+    """User reference lines as full-height rules inside an axis (see _draw_vlines for the PNG side).
+    data_x: `value` is already in x-data units; otherwise it is interpolated to a column position.
+    `ylim` is the axis's explicit (ymin, ymax) -- the line is drawn between those two coordinates."""
+    if not vlines or not ylim:
+        return []
+    y0, y1 = ylim
+    out = []
+    for value, label in vlines:
+        x = value if data_x else _xpos_for_value(colvals, value)
+        if x is None:
+            continue
+        x = float(x)
+        out.append(f"  \\draw[Cvline, dashed, line width=0.9pt] "
+                   f"(axis cs:{x:.8g},{y0:.8g}) -- (axis cs:{x:.8g},{y1:.8g}) "
+                   # anchor=north keeps the label just INSIDE the axis: pgfplots clips paths to the
+                   # axis box, so a label hung above the top end would be cut off.
+                   f"node[anchor=north, font=\\tiny, color=Cvline, fill=white, "
+                   f"fill opacity=0.75, text opacity=1, inner sep=1pt] "
+                   f"{{{_tex_escape(label)}}};")
+    return out
+
+
+def _pgf_panel(title, xlabel, ylabel, series, extra=(), vlines=None, colvals=None, data_x=True):
+    """One standalone tikzpicture holding a single axis. None when every series is empty."""
+    plots = [ln for s in series for ln in _pgf_plot(s)]
+    if not plots:
+        return None
+    extra, draws = list(extra), []
+    if vlines:
+        # Explicit y limits only when a reference line is actually drawn -- otherwise leave pgfplots'
+        # own (nicer) auto-rounding alone.
+        ylim = _pgf_ylimits(series, "ymode=log" in extra)
+        if ylim:
+            extra += [f"ymin={ylim[0]:.8g}", f"ymax={ylim[1]:.8g}"]
+            draws = _pgf_vlines(vlines, ylim, colvals, data_x)
+    body = _pgf_axis(title, xlabel, ylabel, plots + draws, extra)
+    return ["\\begin{tikzpicture}"] + body + ["\\end{tikzpicture}"]
+
+
+def _pgf_matrix_panel(title, xlabel, ylabel, xs, ys, M, bar_label, log=False, reverse_y=False,
+                      vlines=None, colvals=None, data_x=True, annotate=False):
+    """One standalone tikzpicture holding a heatmap (pgfplots `matrix plot`). `M[row, col]` matches
+    the PNG's pcolormesh; non-finite cells are emitted as nan and left as holes."""
+    M = np.asarray(M, dtype=float)
+    if M.size == 0 or not np.isfinite(M).any():
+        return None
+    finite = M[np.isfinite(M)]
+    # Half a cell in y, from the real spacing: y is window indices (spacing 1) on the per-window
+    # colormap but PARAMETER VALUES (spacing ~1e-4) on a grid sweep, and a fixed 0.5 there puts the
+    # reference line's endpoint astronomically outside the axis ("Dimension too large").
+    yv = np.asarray(sorted(float(v) for v in ys), dtype=float)
+    pad = float(np.min(np.diff(yv))) / 2.0 if yv.size > 1 else (abs(float(yv[0])) * 0.5 or 0.5)
+    rows_out = []
+    for i in range(M.shape[0]):
+        for j in range(M.shape[1]):
+            v = M[i, j]
+            cell = f"{v:.8g}" if np.isfinite(v) else "nan"
+            rows_out.append(f"    {float(xs[j]):.8g} {float(ys[i]):.8g} {cell}")
+    opts = [r"width=\linewidth", "height=6.4cm",
+            f"title={{{_tex_escape(title)}}}",
+            f"xlabel={{{_tex_escape(xlabel)}}}", f"ylabel={{{_tex_escape(ylabel)}}}",
+            "tick label style={font=\\footnotesize}", "label style={font=\\small}",
+            "title style={font=\\small}",
+            "colorbar", "colormap/viridis", "unbounded coords=jump",
+            f"colorbar style={{ylabel={{{_tex_escape(bar_label)}}}, "
+            "ylabel style={font=\\footnotesize}, tick label style={font=\\footnotesize}}",
+            "enlargelimits=false", "axis on top"]
+    if annotate:   # print the value in each cell, as the PNG does for small grids
+        opts += ["nodes near coords={\\pgfmathprintnumber[precision=0]{\\pgfplotspointmeta}}",
+                 "every node near coord/.append style={font=\\footnotesize, anchor=center, "
+                 "text=white}"]
+    if log:
+        opts.append("colormap/viridis")
+        opts.append(f"point meta min={max(float(finite.min()), 1e-16):.8g}")
+        opts.append(f"point meta max={float(finite.max()):.8g}")
+    if reverse_y:
+        opts.append("y dir=reverse")
+    body = (["\\begin{axis}[", "  " + ",\n  ".join(opts), "]",
+             f"  \\addplot[matrix plot*, point meta=explicit, mesh/cols={M.shape[1]}] table[meta=C] {{",
+             "    x y C"] + rows_out + ["  };"]
+            + _pgf_vlines(vlines, ((float(max(ys)) + pad, float(min(ys)) - pad) if reverse_y
+                                   else (float(min(ys)) - pad, float(max(ys)) + pad)),
+                          colvals, data_x)
+            + ["\\end{axis}"])
+    return ["\\begin{tikzpicture}"] + body + ["\\end{tikzpicture}"]
+
+
+def _pgf_sweep_head(fname, title, panels, extra_notes=()):
+    """Comment header: preamble lines, how to use one panel, and what the panels are."""
+    head = [f"% Sweep figure exported by sim_ui.py -- {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "%",
+            r"% Preamble (once, in your thesis):",
+            r"%   \usepackage{pgfplots}",
+            r"%   \pgfplotsset{compat=1.18}",
+            "%",
+            f"% {title}",
+            f"% This file holds {len(panels)} INDEPENDENT tikzpicture environments, one per panel:"]
+    head += [f"%   {i + 1}. {p}" for i, p in enumerate(panels)]
+    head += ["%",
+             r"% \input{" + fname[:-4] + "} typesets them in sequence; to use one on its own, copy that",
+             r"% tikzpicture into its own file and \input that instead:",
+             r"%   \begin{figure}[htbp]\centering",
+             "%     \\input{" + fname[:-4] + "}",
+             r"%     \caption{...}\label{fig:...}",
+             r"%   \end{figure}"]
+    for n in extra_notes:
+        head += ["%", "% " + n]
+    return head
+
+
+def pgf_sweep_tex(which, sweep, vlines=None):
+    """Render a sweep figure as pgfplots. `which` is 'sweep' (the metric panels) or 'iters' (the
+    WR-iterations-per-window colormap); `sweep` is the stored _LAST_SWEEP. Returns (filename, tex),
+    or (None, None) when there is nothing to draw."""
+    keys = sweep.get("keys") or []
+    rows = sweep.get("rows") or []
+    mode = sweep.get("mode", "single")
+    dims = list(sweep.get("free_keys") or keys)
+    ok = [r for r in rows if r.get("ok")]
+    if not ok or not dims:
+        return None, None
+    stem = "_x_".join(re.sub(r"[^A-Za-z0-9_-]", "", k) for k in dims) or "sweep"
+
+    def col(name, src=ok):
+        return np.array([r.get(name, np.nan) for r in src], dtype=float)
+
+    # ---- WR iterations per window (colormap) --------------------------------
+    if which == "iters":
+        okn = [r for r in ok if r.get("wr_nit")]
+        if not okn:
+            return None, None
+        ncol = len(okn)
+        wmax = max(len(r["wr_nit"]) for r in okn)
+        M = np.full((wmax, ncol), np.nan)
+        for j, r in enumerate(okn):
+            for w, v in enumerate(r["wr_nit"]):
+                M[w, j] = v
+        one = len(dims) == 1
+        # x = the swept value itself for a 1-D sweep, else the flat run index (as in the PNG).
+        xs = [float(r["vals"][dims[0]]) for r in okn] if one else list(range(ncol))
+        ys = list(range(1, wmax + 1))
+        xlabel = dims[0] if one else "run index (" + " x ".join(dims) + ")"
+        colvals = [r["vals"][dims[0]] for r in okn] if dims else None
+        pic = _pgf_matrix_panel("WR iterations per window", xlabel, "window", xs, ys, M,
+                                "WR iterations", reverse_y=True, vlines=vlines,
+                                colvals=colvals, data_x=one)
+        if pic is None:
+            return None, None
+        fname = f"sweep_{stem}_iterations_per_window.tex"
+        head = _pgf_sweep_head(fname, "WR iterations per window over the sweep.",
+                               ["WR iterations per window (colormap)"],
+                               ["Window 1 is at the top (y dir=reverse), matching the on-screen figure."])
+        return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + pic + [""])
+
+    # ---- 2-parameter grid -> total WR iterations per combination ------------
+    if which == "iters2d":
+        if mode != "grid" or len(dims) != 2:
+            return None, None
+        kx, ky = dims[0], dims[1]
+        okn = [r for r in ok if r.get("wr_nit")]
+        xs = sorted({r["vals"][kx] for r in rows if r.get("vals")})
+        ys = sorted({r["vals"][ky] for r in rows if r.get("vals")})
+        if not okn or not xs or not ys:
+            return None, None
+        ix = {v: i for i, v in enumerate(xs)}
+        iy = {v: i for i, v in enumerate(ys)}
+        M = np.full((len(ys), len(xs)), np.nan)
+        for r in okn:
+            M[iy[r["vals"][ky]], ix[r["vals"][kx]]] = float(np.sum(r["wr_nit"]))
+        pic = _pgf_matrix_panel(f"Total WR iterations: {kx} x {ky}", kx, ky, xs, ys, M,
+                                "total WR iterations", vlines=vlines,
+                                annotate=(M.size <= 144))
+        if pic is None:
+            return None, None
+        fname = f"sweep_{stem}_total_iterations.tex"
+        head = _pgf_sweep_head(fname,
+                               f"Total WR iterations over the {LABELS.get(kx, kx)} x "
+                               f"{LABELS.get(ky, ky)} grid.",
+                               ["Total WR iterations (colormap)"],
+                               ["Colour is the whole run's iteration count summed over every window. "
+                                "Blank cells are combinations whose solve failed (a window hit "
+                                "WRmaxSteps and the run aborted)."])
+        return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + pic + [""])
+
+    # ---- 2-parameter grid -> heatmaps ---------------------------------------
+    if mode == "grid" and len(dims) == 2:
+        kx, ky = dims[0], dims[1]
+        xs = sorted({r["vals"][kx] for r in ok})
+        ys = sorted({r["vals"][ky] for r in ok})
+        ix = {v: i for i, v in enumerate(xs)}
+        iy = {v: i for i, v in enumerate(ys)}
+
+        def grid(name, log=False):
+            g = np.full((len(ys), len(xs)), np.nan)
+            for r in ok:
+                v = r.get(name, np.nan)
+                if log and v is not None and np.isfinite(float(v)):
+                    v = max(float(v), 1e-16)
+                g[iy[r["vals"][ky]], ix[r["vals"][kx]]] = v
+            return g
+
+        spec = [("max_WR_iterations", "WR iterations / window (max)", "iterations", False),
+                ("total_xyce_solves", "Total Xyce solves", "solves", False),
+                ("worst_WR_error", "Worst WR rel. error", "rel. error", True),
+                ("final_I_field", "Final I_field", "A", False)]
+        pics, names = [], []
+        for nm, title, bar, log in spec:
+            pic = _pgf_matrix_panel(title, kx, ky, xs, ys, grid(nm, log), bar, log=log,
+                                    vlines=vlines)
+            if pic:
+                pics.append(pic); names.append(title)
+        if not pics:
+            return None, None
+        fname = f"sweep_{stem}_grid.tex"
+        head = _pgf_sweep_head(fname,
+                               f"Grid sweep: {LABELS.get(kx, kx)} x {LABELS.get(ky, ky)}.", names,
+                               ["Every panel uses pgfplots' built-in viridis colormap; the on-screen "
+                                "figure varies the colormap per panel."])
+        body = []
+        for nm, pic in zip(names, pics):
+            body += [f"% --- {nm} ---"] + pic + [""]
+        return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + body)
+
+    # ---- line panels (single / parallel, or >2-D grid -> run index) ---------
+    index_mode = (mode == "grid" and len(dims) > 2)
+    if index_mode:
+        x = np.arange(len(ok), dtype=float)
+        xlabel, logx = "run index", False
+        colvals = [r["vals"][dims[0]] for r in ok]
+        data_x = False
+        title_label = " x ".join(LABELS.get(k, k) for k in dims)
+    else:
+        x = np.array([r["value"] for r in ok], dtype=float)
+        xlabel = keys[0]
+        span = x.max() - x.min()
+        logx = bool(x.min() > 0 and span > 0 and (x.max() / max(x.min(), 1e-300)) >= 50)
+        colvals, data_x = None, True
+        title_label = LABELS.get(keys[0], keys[0])
+        if mode == "parallel" and len(keys) > 1:
+            title_label += " (lock-step with " + ", ".join(keys[1:]) + ")"
+
+    xopt = ["xmode=log"] if logx else []
+    vk = dict(vlines=vlines, colvals=colvals, data_x=data_x)
+    solid, dash = {}, {"dash": "dashed"}
+    spec = [
+        ("Convergence speed", "WR iterations / window",
+         [("max", x, col("max_WR_iterations"), {**solid, "color": "C0", "mark": "*"}),
+          ("mean", x, col("mean_WR_iterations"), {**dash, "color": "Ccyan", "mark": "square*"})],
+         xopt),
+        ("Cost: Xyce solves", "total Xyce solves",
+         [("Xyce solves", x, col("total_xyce_solves"), {**solid, "color": "Cpurple", "mark": "*"})],
+         xopt),
+        ("Cost: solver time", "solver time (s)",
+         [("solver s", x, col("solver_seconds"), {**dash, "color": "C2", "mark": "triangle*"})],
+         xopt),
+        ("WR accuracy", "worst WR rel. error",
+         [("worst WR rel. error", x, np.maximum(col("worst_WR_error"), 1e-16),
+           {**solid, "color": "C3", "mark": "*"})],
+         xopt + ["ymode=log"]),
+        ("Final interface current", "final I_field (A)",
+         [("I_field", x, col("final_I_field"), {**solid, "color": "C1", "mark": "*"})],
+         xopt),
+        ("Final interface voltage", "final V_field (V)",
+         [("V_field", x, col("final_V_field"), {**dash, "color": "Cgray", "mark": "square*"})],
+         xopt),
+    ]
+    pics, names = [], []
+    for title, ylabel, series, extra in spec:
+        series = [(lab, xx, yy, {**st, "decimate": False}) for lab, xx, yy, st in series]
+        pic = _pgf_panel(title, xlabel, ylabel, series, extra, **vk)
+        if pic:
+            pics.append(pic); names.append(title)
+    if not pics:
+        return None, None
+    fname = f"sweep_{stem}.tex"
+    notes = ["The on-screen figure puts Xyce solves / solver time on twin y-axes of one panel, and "
+             "the two final interface values on another; here each quantity gets its own panel so "
+             "no curve is read against a hidden second scale."]
+    if index_mode:
+        notes.append("x is the flat run index -- see the sweep table for the parameter tuple per run.")
+    head = _pgf_sweep_head(fname, f"Convergence study: sweep of {title_label}.", names, notes)
+    body = []
+    for nm, pic in zip(names, pics):
+        body += [f"% --- {nm} ---"] + pic + [""]
+    return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + body)
 
 def _xpos_for_value(colvals, value):
     """Map a parameter value to a fractional column position (centres at k+0.5),
@@ -1780,6 +2763,65 @@ def _make_iters_heatmap(dims, rows, mode, vlines=None):
     ax.set_title("WR iterations per window", fontsize=12)
     fig.tight_layout()
     return {"iters": _png(fig)}
+
+
+
+def _make_total_iters_heatmap(dims, rows, mode, vlines=None):
+    """TOTAL WR iterations (summed over every window) for each point of a 2-parameter grid sweep:
+    x = the first swept parameter, y = the second, colour = the whole run's iteration count. This is
+    the "how expensive is this corner of the parameter space" view; _make_iters_heatmap instead
+    resolves iterations PER WINDOW but collapses the two parameters to a flat run index, so the 2-D
+    structure is only visible here. Points whose solve failed (a window hit WRmaxSteps and the run
+    aborted) carry no iteration counts and are left blank."""
+    if mode != "grid" or len(dims) != 2:
+        return {}
+    ok = [r for r in rows if r.get("ok") and r.get("wr_nit")]
+    if not ok:
+        return {}
+    kx, ky = dims[0], dims[1]
+    # Axes span every REQUESTED point, so a failed combination shows as a hole rather than
+    # silently shrinking the grid.
+    xs = sorted({r["vals"][kx] for r in rows if r.get("vals")})
+    ys = sorted({r["vals"][ky] for r in rows if r.get("vals")})
+    if not xs or not ys:
+        return {}
+    ix = {v: i for i, v in enumerate(xs)}
+    iy = {v: i for i, v in enumerate(ys)}
+    M = np.full((len(ys), len(xs)), np.nan)
+    for r in ok:
+        M[iy[r["vals"][ky]], ix[r["vals"][kx]]] = float(np.sum(r["wr_nit"]))
+
+    def edges(v):
+        v = np.array(v, dtype=float)
+        if len(v) == 1:
+            d = abs(v[0]) * 0.5 or 0.5
+            return np.array([v[0] - d, v[0] + d])
+        mid = (v[:-1] + v[1:]) / 2
+        return np.concatenate([[2 * v[0] - mid[0]], mid, [2 * v[-1] - mid[-1]]])
+
+    fig_w = max(5.0, min(13.0, 2.2 + 0.85 * len(xs)))
+    fig_h = max(3.4, min(9.0, 1.8 + 0.70 * len(ys)))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    pcm = ax.pcolormesh(edges(xs), edges(ys), M, cmap="viridis", shading="flat")
+    cbar = fig.colorbar(pcm, ax=ax)
+    cbar.set_label("total WR iterations")
+    ax.set_xticks(xs); ax.set_yticks(ys)
+    ax.set_xlabel(kx); ax.set_ylabel(ky)
+    # Annotate the cells while the grid is small enough to read; the colour scale carries it after.
+    if M.size <= 144:
+        finite = M[np.isfinite(M)]
+        mid = (finite.min() + finite.max()) / 2 if finite.size else 0.0
+        for i, yv in enumerate(ys):
+            for j, xv in enumerate(xs):
+                v = M[i, j]
+                if not np.isfinite(v):
+                    continue
+                ax.text(xv, yv, f"{int(round(v))}", ha="center", va="center", fontsize=8,
+                        color="black" if v > mid else "white")
+    _draw_vlines(ax, vlines, data_x=True)   # x-axis is kx in real units
+    ax.set_title(f"Total WR iterations: {LABELS.get(kx, kx)}  x  {LABELS.get(ky, ky)}", fontsize=12)
+    fig.tight_layout()
+    return {"iters2d": _png(fig)}
 
 
 def _draw_vlines(ax, vlines, colvals=None, data_x=False):
@@ -2048,8 +3090,10 @@ class Handler(BaseHTTPRequestHandler):
             }))
 
     def do_POST(self):
+        global _LAST_RUN                      # /run refreshes it; /export_pgf reads it back
         if self.path not in ("/run", "/sweep", "/netlist", "/export", "/export_csv",
-                             "/eval_vlines", "/sweep_replot", "/sweep_export"):
+                             "/export_pgf", "/eval_vlines", "/sweep_replot", "/sweep_export",
+                             "/xp", "/rho"):
             self._send(404, json.dumps({"error": "unknown endpoint"}))
             return
         n = int(self.headers.get("Content-Length", 0))
@@ -2092,6 +3136,55 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"ok": False, "error": str(e),
                                             "trace": traceback.format_exc()[-2000:]}))
             return
+        if self.path == "/export_pgf":
+            # One plot -> a thesis-ready pgfplots figure, rendered from the LAST run's / sweep's
+            # parsed data (no re-solve). "sweep_*" names come from the sweep figures.
+            nm = body.get("name", "")
+            # The a-priori figures re-render from _LAST_XP (their own store), not from a run/sweep.
+            if nm in _XP_TEX:
+                if not _LAST_XP:
+                    self._send(200, json.dumps({"ok": False, "error": "compute x_P first"}))
+                    return
+                try:
+                    fname, tex = pgf_xp_tex(nm, _LAST_XP)
+                    if not tex:
+                        self._send(200, json.dumps({
+                            "ok": False, "error": "that figure has no data in this x_P sweep"}))
+                    else:
+                        self._send(200, json.dumps({"ok": True, "filename": fname, "tex": tex}))
+                except Exception as e:
+                    self._send(200, json.dumps({"ok": False, "error": str(e),
+                                                "trace": traceback.format_exc()[-2000:]}))
+                return
+            sweep = nm.startswith("sweep_")
+            if sweep and not _LAST_SWEEP:
+                self._send(200, json.dumps({"ok": False, "error": "run a sweep first"}))
+                return
+            if not sweep and not _LAST_RUN:
+                self._send(200, json.dumps({"ok": False, "error": "run a simulation first"}))
+                return
+            try:
+                if sweep:
+                    # Reference lines are a live UI field, not part of the stored sweep -> re-evaluate
+                    # against the sweep's base params, exactly as /sweep_replot does.
+                    vl = eval_vlines(body.get("vlines"), _LAST_SWEEP.get("params") or {})
+                    which = {"sweep_iters": "iters", "sweep_iters2d": "iters2d"}.get(nm, "sweep")
+                    fname, tex = pgf_sweep_tex(which, _LAST_SWEEP, vl)
+                else:
+                    fname, tex = pgfplots_tex(nm, _LAST_RUN["data"], _LAST_RUN.get("params"))
+                if not tex:
+                    self._send(200, json.dumps({
+                        "ok": False,
+                        "error": "that figure has no data in this " + ("sweep" if sweep else "run")}))
+                else:
+                    self._send(200, json.dumps({"ok": True, "filename": fname, "tex": tex}))
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e),
+                                            "trace": traceback.format_exc()[-2000:]}))
+            return
+        if self.path in ("/xp", "/rho"):
+            self._handle_xp(body, reuse=(self.path == "/rho"))
+            return
         if self.path == "/netlist":
             self._handle_netlist(body)
             return
@@ -2132,6 +3225,13 @@ class Handler(BaseHTTPRequestHandler):
                 }))
                 return
             data = read_outputs()
+            # Optional monolithic-reference overlay: one extra solve of the same circuit in
+            # validation mode. Never fatal -- a failed reference just drops the overlay.
+            if _ui_flag(params, "reference_overlay") and not _ui_flag(params, "validation_mode"):
+                data["ref"] = run_reference(params)
+                if data["ref"] is None:
+                    log_tail += "\n[ui] monolithic reference solve failed -- overlay omitted."
+            _LAST_RUN = {"data": data, "params": params}
             summary = scalar_summary(data)
             summary["solver_seconds"] = round(elapsed, 4)
             if summary.get("total_xyce_solves"):
@@ -2148,6 +3248,46 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": False, "error": str(e),
                 "trace": traceback.format_exc()[-2000:],
             }))
+
+    def _handle_xp(self, body, reuse=False):
+        """A-priori estimate. reuse=False (/xp) runs the Xyce .AC sweep and then rho on top of it;
+        reuse=True (/rho) recomputes ONLY rho from the stored x_P, so the ROM can be re-tuned
+        without paying for another Xyce solve -- the whole point of keeping the two apart."""
+        global _LAST_XP
+        try:
+            params = body.get("params", {})
+            if reuse:
+                if not _LAST_XP:
+                    self._send(200, json.dumps({"ok": False, "error": "compute x_P first"}))
+                    return
+                f, xp, notes = _LAST_XP["f"], _LAST_XP["xp"], []
+                checks_ok = True
+            else:
+                opts = xp_options(body)
+                spec = params.get("circuit_spec") or read_spec()
+                res = load_script("xp_extract").extract_xp(
+                    spec, port=opts["port"], gnd=opts["gnd"], sweep=opts["sweep"],
+                    points=opts["points"], fstart=opts["fstart"], fstop=opts["fstop"],
+                    switch_time=opts["switch_time"])
+                f, xp = res["f"], res["xp"]
+                _LAST_XP = {"f": f, "xp": xp, "opts": opts, "spec": spec}
+                notes = list(res["warnings"]) + list(res["checks"])
+                checks_ok = bool(res["checks_ok"])
+            rho, crossings, rho_mod = contraction_from_params(f, xp, params)
+            # The rho figure exports from here, so store what it needs alongside the sweep.
+            _LAST_XP.update({"rho": rho, "crossings": crossings, "params": params})
+            self._send(200, json.dumps({
+                "ok": True,
+                "plots": make_xp_plots(f, xp, rho, crossings),
+                "notes": notes + rho_mod.summarize(f, rho, crossings),
+                "files": write_xp_csvs(body, f, xp, rho),
+                "n_points": int(f.size),
+                "checks_ok": checks_ok,
+                "f_range": [float(f.min()), float(f.max())],
+            }))
+        except Exception as e:
+            self._send(200, json.dumps({"ok": False, "error": str(e),
+                                        "trace": traceback.format_exc()[-2000:]}))
 
     def _handle_sweep(self, body):
         try:
@@ -2210,8 +3350,8 @@ class Handler(BaseHTTPRequestHandler):
 #   group := (title, open_by_default, [rows]);  row := [control keys laid out equal-width]
 _PROP_GROUPS = [
     ("Run & windows",      True,  [["t_end", "N_field_windows", "__arrow__", "window_width"]]),
-    ("Coupling",           True,  [["validation_mode", "coupling_mode", "N_xyce_samples",
-                                    "reconstruct_mode", "N_field_eval_intervals"]]),
+    ("Coupling",           True,  [["validation_mode", "coupling_mode", "N_xyce_samples"],
+                                   ["N_field_eval_intervals", "reference_overlay"]]),
     ("WR iteration",       False, [["wr_convergence_method", "WRmaxSteps", "WR_tolerance"]]),
     ("Interface & secant", False, [["precondition", "interface_form", "use_t_floor",
                                     "interface_consistency", "t_floor_frac", "seam_average"]]),
@@ -2377,6 +3517,8 @@ INDEX_HTML = """<!doctype html>
 
   .mini { font-size:11px; color:var(--muted); font-family:ui-monospace,monospace; }
   .note { color:var(--muted); font-size:11px; margin-top:8px; line-height:1.5; }
+  /* .note holding preformatted solver/analysis output (keeps its own line breaks) */
+  .note.mono { white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .note.warn { color:var(--err); }
   #status, .sub2 { font-size:12.5px; min-height:16px; }
   #status { margin-top:14px; }
@@ -2431,6 +3573,20 @@ INDEX_HTML = """<!doctype html>
   .plot { width:100%; background:#fff; border:1px solid var(--line); display:none;
           cursor:zoom-in; }
   .plot.wide { grid-column:1 / -1; }
+  .pbox.wide { grid-column:1 / -1; }
+  /* A plot that can be exported sits in a .pbox so the TikZ button can float over it; the box takes
+     over the show/hide that .plot does on its own (setPlot toggles whichever wrapper it finds). */
+  .pbox { position:relative; display:none; min-width:0; }
+  .pbox .plot { display:block; }
+  .pbox .tikzbtn { position:absolute; top:8px; right:8px; padding:3px 8px; font-size:10px;
+        letter-spacing:.06em; text-transform:uppercase; background:var(--bg);
+        border:1px solid var(--line-strong); color:var(--muted); cursor:pointer;
+        opacity:0; transition:opacity .12s ease; }
+  .pbox:hover .tikzbtn, .pbox .tikzbtn:focus { opacity:1; }
+  .pbox .tikzbtn:hover { color:var(--fg); border-color:var(--fg); }
+  .pbox .tikzbtn.busy { opacity:1; color:var(--muted); }
+  .pbox .tikzbtn.ok { opacity:1; color:var(--ok); border-color:var(--ok); }
+  .pbox .tikzbtn.err { opacity:1; color:var(--err); border-color:var(--err); }
 
   pre#log { background:var(--field); border:1px solid var(--line); border-radius:0; padding:12px;
             color:var(--muted); font-size:11.5px; max-height:240px; overflow:auto; white-space:pre-wrap; }
@@ -2620,6 +3776,43 @@ INDEX_HTML = """<!doctype html>
         <div class="note" id="sweepNote"></div>
       </div>
     </details>
+    <details class="fold" style="margin-top:10px" id="xpPanel">
+      <summary>A-priori estimate (port impedance x<sub>P</sub>)<span class="help" data-help="xp_panel">?</span></summary>
+      <div class="fold-body">
+        <div class="prop-row" style="grid-template-columns:repeat(5,minmax(0,1fr))">
+          <div class="ctl"><label for="xp_fstart">f start (Hz)</label>
+            <div class="inputs"><input type="number" id="xp_fstart" step="any" min="0" value="1"></div></div>
+          <div class="ctl"><label for="xp_fstop">f stop (Hz)</label>
+            <div class="inputs"><input type="number" id="xp_fstop" step="any" min="0" value="1e6"></div></div>
+          <div class="ctl"><label for="xp_sweep">Frequency spacing</label>
+            <div class="inputs"><select id="xp_sweep" class="choice" onchange="xpSweepLabel()">
+              <option value="dec">log (per decade)</option>
+              <option value="oct">log (per octave)</option>
+              <option value="lin">linear (total)</option>
+            </select></div></div>
+          <div class="ctl"><label for="xp_points" id="xp_points_lbl">Points / decade</label>
+            <div class="inputs"><input type="number" id="xp_points" step="1" min="2" value="200"></div></div>
+          <div class="ctl"><label for="xp_switch_time">Switch freeze time (s)</label>
+            <div class="inputs"><input type="number" id="xp_switch_time" step="any" value="0"
+                 title="SW elements are frozen to Ron/Roff at this time"></div></div>
+        </div>
+        <div class="prop-row" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-top:16px">
+          <div class="ctl"><label for="xpCsvPath">x<sub>P</sub> CSV path</label>
+            <div class="inputs"><input type="text" id="xpCsvPath" value="results/xp.csv"
+                 placeholder="(blank = don't save)" spellcheck="false"></div></div>
+          <div class="ctl"><label for="rhoCsvPath">&rho; CSV path</label>
+            <div class="inputs"><input type="text" id="rhoCsvPath" value="results/rho.csv"
+                 placeholder="(blank = don't save)" spellcheck="false"></div></div>
+        </div>
+        <div class="btns" style="margin-top:16px">
+          <button id="xpBtn" onclick="computeXp()">Compute x_P</button>
+          <button id="rhoBtn" onclick="computeXp(true)"
+                  title="Recompute rho from the stored x_P with the current R_ROM/L_ROM/R_FEM/L_FEM">Update &rho; only</button>
+        </div>
+        <div id="xpStatus" class="sub2" style="margin-top:10px"></div>
+        <div class="note mono" id="xpNotes" style="display:none"></div>
+      </div>
+    </details>
     <details class="fold" style="margin-top:10px" id="probesPanel">
       <summary>Probes<span class="help" data-help="probes">?</span></summary>
       <div class="fold-body">
@@ -2660,13 +3853,26 @@ INDEX_HTML = """<!doctype html>
     </div>
     <div class="summary" id="summary"></div>
     <div class="plots">
-      <img class="plot" id="p_voltage" onclick="enlarge(this)">
-      <img class="plot" id="p_current" onclick="enlarge(this)">
-      <img class="plot" id="p_wr" onclick="enlarge(this)">
-      <img class="plot" id="p_probe_v" onclick="enlarge(this)">
-      <img class="plot" id="p_probe_i" onclick="enlarge(this)">
-      <img class="plot wide" id="p_sweep" onclick="enlarge(this)">
-      <img class="plot wide" id="p_sweep_iters" onclick="enlarge(this)">
+      <figure class="pbox" id="box_voltage"><img class="plot" id="p_voltage" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('voltage',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox" id="box_current"><img class="plot" id="p_current" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('current',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox" id="box_wr"><img class="plot" id="p_wr" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('wr',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox" id="box_probe_v"><img class="plot" id="p_probe_v" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('probe_v',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox" id="box_probe_i"><img class="plot" id="p_probe_i" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('probe_i',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox" id="box_xp"><img class="plot" id="p_xp" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('xp',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox" id="box_rho"><img class="plot" id="p_rho" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('rho',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox wide" id="box_sweep"><img class="plot" id="p_sweep" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('sweep_fig',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox wide" id="box_sweep_iters"><img class="plot" id="p_sweep_iters" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('sweep_iters',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox wide" id="box_sweep_iters2d"><img class="plot" id="p_sweep_iters2d" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('sweep_iters2d',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
     </div>
     <div id="vlineBar" style="display:none">
       <div class="btns" style="margin-top:12px;align-items:center;gap:10px">
@@ -2836,7 +4042,28 @@ function showSummary(sum){
   }}
 }
 function setPlot(id, src){ const im = document.getElementById(id);
-  if(src){ im.src=src; im.style.display='block'; } else { im.removeAttribute('src'); im.style.display='none'; } }
+  if(!im) return;
+  // A .pbox wrapper (exportable plot) owns the show/hide; a bare <img> still hides itself.
+  const box = im.closest ? im.closest('.pbox') : null;
+  if(src){ im.src=src; im.style.display='block'; if(box) box.style.display='block'; }
+  else { im.removeAttribute('src'); im.style.display='none'; if(box) box.style.display='none'; } }
+
+// Download one results plot as a thesis-ready pgfplots figure (an input-able tikzpicture).
+async function exportPgf(name, btn){
+  const t0=btn.textContent; btn.className='tikzbtn busy'; btn.textContent='...';
+  const done=(cls,txt)=>{ btn.className='tikzbtn '+cls; btn.textContent=txt;
+    setTimeout(()=>{ btn.className='tikzbtn'; btn.textContent=t0; }, 2200); };
+  try {
+    // Sweep figures re-render from the stored sweep; reference lines live in the UI, so send them.
+    const vl=document.getElementById('sw_vlines');
+    const res=await fetch('/export_pgf',{method:'POST',headers:{'Content-Type':'application/json'},
+                                         body:JSON.stringify({name:name, vlines: vl? vl.value : ''})});
+    const j=await res.json();
+    if(!j.ok){ done('err','✗'); setStatus('pgfplots export: '+(j.error||'failed'),'err'); return; }
+    _dl(j.filename,'data:application/x-tex;charset=utf-8,'+encodeURIComponent(j.tex));
+    done('ok','✓ '+j.filename);
+  } catch(e){ done('err','✗'); setStatus('pgfplots export: '+e,'err'); }
+}
 function enlarge(im){ if(!im.src) return;
   document.getElementById('lightboxImg').src = im.src;
   document.getElementById('lightbox').classList.add('on'); }
@@ -2879,6 +4106,52 @@ async function run(){
     }
   } catch(e){ setStatus('Request failed: '+e, 'err'); }
   finally { btn.disabled = false; }
+}
+
+// --- A-priori estimate: port impedance x_P(f) and WR contraction rho(f) -----------------------
+// .AC sweep counts mean different things per sweep type (per decade / per octave / total), so the
+// label tracks the selector instead of leaving "points" ambiguous.
+function xpSweepLabel(){
+  const k=document.getElementById('xp_sweep').value;
+  document.getElementById('xp_points_lbl').textContent =
+    k==='lin' ? 'Points (total)' : (k==='oct' ? 'Points / octave' : 'Points / decade');
+}
+
+// reuse=true hits /rho: rho is recomputed from the STORED x_P with the Properties panel's current
+// R_ROM/L_ROM/R_FEM/L_FEM, so re-tuning the ROM costs no Xyce solve.
+async function computeXp(reuse){
+  const btn=document.getElementById(reuse ? 'rhoBtn' : 'xpBtn');
+  const st=document.getElementById('xpStatus'), notes=document.getElementById('xpNotes');
+  btn.disabled=true;
+  st.className='sub2'; st.textContent = reuse ? 'Computing ρ...' : 'Running Xyce .AC sweep...';
+  const body={ params: collect(),
+               fstart: document.getElementById('xp_fstart').value,
+               fstop:  document.getElementById('xp_fstop').value,
+               points: document.getElementById('xp_points').value,
+               sweep:  document.getElementById('xp_sweep').value,
+               switch_time: document.getElementById('xp_switch_time').value,
+               xp_csv:  (document.getElementById('xpCsvPath').value||'').trim(),
+               rho_csv: (document.getElementById('rhoCsvPath').value||'').trim() };
+  try {
+    const res=await fetch(reuse?'/rho':'/xp',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const j=await res.json();
+    if(!j.ok){
+      st.className='sub2 err'; st.textContent='Error: '+(j.error||'unknown');
+      notes.style.display='none';
+      setPlot('p_xp', null); setPlot('p_rho', null);
+      return;
+    }
+    setPlot('p_xp', j.plots.xp); setPlot('p_rho', j.plots.rho);
+    notes.textContent=(j.notes||[]).join('\\n');
+    notes.style.display=(j.notes&&j.notes.length)?'block':'none';
+    const files=(j.files||[]).map(f=>f.split('/').pop()).join(', ');
+    st.className='sub2 ok';
+    st.textContent=j.n_points+' points, '+(j.f_range?j.f_range[0].toPrecision(3)+'..'+
+      j.f_range[1].toPrecision(3)+' Hz':'')+(files?'  → '+files:'')+
+      (j.checks_ok===false?'  (sanity check MISMATCH — see below)':'');
+  } catch(e){ st.className='sub2 err'; st.textContent='Request failed: '+e; }
+  finally { btn.disabled=false; }
 }
 
 let lastRun = null;
@@ -3075,6 +4348,7 @@ function vlinePreview(){
       if (j.ok){
         setPlot('p_sweep', j.plots ? j.plots.sweep : null);
         setPlot('p_sweep_iters', j.plots ? j.plots.iters : null);
+        setPlot('p_sweep_iters2d', j.plots ? j.plots.iters2d : null);
         showVlineVals(j.results);
       }
     } catch(e){ /* leave plots as-is */ }
@@ -3104,6 +4378,7 @@ async function runSweep(){
       setSweepStatus('Sweep done: '+j.n_ok+'/'+j.n_points+' points'+jw+' in '+j.sweep_seconds.toFixed(1)+' s.', 'ok');
       setPlot('p_sweep', j.plots ? j.plots.sweep : null);
       setPlot('p_sweep_iters', j.plots ? j.plots.iters : null);
+      setPlot('p_sweep_iters2d', j.plots ? j.plots.iters2d : null);
       showSweepTable(j.table);
       document.getElementById('vlineBar').style.display = '';   // enable post-processing lines
     }
