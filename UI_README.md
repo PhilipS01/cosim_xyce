@@ -190,17 +190,26 @@ max WR iterations, total Xyce solves, final `I_field`, and the accuracy pair —
 worst and mean WR relative error, each on its own log colour scale (they differ
 by orders of magnitude, so a shared scale would flatten the mean panel).
 
-A 2-parameter grid sweep also draws **Mean field-circuit defect**: two heatmaps
-of `mean |dV|` and `mean |dI|` (log colour scale), the inner-window defect above
-averaged over every circuit sample. Kept as its own figure rather than folded
-into the metric grid, because the two channels are not interchangeable — one is
-the cross-solver defect and the other the reconstruction error, and which is
-which flips with `coupling_mode`, so they are read as a pair.
+Every sweep also draws a **Field-circuit interface defect** figure: the
+inner-window defect above, collapsed to one number per run. Its shape follows the
+sweep —
 
-Should a cell come out **exactly zero**, it is drawn grey (a `set_under` colour,
-with the count in the panel title) rather than floored onto the log scale, which
-would invent decades of dynamic range that aren't there. The TikZ export has no
-equivalent, so it emits such cells as holes and says so in its header comment.
+- **2-parameter grid** → two heatmaps (`mean |dV|`, `mean |dI|`) on a log colour
+  scale, one per channel;
+- **single / parallel / >2-parameter grid** → two log-y panels of **mean and max**
+  against the swept parameter (or the run index for a >2-D grid).
+
+Kept as its own figure rather than folded into the metric grid, because the two
+channels are not interchangeable — one is the cross-solver defect and the other
+the reconstruction error, and which is which flips with `coupling_mode`, so they
+are read as a pair.
+
+Exact zeros can't sit on a log scale. On the heatmaps such a cell is drawn grey
+(a `set_under` colour, with the count in the panel title) rather than floored,
+which would invent decades of dynamic range that aren't there; the TikZ export
+has no equivalent, so it emits those cells as holes and says so in its header. On
+the line panels a zero is floored to the smallest positive value in that panel so
+the point still plots.
 
 **Heatmap axes follow the sweep's Spacing.** A parameter swept `log` gets a
 log-scaled axis, so its cells come out uniform instead of crowding at the small

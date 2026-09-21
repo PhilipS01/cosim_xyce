@@ -338,11 +338,14 @@ HELP = {
         "the window <i>terminals</i> &mdash; the values the WR iteration is actively driving "
         "together. This is what is left in between.</div>"
     ),
-    "defect_heatmap": (
-        "<div class='hh'>Mean field-circuit defect</div>"
-        "<div class='hn'>One cell per parameter combination: <code>mean(|dV|)</code> and "
-        "<code>mean(|dI|)</code> of the interface defect above, averaged over <b>every circuit "
-        "sample of the whole run</b> (the interpolated defect, collapsed to one number).</div>"
+    "defect_sweep": (
+        "<div class='hh'>Field-circuit interface defect across a sweep</div>"
+        "<div class='hn'>The interface defect above, collapsed to one number per run: "
+        "<code>mean(|dV|)</code> and <code>mean(|dI|)</code> over <b>every circuit sample of the "
+        "whole run</b> (the interpolated defect).</div>"
+        "<div class='hn'>Shape follows the sweep: a <b>2-parameter grid</b> gives two heatmaps, one "
+        "per channel; <b>anything else</b> (single, parallel, or a &gt;2-parameter grid on a run "
+        "index) gives two log-y panels of <b>mean and max</b> against the swept parameter.</div>"
         "<div class='hn'>Mean of the <b>absolute</b> value, because the defect ramps and resets each "
         "window and signs would partly cancel. Averaged over the whole run, not per window, so a "
         "single bad window reads as a moderate mean &mdash; <code>max_V_defect</code> / "
@@ -351,9 +354,11 @@ HELP = {
         "with each other, and neither is comparable with <b>worst f-c defect</b> (which is relative "
         "above 0.1). As on the time plot, only one panel is the genuine cross-solver defect: "
         "voltage-driven &rarr; <code>|dI|</code>, current-driven &rarr; <code>|dV|</code>.</div>"
-        "<div class='hn'>A cell that comes out <b>exactly zero</b> is drawn grey, not floored onto "
-        "the log colour scale &mdash; flooring would invent decades of range that are not there. "
-        "Blank = that combination's solve failed.</div>"
+        "<div class='hn'>On the heatmaps, a cell that comes out <b>exactly zero</b> is drawn grey "
+        "rather than floored onto the log colour scale &mdash; flooring would invent decades of "
+        "range that are not there; blank = that combination's solve failed. On the line panels an "
+        "exact zero is floored to the smallest positive value in that panel, so the point still "
+        "plots.</div>"
     ),
     "worst_FC_defect": (
         "<div class='hh'>Worst f-c defect (field vs circuit)</div>"
@@ -2576,7 +2581,7 @@ def make_sweep_plots(keys, rows, mode="single", free_keys=None, vlines=None, sca
     # so its cells are already evenly spaced and a log axis would mean nothing there.
     out.update(_make_iters_heatmap(dims, rows, mode, vlines))  # WR-iterations-per-window colormap
     out.update(_make_total_iters_heatmap(dims, rows, mode, vlines, scales))  # 2-D: total iterations
-    out.update(_make_defect_heatmap(dims, rows, mode, vlines, scales))  # 2-D: mean interface defect
+    out.update(_make_defect_plots(dims, rows, mode, vlines, scales))  # interface defect vs sweep
     return out
 
 
@@ -2987,6 +2992,58 @@ def _pgf_sweep_head(fname, title, panels, extra_notes=()):
     return head
 
 
+def _pgf_defect_lines(stem, dims, ok, mode, keys, vlines=None):
+    """pgfplots counterpart of _make_defect_line_plots: mean + max defect vs the swept parameter."""
+    index_mode = (mode == "grid" and len(dims) > 2)
+    if index_mode:
+        x = np.arange(len(ok), dtype=float)
+        xlabel, logx, data_x = "run index", False, False
+        colvals = [r["vals"][dims[0]] for r in ok] if dims else None
+        title_label = " x ".join(LABELS.get(k, k) for k in dims)
+    else:
+        x = np.array([r["value"] for r in ok], dtype=float)
+        key = dims[0] if dims else (keys[0] if keys else "")
+        xlabel, data_x, colvals = key, True, None
+        span = x.max() - x.min()
+        logx = bool(x.min() > 0 and span > 0 and (x.max() / max(x.min(), 1e-300)) >= 50)
+        title_label = LABELS.get(key, key)
+
+    def col(name):
+        return np.array([r.get(name, np.nan) for r in ok], dtype=float)
+
+    xopt = ["xmode=log"] if logx else []
+    pics, names = [], []
+    for metric, _pt, pname, ptitle, unit in _DEFECT_PANELS:
+        mean, mx = col("mean_" + metric), col("max_" + metric)
+        finite = np.concatenate([mean, mx])
+        finite = finite[np.isfinite(finite) & (finite > 0.0)]
+        if not finite.size:
+            continue
+        floor = float(finite.min())          # a log axis cannot carry an exact zero
+        series = [("mean", x, np.maximum(mean, floor),
+                   {"color": "C3", "mark": "*", "decimate": False}),
+                  ("max", x, np.maximum(mx, floor),
+                   {"dash": "dashed", "color": "C1", "mark": "square*", "decimate": False})]
+        pic = _pgf_panel(ptitle, xlabel, f"defect ({unit})", series, xopt + ["ymode=log"],
+                         vlines=vlines, colvals=colvals, data_x=data_x)
+        if pic:
+            pics.append(pic); names.append(pname)
+    if not pics:
+        return None, None
+    fname = f"sweep_{stem}_interface_defect.tex"
+    notes = ["Mean and max of |field - circuit| over every circuit sample of each run (the field "
+             "waveform interpolated onto the circuit grid), against the swept parameter. Which "
+             "channel is the real cross-solver defect flips with coupling_mode: voltage-driven -> "
+             "dI, current-driven -> dV; the other is the field-grid reconstruction error."]
+    if index_mode:
+        notes.append("x is the flat run index -- see the sweep table for the parameter tuple per run.")
+    head = _pgf_sweep_head(fname, f"Field-circuit interface defect: {title_label}.", names, notes)
+    body = []
+    for nm, pic in zip(names, pics):
+        body += [f"% --- {nm} ---"] + pic + [""]
+    return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + body)
+
+
 def pgf_sweep_tex(which, sweep, vlines=None):
     """Render a sweep figure as pgfplots. `which` is 'sweep' (the metric panels) or 'iters' (the
     WR-iterations-per-window colormap); `sweep` is the stored _LAST_SWEEP. Returns (filename, tex),
@@ -3067,10 +3124,12 @@ def pgf_sweep_tex(which, sweep, vlines=None):
                                 "WRmaxSteps and the run aborted)."])
         return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + pic + [""])
 
-    # ---- 2-parameter grid -> mean inner-window interface defect -------------
-    if which == "defect2d":
-        if mode != "grid" or len(dims) != 2:
+    # ---- interface defect: heatmaps over a 2-parameter grid, curves otherwise
+    if which == "defect_sweep":
+        if not any(r.get("mean_V_defect") is not None for r in ok):
             return None, None
+        if not (mode == "grid" and len(dims) == 2):
+            return _pgf_defect_lines(stem, dims, ok, mode, keys, vlines)
         kx, ky = dims[0], dims[1]
         xs = sorted({r["vals"][kx] for r in rows if r.get("vals")})
         ys = sorted({r["vals"][ky] for r in rows if r.get("vals")})
@@ -3080,11 +3139,9 @@ def pgf_sweep_tex(which, sweep, vlines=None):
         iy = {v: i for i, v in enumerate(ys)}
         gx, gy = _axis_is_log(xs, scales.get(kx)), _axis_is_log(ys, scales.get(ky))
         pics, names = [], []
-        for nm, name, title, unit in (
-                ("mean_V_defect", "Mean |dV| (field - circuit)",
-                 r"$\mathrm{Mean}\;|\Delta V|\;(\mathrm{field}-\mathrm{circuit})$", "V"),
-                ("mean_I_defect", "Mean |dI| (field - circuit)",
-                 r"$\mathrm{Mean}\;|\Delta I|\;(\mathrm{field}-\mathrm{circuit})$", "A")):
+        for metric, _pt, pname, ptitle, unit in _DEFECT_PANELS:
+            nm, name = "mean_" + metric, "Mean " + pname
+            title = r"$\mathrm{Mean}\;$" + ptitle
             # A log colour scale cannot carry an exact zero, and flooring it would invent a value.
             # Zeros are emitted as holes; the header comment says so.
             M = np.full((len(ys), len(xs)), np.nan)
@@ -3340,18 +3397,26 @@ def _make_total_iters_heatmap(dims, rows, mode, vlines=None, scales=None):
     return {"iters2d": _png(fig)}
 
 
-def _make_defect_heatmap(dims, rows, mode, vlines=None, scales=None):
-    """Mean inner-window field-circuit defect over a 2-parameter grid: |dV| and |dI| averaged over
-    every sample of every window (see interface_defect), one panel each.
+# The two defect channels, as (metric key, PNG panel title, TeX panel name, TeX title, unit).
+_DEFECT_PANELS = (
+    ("V_defect", r"$|\Delta V|$   (field $-$ circuit)", "|dV| (field - circuit)",
+     r"$|\Delta V|\;(\mathrm{field}-\mathrm{circuit})$", "V"),
+    ("I_defect", r"$|\Delta I|$   (field $-$ circuit)", "|dI| (field - circuit)",
+     r"$|\Delta I|\;(\mathrm{field}-\mathrm{circuit})$", "A"),
+)
 
-    Kept out of the main grid figure because the two channels are not interchangeable: one of them
-    is the genuine cross-solver defect and the other the field-grid reconstruction error, and which
-    is which flips with coupling_mode -- so they are read as a pair, not as two more metrics."""
-    if mode != "grid" or len(dims) != 2:
-        return {}
+
+def _make_defect_plots(dims, rows, mode, vlines=None, scales=None):
+    """Interface defect across a sweep: two heatmaps over a 2-parameter grid, two curves otherwise.
+
+    Kept out of the main metric figure because the two channels are not interchangeable: one is the
+    genuine cross-solver defect and the other the field-grid reconstruction error, and which is
+    which flips with coupling_mode -- so they are read as a pair, not as two more metrics."""
     ok = [r for r in rows if r.get("ok")]
     if not ok or not any(r.get("mean_V_defect") is not None for r in ok):
         return {}
+    if not (mode == "grid" and len(dims) == 2):
+        return _make_defect_line_plots(dims, ok, mode, vlines)
     kx, ky = dims[0], dims[1]
     xs = sorted({r["vals"][kx] for r in rows if r.get("vals")})
     ys = sorted({r["vals"][ky] for r in rows if r.get("vals")})
@@ -3377,11 +3442,8 @@ def _make_defect_heatmap(dims, rows, mode, vlines=None, scales=None):
     xe, ye = _cell_edges(xs, logx), _cell_edges(ys, logy)
     from matplotlib.colors import LogNorm
     fig, axes = plt.subplots(1, 2, figsize=(11.4, 4.2))
-    for ax, (name, title, unit) in zip(
-            axes.flat,
-            [("mean_V_defect", r"mean $|\Delta V|$   (field $-$ circuit)", "V"),
-             ("mean_I_defect", r"mean $|\Delta I|$   (field $-$ circuit)", "A")]):
-        g = grid(name)
+    for ax, (metric, title, _n, _t, unit) in zip(axes.flat, _DEFECT_PANELS):
+        g = grid("mean_" + metric)
         pos = g[np.isfinite(g) & (g > 0.0)]
         n_zero = int(np.sum(np.isfinite(g) & (g == 0.0)))
         cmap = plt.get_cmap("inferno").copy()
@@ -3401,7 +3463,7 @@ def _make_defect_heatmap(dims, rows, mode, vlines=None, scales=None):
             sub = "  -- all exactly 0"
         elif n_zero:
             sub = f"  -- {n_zero} cell(s) exactly 0 (grey)"
-        ax.set_title(title + sub, fontsize=10)
+        ax.set_title("mean " + title + sub, fontsize=10)
         ax.set_xlabel(kx); ax.set_ylabel(ky)
         _heatmap_axis(ax, "x", xs, logx)
         _heatmap_axis(ax, "y", ys, logy)
@@ -3409,7 +3471,54 @@ def _make_defect_heatmap(dims, rows, mode, vlines=None, scales=None):
     fig.suptitle(f"Mean field-circuit defect: {LABELS.get(kx, kx)}  x  {LABELS.get(ky, ky)}",
                  fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    return {"defect2d": _png(fig)}
+    return {"defect_sweep": _png(fig)}
+
+
+def _make_defect_line_plots(dims, ok, mode, vlines=None):
+    """Mean and max interface defect vs the swept parameter (single / parallel / >2-D grid).
+
+    Log y: the defect routinely spans decades across a sweep. One panel per channel rather than
+    twin axes -- the two carry different units (V and A) and are compared against themselves across
+    the sweep, not against each other."""
+    index_mode = (mode == "grid" and len(dims) > 2)
+    if index_mode:
+        x = np.arange(len(ok), dtype=float)
+        xlabel, logx, data_x = "run index", False, False
+        colvals = [r["vals"][dims[0]] for r in ok] if dims else None
+        title_label = " x ".join(LABELS.get(k, k) for k in dims)
+    else:
+        x = np.array([r["value"] for r in ok], dtype=float)
+        key = dims[0] if dims else ""
+        xlabel, data_x, colvals = key, True, None
+        span = x.max() - x.min()
+        logx = bool(x.min() > 0 and span > 0 and (x.max() / max(x.min(), 1e-300)) >= 50)
+        title_label = LABELS.get(key, key)
+        if mode == "parallel" and len(dims) > 1:
+            title_label += " (lock-step with " + ", ".join(dims[1:]) + ")"
+
+    def col(name):
+        return np.array([r.get(name, np.nan) for r in ok], dtype=float)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.4, 3.6))
+    for ax, (metric, title, _n, _t, unit) in zip(axes.flat, _DEFECT_PANELS):
+        mean, mx = col("mean_" + metric), col("max_" + metric)
+        # A defect of exactly 0 cannot sit on a log axis; floor it at the smallest POSITIVE value
+        # in the panel so the point still plots without inventing dynamic range below the data.
+        finite = np.concatenate([mean, mx])
+        finite = finite[np.isfinite(finite) & (finite > 0.0)]
+        floor = float(finite.min()) if finite.size else 1e-18
+        ax.semilogy(x, np.maximum(mean, floor), "o-", ms=4, color="tab:red", label="mean")
+        ax.semilogy(x, np.maximum(mx, floor), "s--", ms=4, color="tab:orange", label="max")
+        ax.set_xlabel(xlabel); ax.set_ylabel(f"defect ({unit})")
+        ax.set_title(title, fontsize=10)
+        if logx:
+            ax.set_xscale("log")
+        ax.grid(True, which="both", alpha=.3)
+        ax.legend(fontsize=8, loc="upper right")
+        _draw_vlines(ax, vlines, colvals=colvals, data_x=data_x)
+    fig.suptitle(f"Field-circuit interface defect: {title_label}", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    return {"defect_sweep": _png(fig)}
 
 
 def _draw_vlines(ax, vlines, colvals=None, data_x=False):
@@ -3761,7 +3870,7 @@ class Handler(BaseHTTPRequestHandler):
                     # against the sweep's base params, exactly as /sweep_replot does.
                     vl = eval_vlines(body.get("vlines"), _LAST_SWEEP.get("params") or {})
                     which = {"sweep_iters": "iters", "sweep_iters2d": "iters2d",
-                             "sweep_defect2d": "defect2d"}.get(nm, "sweep")
+                             "sweep_defect": "defect_sweep"}.get(nm, "sweep")
                     fname, tex = pgf_sweep_tex(which, _LAST_SWEEP, vl)
                 else:
                     fname, tex = pgfplots_tex(nm, _LAST_RUN["data"], _LAST_RUN.get("params"))
@@ -4495,9 +4604,9 @@ INDEX_HTML = """<!doctype html>
         <button class="tikzbtn" onclick="exportPgf('sweep_iters',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
       <figure class="pbox wide" id="box_sweep_iters2d"><img class="plot" id="p_sweep_iters2d" onclick="enlarge(this)">
         <button class="tikzbtn" onclick="exportPgf('sweep_iters2d',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
-      <figure class="pbox wide" id="box_sweep_defect2d"><img class="plot" id="p_sweep_defect2d" onclick="enlarge(this)">
-        <span class="help" data-help="defect_heatmap">?</span>
-        <button class="tikzbtn" onclick="exportPgf('sweep_defect2d',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox wide" id="box_sweep_defect"><img class="plot" id="p_sweep_defect" onclick="enlarge(this)">
+        <span class="help" data-help="defect_sweep">?</span>
+        <button class="tikzbtn" onclick="exportPgf('sweep_defect',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
     </div>
     <div id="vlineBar" style="display:none">
       <div class="btns" style="margin-top:12px;align-items:center;gap:10px">
@@ -4993,7 +5102,7 @@ function vlinePreview(){
         setPlot('p_sweep', j.plots ? j.plots.sweep : null);
         setPlot('p_sweep_iters', j.plots ? j.plots.iters : null);
         setPlot('p_sweep_iters2d', j.plots ? j.plots.iters2d : null);
-        setPlot('p_sweep_defect2d', j.plots ? j.plots.defect2d : null);
+        setPlot('p_sweep_defect', j.plots ? j.plots.defect_sweep : null);
         showVlineVals(j.results);
       }
     } catch(e){ /* leave plots as-is */ }
@@ -5059,7 +5168,7 @@ async function runSweep(){
       setPlot('p_sweep', j.plots ? j.plots.sweep : null);
       setPlot('p_sweep_iters', j.plots ? j.plots.iters : null);
       setPlot('p_sweep_iters2d', j.plots ? j.plots.iters2d : null);
-      setPlot('p_sweep_defect2d', j.plots ? j.plots.defect2d : null);
+      setPlot('p_sweep_defect', j.plots ? j.plots.defect_sweep : null);
       showSweepTable(j.table);
       document.getElementById('vlineBar').style.display = '';   // enable post-processing lines
     }
