@@ -293,9 +293,14 @@ Derived rows appear in the per-point table and the exported CSV like any other
 parameter, so the value actually used is always on the record.
 
 Both sweep figures carry the same **TikZ** button as the results plots. Because
-the on-screen figures are composites, the exported `.tex` holds **one
-independent `tikzpicture` per panel** — copy the one you want into its own file,
-or `\input` the whole file to typeset them in sequence. The two twin-axis panels
+the on-screen figures are composites, clicking TikZ on one opens a **panel
+picker**: *All N panels (one file)*, or any single panel on its own. The
+all-panels file holds one independent `tikzpicture` per panel and `\input`s them
+in sequence; a single-panel file carries just that picture, is named after it
+(`sweep_<params>_grid_mean_wr_rel_error.tex`), and heads with which panel of
+which figure it is — so several panels of the same sweep can sit side by side in
+a thesis without colliding. Single-picture figures (the iterations colormaps, the
+results plots) download straight away with no menu. The two twin-axis panels
 are split so each quantity gets its own axis (six panels: WR iterations, Xyce
 solves, solver time, WR accuracy, final `I_field`, final `V_field`); a 2-parameter
 grid sweep exports its five heatmaps instead, and the iterations colormap exports

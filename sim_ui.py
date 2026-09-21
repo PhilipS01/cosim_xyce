@@ -2969,30 +2969,76 @@ def _pgf_matrix_panel(title, xlabel, ylabel, xs, ys, M, bar_label, log=False, re
     return ["\\begin{tikzpicture}"] + body + ["\\end{tikzpicture}"]
 
 
-def _pgf_sweep_head(fname, title, panels, extra_notes=()):
-    """Comment header: preamble lines, how to use one panel, and what the panels are."""
+def _pgf_sweep_head(fname, title, panels, extra_notes=(), single=False):
+    """Comment header: preamble lines, how to use one panel, and what the panels are.
+
+    `single` heads a file holding ONE panel of a composite figure (see _pgf_emit), so it names that
+    panel instead of enumerating them and drops the "copy the one you want out" instructions."""
     head = [f"% Sweep figure exported by sim_ui.py -- {time.strftime('%Y-%m-%d %H:%M:%S')}",
             "%",
             r"% Preamble (once, in your thesis):",
             r"%   \usepackage{pgfplots}",
             r"%   \pgfplotsset{compat=1.18}",
             "%",
-            f"% {title}",
-            f"% This file holds {len(panels)} INDEPENDENT tikzpicture environments, one per panel:"]
-    head += [f"%   {i + 1}. {p}" for i, p in enumerate(panels)]
-    head += ["%",
-             r"% \input{" + fname[:-4] + "} typesets them in sequence; to use one on its own, copy that",
-             r"% tikzpicture into its own file and \input that instead:",
-             r"%   \begin{figure}[htbp]\centering",
-             "%     \\input{" + fname[:-4] + "}",
-             r"%     \caption{...}\label{fig:...}",
-             r"%   \end{figure}"]
+            f"% {title}"]
+    if single:
+        head += [f"% This file holds ONE panel of that figure: {panels[0]}.",
+                 "%",
+                 r"% Use:",
+                 r"%   \begin{figure}[htbp]\centering",
+                 "%     \\input{" + fname[:-4] + "}",
+                 r"%     \caption{...}\label{fig:...}",
+                 r"%   \end{figure}"]
+    else:
+        head += [f"% This file holds {len(panels)} INDEPENDENT tikzpicture environments, one per panel:"]
+        head += [f"%   {i + 1}. {p}" for i, p in enumerate(panels)]
+        head += ["%",
+                 r"% \input{" + fname[:-4] + "} typesets them in sequence; to use one on its own, copy that",
+                 r"% tikzpicture into its own file and \input that instead:",
+                 r"%   \begin{figure}[htbp]\centering",
+                 "%     \\input{" + fname[:-4] + "}",
+                 r"%     \caption{...}\label{fig:...}",
+                 r"%   \end{figure}"]
     for n in extra_notes:
         head += ["%", "% " + n]
     return head
 
 
-def _pgf_defect_lines(stem, dims, ok, mode, keys, vlines=None):
+def _pgf_slug(name):
+    """Panel name -> a filename-safe stem fragment."""
+    return re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9]+", "_", name)).strip("_").lower() or "panel"
+
+
+# Marks each tikzpicture in a composite export; also how the studio recovers the panel list.
+_PGF_PANEL_MARK = re.compile(r"^% --- (.+?) ---$", re.M)
+
+
+def pgf_panel_names(tex):
+    """Panel names of an assembled export, in order ([] for a single-picture figure)."""
+    return _PGF_PANEL_MARK.findall(tex or "")
+
+
+def _pgf_emit(fname, title, names, pics, notes=(), panel=None):
+    """Assemble an export: every panel in sequence, or just `panel` (an index) on its own.
+
+    Selecting one panel renames the file with a slug of the panel, so several panels of the same
+    sweep can sit side by side in a thesis without colliding. Returns (filename, tex)."""
+    if not pics:
+        return None, None
+    if panel is None:
+        head = _pgf_sweep_head(fname, title, names, notes)
+        body = []
+        for nm, pic in zip(names, pics):
+            body += [f"% --- {nm} ---"] + pic + [""]
+        return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + body)
+    if not (0 <= panel < len(pics)):
+        return None, None
+    one = f"{fname[:-4]}_{_pgf_slug(names[panel])}.tex"
+    head = _pgf_sweep_head(one, title, [names[panel]], notes, single=True)
+    return one, "\n".join(head + [""] + _pgf_colordefs() + [""] + pics[panel] + [""])
+
+
+def _pgf_defect_lines(stem, dims, ok, mode, keys, vlines=None, panel=None):
     """pgfplots counterpart of _make_defect_line_plots: mean + max defect vs the swept parameter."""
     index_mode = (mode == "grid" and len(dims) > 2)
     if index_mode:
@@ -3037,17 +3083,15 @@ def _pgf_defect_lines(stem, dims, ok, mode, keys, vlines=None):
              "dI, current-driven -> dV; the other is the field-grid reconstruction error."]
     if index_mode:
         notes.append("x is the flat run index -- see the sweep table for the parameter tuple per run.")
-    head = _pgf_sweep_head(fname, f"Field-circuit interface defect: {title_label}.", names, notes)
-    body = []
-    for nm, pic in zip(names, pics):
-        body += [f"% --- {nm} ---"] + pic + [""]
-    return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + body)
+    return _pgf_emit(fname, f"Field-circuit interface defect: {title_label}.", names, pics,
+                     notes, panel)
 
 
-def pgf_sweep_tex(which, sweep, vlines=None):
-    """Render a sweep figure as pgfplots. `which` is 'sweep' (the metric panels) or 'iters' (the
-    WR-iterations-per-window colormap); `sweep` is the stored _LAST_SWEEP. Returns (filename, tex),
-    or (None, None) when there is nothing to draw."""
+def pgf_sweep_tex(which, sweep, vlines=None, panel=None):
+    """Render a sweep figure as pgfplots. `which` is 'sweep' (the metric panels), 'iters' (the
+    WR-iterations-per-window colormap), 'iters2d' or 'defect_sweep'; `sweep` is the stored
+    _LAST_SWEEP. `panel` selects ONE panel of a composite figure by index (None = all of them).
+    Returns (filename, tex), or (None, None) when there is nothing to draw."""
     keys = sweep.get("keys") or []
     rows = sweep.get("rows") or []
     mode = sweep.get("mode", "single")
@@ -3087,10 +3131,10 @@ def pgf_sweep_tex(which, sweep, vlines=None):
         if pic is None:
             return None, None
         fname = f"sweep_{stem}_iterations_per_window.tex"
-        head = _pgf_sweep_head(fname, "WR iterations per window over the sweep.",
-                               ["WR iterations per window (colormap)"],
-                               ["Window 1 is at the top (y dir=reverse), matching the on-screen figure."])
-        return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + pic + [""])
+        return _pgf_emit(fname, "WR iterations per window over the sweep.",
+                         ["WR iterations per window (colormap)"], [pic],
+                         ["Window 1 is at the top (y dir=reverse), matching the on-screen figure."],
+                         panel)
 
     # ---- 2-parameter grid -> total WR iterations per combination ------------
     if which == "iters2d":
@@ -3115,21 +3159,20 @@ def pgf_sweep_tex(which, sweep, vlines=None):
         if pic is None:
             return None, None
         fname = f"sweep_{stem}_total_iterations.tex"
-        head = _pgf_sweep_head(fname,
-                               f"Total WR iterations over the {LABELS.get(kx, kx)} x "
-                               f"{LABELS.get(ky, ky)} grid.",
-                               ["Total WR iterations (colormap)"],
-                               ["Colour is the whole run's iteration count summed over every window. "
-                                "Blank cells are combinations whose solve failed (a window hit "
-                                "WRmaxSteps and the run aborted)."])
-        return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + pic + [""])
+        return _pgf_emit(fname,
+                         f"Total WR iterations over the {LABELS.get(kx, kx)} x "
+                         f"{LABELS.get(ky, ky)} grid.",
+                         ["Total WR iterations (colormap)"], [pic],
+                         ["Colour is the whole run's iteration count summed over every window. "
+                          "Blank cells are combinations whose solve failed (a window hit "
+                          "WRmaxSteps and the run aborted)."], panel)
 
     # ---- interface defect: heatmaps over a 2-parameter grid, curves otherwise
     if which == "defect_sweep":
         if not any(r.get("mean_V_defect") is not None for r in ok):
             return None, None
         if not (mode == "grid" and len(dims) == 2):
-            return _pgf_defect_lines(stem, dims, ok, mode, keys, vlines)
+            return _pgf_defect_lines(stem, dims, ok, mode, keys, vlines, panel)
         kx, ky = dims[0], dims[1]
         xs = sorted({r["vals"][kx] for r in rows if r.get("vals")})
         ys = sorted({r["vals"][ky] for r in rows if r.get("vals")})
@@ -3156,22 +3199,18 @@ def pgf_sweep_tex(which, sweep, vlines=None):
         if not pics:
             return None, None
         fname = f"sweep_{stem}_interface_defect.tex"
-        head = _pgf_sweep_head(fname,
-                               f"Mean field-circuit interface defect over the "
-                               f"{LABELS.get(kx, kx)} x {LABELS.get(ky, ky)} grid.", names,
-                               ["Colour is |field - circuit| averaged over every instant where BOTH "
-                                "solvers have a sample (no interpolation), not just the window "
-                                "terminals. Which channel is the real cross-solver defect flips with "
-                                "coupling_mode: voltage-driven -> dI, current-driven -> dV; the "
-                                "other channel is the field-grid reconstruction error.",
-                                "A BLANK cell is either a combination whose solve failed or one "
-                                "whose defect is EXACTLY zero -- a log colour scale cannot carry a "
-                                "zero, and flooring it would invent a value. The on-screen figure "
-                                "separates the two (grey = exactly zero)."])
-        body = []
-        for nm, pic in zip(names, pics):
-            body += [f"% --- {nm} ---"] + pic + [""]
-        return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + body)
+        return _pgf_emit(fname,
+                         f"Mean field-circuit interface defect over the "
+                         f"{LABELS.get(kx, kx)} x {LABELS.get(ky, ky)} grid.", names, pics,
+                         ["Colour is |field - circuit| averaged over every instant where BOTH "
+                          "solvers have a sample, not just the window terminals. Which channel is "
+                          "the real cross-solver defect flips with coupling_mode: voltage-driven "
+                          "-> dI, current-driven -> dV; the other channel is the field-grid "
+                          "reconstruction error.",
+                          "A BLANK cell is either a combination whose solve failed or one whose "
+                          "defect is EXACTLY zero -- a log colour scale cannot carry a zero, and "
+                          "flooring it would invent a value. The on-screen figure separates the "
+                          "two (grey = exactly zero)."], panel)
 
     # ---- 2-parameter grid -> heatmaps ---------------------------------------
     if mode == "grid" and len(dims) == 2:
@@ -3205,14 +3244,10 @@ def pgf_sweep_tex(which, sweep, vlines=None):
         if not pics:
             return None, None
         fname = f"sweep_{stem}_grid.tex"
-        head = _pgf_sweep_head(fname,
-                               f"Grid sweep: {LABELS.get(kx, kx)} x {LABELS.get(ky, ky)}.", names,
-                               ["Every panel uses pgfplots' built-in viridis colormap; the on-screen "
-                                "figure varies the colormap per panel."])
-        body = []
-        for nm, pic in zip(names, pics):
-            body += [f"% --- {nm} ---"] + pic + [""]
-        return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + body)
+        return _pgf_emit(fname, f"Grid sweep: {LABELS.get(kx, kx)} x {LABELS.get(ky, ky)}.",
+                         names, pics,
+                         ["Every panel uses pgfplots' built-in viridis colormap; the on-screen "
+                          "figure varies the colormap per panel."], panel)
 
     # ---- line panels (single / parallel, or >2-D grid -> run index) ---------
     index_mode = (mode == "grid" and len(dims) > 2)
@@ -3273,11 +3308,8 @@ def pgf_sweep_tex(which, sweep, vlines=None):
              "no curve is read against a hidden second scale."]
     if index_mode:
         notes.append("x is the flat run index -- see the sweep table for the parameter tuple per run.")
-    head = _pgf_sweep_head(fname, f"Convergence study: sweep of {title_label}.", names, notes)
-    body = []
-    for nm, pic in zip(names, pics):
-        body += [f"% --- {nm} ---"] + pic + [""]
-    return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + body)
+    return _pgf_emit(fname, f"Convergence study: sweep of {title_label}.", names, pics,
+                     notes, panel)
 
 def _xpos_for_value(colvals, value):
     """Map a parameter value to a fractional column position (centres at k+0.5),
@@ -3841,6 +3873,12 @@ class Handler(BaseHTTPRequestHandler):
             # One plot -> a thesis-ready pgfplots figure, rendered from the LAST run's / sweep's
             # parsed data (no re-solve). "sweep_*" names come from the sweep figures.
             nm = body.get("name", "")
+            # `panel` selects ONE panel of a composite sweep figure; absent = the whole thing, and
+            # the reply then lists the panels so the studio can offer them individually.
+            try:
+                panel = int(body["panel"]) if body.get("panel") is not None else None
+            except (TypeError, ValueError):
+                panel = None
             # The a-priori figures re-render from _LAST_XP (their own store), not from a run/sweep.
             if nm in _XP_TEX:
                 if not _LAST_XP:
@@ -3871,15 +3909,21 @@ class Handler(BaseHTTPRequestHandler):
                     vl = eval_vlines(body.get("vlines"), _LAST_SWEEP.get("params") or {})
                     which = {"sweep_iters": "iters", "sweep_iters2d": "iters2d",
                              "sweep_defect": "defect_sweep"}.get(nm, "sweep")
-                    fname, tex = pgf_sweep_tex(which, _LAST_SWEEP, vl)
+                    fname, tex = pgf_sweep_tex(which, _LAST_SWEEP, vl, panel)
                 else:
                     fname, tex = pgfplots_tex(nm, _LAST_RUN["data"], _LAST_RUN.get("params"))
                 if not tex:
                     self._send(200, json.dumps({
                         "ok": False,
-                        "error": "that figure has no data in this " + ("sweep" if sweep else "run")}))
+                        "error": ("no such panel in that figure" if panel is not None else
+                                  "that figure has no data in this "
+                                  + ("sweep" if sweep else "run"))}))
                 else:
-                    self._send(200, json.dumps({"ok": True, "filename": fname, "tex": tex}))
+                    out = {"ok": True, "filename": fname, "tex": tex}
+                    if panel is None:
+                        # Only meaningful for the whole-figure reply; a single panel carries no marks.
+                        out["panels"] = pgf_panel_names(tex)
+                    self._send(200, json.dumps(out))
             except Exception as e:
                 self._send(200, json.dumps({"ok": False, "error": str(e),
                                             "trace": traceback.format_exc()[-2000:]}))
@@ -4304,6 +4348,15 @@ INDEX_HTML = """<!doctype html>
   .pbox .tikzbtn.busy { opacity:1; color:var(--muted); }
   .pbox .tikzbtn.ok { opacity:1; color:var(--ok); border-color:var(--ok); }
   .pbox .tikzbtn.err { opacity:1; color:var(--err); border-color:var(--err); }
+  /* Panel picker for a composite figure, hung under its TikZ button. */
+  .pgfmenu { position:absolute; top:32px; right:8px; z-index:6; background:var(--bg);
+        border:1px solid var(--line-strong); box-shadow:0 8px 24px rgba(0,0,0,.12);
+        max-width:min(320px,90%); }
+  .pgfmenu button { display:block; width:100%; text-align:left; border:0; border-radius:0;
+        padding:6px 12px; font-size:11.5px; font-weight:400; background:none; white-space:nowrap;
+        overflow:hidden; text-overflow:ellipsis; }
+  .pgfmenu button:hover { background:var(--field); }
+  .pgfmenu button.all { border-bottom:1px solid var(--line); font-weight:600; }
   /* Figure-level help sits top-LEFT so it never collides with the TikZ button, and stays visible
      (unlike the button) because it is the only hint that a figure needs explaining. */
   .pbox .help { position:absolute; top:8px; left:8px; margin-left:0; background:var(--bg);
@@ -4785,19 +4838,49 @@ function setPlot(id, src){ const im = document.getElementById(id);
   if(src){ im.src=src; im.style.display='block'; if(box) box.style.display='block'; }
   else { im.removeAttribute('src'); im.style.display='none'; if(box) box.style.display='none'; } }
 
+const _texUri = tex => 'data:application/x-tex;charset=utf-8,'+encodeURIComponent(tex);
+function closePgfMenu(){ document.querySelectorAll('.pgfmenu').forEach(m => m.remove()); }
+
+// A composite figure (the sweep metric panels, the grid heatmaps) offers its panels one by one.
+// The whole-figure reply already carries the tex, so "All panels" needs no second request.
+function pgfMenu(btn, name, all){
+  closePgfMenu();
+  const box = btn.closest('.pbox'); if(!box) return;
+  const m = document.createElement('div'); m.className = 'pgfmenu';
+  const add = (label, cls, fn) => {
+    const b = document.createElement('button'); b.type='button'; b.textContent=label;
+    if(cls) b.className=cls;
+    b.onclick = e => { e.stopPropagation(); closePgfMenu(); fn(); };
+    m.appendChild(b);
+  };
+  add('All '+all.panels.length+' panels (one file)', 'all',
+      () => _dl(all.filename, _texUri(all.tex)));
+  all.panels.forEach((p, i) => add((i+1)+'. '+p, '', () => exportPgf(name, btn, i)));
+  box.appendChild(m);
+  // Defer, or this very click would close the menu it just opened.
+  setTimeout(() => document.addEventListener('click', closePgfMenu, {once:true}), 0);
+}
+
 // Download one results plot as a thesis-ready pgfplots figure (an input-able tikzpicture).
-async function exportPgf(name, btn){
-  const t0=btn.textContent; btn.className='tikzbtn busy'; btn.textContent='...';
+// `panel` (optional) picks a single panel of a composite figure by index.
+async function exportPgf(name, btn, panel){
+  const t0 = btn.dataset.t0 || btn.textContent; btn.dataset.t0 = t0;
+  const one = (panel !== undefined && panel !== null);
+  btn.className='tikzbtn busy'; btn.textContent='...';
+  const reset=()=>{ btn.className='tikzbtn'; btn.textContent=t0; };
   const done=(cls,txt)=>{ btn.className='tikzbtn '+cls; btn.textContent=txt;
-    setTimeout(()=>{ btn.className='tikzbtn'; btn.textContent=t0; }, 2200); };
+    setTimeout(reset, 2200); };
   try {
     // Sweep figures re-render from the stored sweep; reference lines live in the UI, so send them.
     const vl=document.getElementById('sw_vlines');
+    const body={name:name, vlines: vl? vl.value : ''};
+    if(one) body.panel = panel;
     const res=await fetch('/export_pgf',{method:'POST',headers:{'Content-Type':'application/json'},
-                                         body:JSON.stringify({name:name, vlines: vl? vl.value : ''})});
+                                         body:JSON.stringify(body)});
     const j=await res.json();
     if(!j.ok){ done('err','✗'); setStatus('pgfplots export: '+(j.error||'failed'),'err'); return; }
-    _dl(j.filename,'data:application/x-tex;charset=utf-8,'+encodeURIComponent(j.tex));
+    if(!one && (j.panels||[]).length > 1){ reset(); pgfMenu(btn, name, j); return; }
+    _dl(j.filename, _texUri(j.tex));
     done('ok','✓ '+j.filename);
   } catch(e){ done('err','✗'); setStatus('pgfplots export: '+e,'err'); }
 }
