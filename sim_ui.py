@@ -81,7 +81,7 @@ PARAMS = [
         {0: "linear", 1: "magnetic saturation"}),
     ("I_sat",                           "I_sat saturation current (A)", 100.0,    "float", None),
     ("t_end",                           "Sim duration (s)",             2.0e-2,   "float", None),
-    ("N_field_windows",                 "Field windows (total)",        50,       "int",   (1, 400, 1)),
+    ("N_field_windows",                 "WR windows (total)",           50,       "int",   (1, 400, 1)),
     ("N_field_eval_intervals",          "FEM eval intervals / window",  1,        "int",   (1, 64, 1)),
     ("N_xyce_samples",                  "Xyce solution samples",        100,      "int",   (1, 400, 1)),
     ("WRmaxSteps",                      "WR max iterations",            20,       "int",   (1, 100, 1)),
