@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2245,7 +2246,49 @@ def _sweep_point(base_params, keys, pt):
         shutil.rmtree(d, ignore_errors=True)
 
 
-def run_sweep(base_params, keys, points, workers=None):
+# Live progress of the running sweep, polled by the studio at /sweep_progress. The sweep itself is
+# one long POST; ThreadingHTTPServer answers the poll on a different thread, so this needs no
+# streaming or background task. One sweep at a time -- a second one simply takes the slot over.
+_SWEEP_PROGRESS = {"active": False, "done": 0, "total": 0, "ok": 0, "failed": 0,
+                   "started": 0.0, "workers": 1, "label": ""}
+_SWEEP_PROGRESS_LOCK = threading.Lock()
+
+
+def sweep_progress_begin(total, workers, label):
+    with _SWEEP_PROGRESS_LOCK:
+        _SWEEP_PROGRESS.update({"active": True, "done": 0, "total": int(total), "ok": 0,
+                                "failed": 0, "started": time.time(),
+                                "workers": int(workers), "label": str(label)})
+
+
+def sweep_progress_step(row):
+    """One point finished (called from the worker thread that ran it)."""
+    with _SWEEP_PROGRESS_LOCK:
+        _SWEEP_PROGRESS["done"] += 1
+        _SWEEP_PROGRESS["ok" if (row or {}).get("ok") else "failed"] += 1
+
+
+def sweep_progress_end():
+    with _SWEEP_PROGRESS_LOCK:
+        _SWEEP_PROGRESS["active"] = False
+
+
+def sweep_progress_snapshot():
+    """Progress plus a linear ETA from the mean wall time per completed point.
+
+    Linear is honest for `parallel`/`grid` sweeps of a fixed circuit -- every point is one full
+    solve -- but it will drift when the swept parameter itself changes the cost per point (more
+    windows, more WR iterations), so the UI labels it a rough estimate."""
+    with _SWEEP_PROGRESS_LOCK:
+        p = dict(_SWEEP_PROGRESS)
+    p["elapsed"] = round(time.time() - p["started"], 2) if p["started"] else 0.0
+    done, total = p["done"], p["total"]
+    p["eta"] = round(p["elapsed"] / done * (total - done), 1) if done and total > done else 0.0
+    p["frac"] = (done / total) if total else 0.0
+    return p
+
+
+def run_sweep(base_params, keys, points, workers=None, on_done=None):
     """Run the solver once per swept point; collect per-point metrics.
 
     Each point runs in its own temp working directory, so points can execute
@@ -2253,6 +2296,9 @@ def run_sweep(base_params, keys, points, workers=None):
     released while it runs). Results are returned in input order regardless of
     completion order. `workers=None` -> os.cpu_count(). For back-compat a single
     string key + list of scalars is also accepted (classic 1-parameter sweep).
+
+    `on_done(row)` fires as each point COMPLETES (so, in completion order, from whichever worker
+    thread ran it) -- that is what drives the progress bar. It must be cheap and thread-safe.
     """
     if isinstance(keys, str):  # legacy call: run_sweep(base, key, values)
         keys = [keys]
@@ -2262,13 +2308,22 @@ def run_sweep(base_params, keys, points, workers=None):
         workers = os.cpu_count() or 1
     workers = max(1, min(int(workers), n or 1))
     if workers == 1:
-        return [_sweep_point(base_params, keys, pt) for pt in points]
+        rows = []
+        for pt in points:
+            row = _sweep_point(base_params, keys, pt)
+            rows.append(row)
+            if on_done:
+                on_done(row)
+        return rows
     rows = [None] * n
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_sweep_point, base_params, keys, pt): i
                 for i, pt in enumerate(points)}
         for fut in as_completed(futs):
-            rows[futs[fut]] = fut.result()
+            row = fut.result()
+            rows[futs[fut]] = row
+            if on_done:
+                on_done(row)
     return rows
 
 
@@ -3133,6 +3188,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send(200, INDEX_HTML, "text/html; charset=utf-8")
+        elif self.path.startswith("/sweep_progress"):
+            # Polled while a sweep POST is in flight; must stay cheap and never block on it.
+            self._send(200, json.dumps(sweep_progress_snapshot()))
         elif self.path.startswith("/netlist"):
             self._handle_netlist()
         else:
@@ -3390,7 +3448,13 @@ class Handler(BaseHTTPRequestHandler):
             workers = int(body.get("workers") or 0) or None
             workers_used = max(1, min(workers or (os.cpu_count() or 1), len(points) or 1))
             t0 = time.perf_counter()
-            rows = run_sweep(base, keys, points, workers)
+            label = (" x " if mode == "grid" and len(keys) > 1 else " + ").join(
+                LABELS.get(k, k) for k in keys)
+            sweep_progress_begin(len(points), workers_used, label)
+            try:
+                rows = run_sweep(base, keys, points, workers, on_done=sweep_progress_step)
+            finally:
+                sweep_progress_end()
             total = round(time.perf_counter() - t0, 3)
             n_ok = sum(1 for r in rows if r.get("ok"))
             # Keep the result so reference lines can be re-drawn (Results section)
@@ -3595,6 +3659,11 @@ INDEX_HTML = """<!doctype html>
   button:disabled { opacity:.45; cursor:default; }
 
   .mini { font-size:11px; color:var(--muted); font-family:ui-monospace,monospace; }
+  /* sweep progress: flat bar with an accent fill, same treatment as the fields/buttons */
+  .prog { margin-top:12px; }
+  .prog-bar { height:6px; background:var(--line); border:1px solid var(--line-strong); }
+  .prog-fill { height:100%; width:0; background:var(--accent); transition:width .2s linear; }
+  .prog-txt { margin-top:6px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .note { color:var(--muted); font-size:11px; margin-top:8px; line-height:1.5; }
   /* .note holding preformatted solver/analysis output (keeps its own line breaks) */
   .note.mono { white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
@@ -3850,6 +3919,10 @@ INDEX_HTML = """<!doctype html>
             <span class="help" data-help="sweep_jobs">?</span></label>
           <input type="number" id="sw_jobs" min="1" step="1" value="0" placeholder="auto"
                  style="width:70px" title="Parallel solver processes (0 = auto / all cores)">
+        </div>
+        <div id="sweepProg" class="prog" style="display:none">
+          <div class="prog-bar"><div class="prog-fill" id="sweepProgFill"></div></div>
+          <div class="prog-txt sub2" id="sweepProgTxt"></div>
         </div>
         <div id="sweepStatus" class="sub2" style="margin-top:10px"></div>
         <div class="note" id="sweepNote"></div>
@@ -4448,6 +4521,39 @@ function vlinePreview(){
     } catch(e){ /* leave plots as-is */ }
   }, 200);
 }
+// --- sweep progress ---------------------------------------------------------------------------
+// The sweep is a single long POST, so progress is POLLED on a second connection rather than
+// streamed; ThreadingHTTPServer answers it while the sweep thread is still working.
+let sweepPoll = null;
+function fmtDur(s){
+  s = Math.max(0, Math.round(s));
+  return s < 90 ? s+' s' : Math.floor(s/60)+' min '+String(s%60).padStart(2,'0')+' s';
+}
+function sweepProgReset(){
+  document.getElementById('sweepProgFill').style.width = '0';
+  document.getElementById('sweepProgTxt').textContent = 'starting...';
+  document.getElementById('sweepProg').style.display = '';
+}
+function sweepProgStop(){
+  if (sweepPoll){ clearInterval(sweepPoll); sweepPoll = null; }
+  document.getElementById('sweepProg').style.display = 'none';
+}
+async function pollSweepProgress(){
+  try {
+    const p = await (await fetch('/sweep_progress')).json();
+    // Gate on `active` so a finished sweep's stale 100% can't leak into the next run's first poll.
+    if (!p.active || !p.total) return;
+    const pct = Math.round(100 * p.frac);
+    document.getElementById('sweepProgFill').style.width = pct+'%';
+    const bits = [p.done+' / '+p.total+' points ('+pct+'%)'];
+    if (p.failed) bits.push(p.failed+' failed');
+    bits.push(fmtDur(p.elapsed)+' elapsed');
+    if (p.eta > 0) bits.push('~'+fmtDur(p.eta)+' left');
+    if (p.workers > 1) bits.push(p.workers+' jobs');
+    document.getElementById('sweepProgTxt').textContent = bits.join('  \u00b7  ');
+  } catch(e){ /* a dropped poll is harmless -- the next one catches up */ }
+}
+
 async function runSweep(){
   const btn = document.getElementById('sweepBtn'); btn.disabled = true;
   const mode = document.getElementById('sw_mode').value;
@@ -4461,6 +4567,8 @@ async function runSweep(){
   const jobs = parseInt(document.getElementById('sw_jobs').value, 10) || 0;
   const vlines = (document.getElementById('sw_vlines').value || '').trim();
   setSweepStatus('Running sweep of '+label+'...', '');
+  sweepProgReset();
+  sweepPoll = setInterval(pollSweepProgress, 400);
   try {
     const payload = { params: collect(), mode: mode, specs: specs, workers: jobs, vlines: vlines };
     const res = await fetch('/sweep', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -4477,7 +4585,7 @@ async function runSweep(){
       document.getElementById('vlineBar').style.display = '';   // enable post-processing lines
     }
   } catch(e){ setSweepStatus('Request failed: '+e, 'err'); }
-  finally { btn.disabled = false; }
+  finally { sweepProgStop(); btn.disabled = false; }
 }
 
 function showNetlist(j){

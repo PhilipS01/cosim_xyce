@@ -143,6 +143,14 @@ metrics vs the swept parameter in a 2×2 figure:
 plus a WR-iterations-per-window colormap and a per-point table (rows that
 failed / didn't fully converge are red).
 
+While a sweep runs, a **progress bar** under the buttons shows points completed,
+elapsed time, a rough ETA, the failed count, and the number of parallel jobs. The
+sweep is a single long request, so the studio polls `/sweep_progress` on a second
+connection rather than streaming; the ETA is linear in the mean time per
+completed point, which is honest when every point costs about the same and drifts
+when the swept parameter itself changes the cost (more windows, more WR
+iterations).
+
 A **2-parameter grid sweep** adds one more figure: a heatmap of the **total WR
 iterations** (summed over every window) with the first swept parameter on x and
 the second on y — the "how expensive is this corner of the parameter space" view.
