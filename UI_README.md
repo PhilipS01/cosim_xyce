@@ -79,7 +79,10 @@ python3 sim_ui.py sweep --param L_FEM --min 1e-7 --max 1e-5 --steps 8 --scale lo
 
    Summary scalars `mean_V_defect` / `mean_I_defect` (and `max_*`) are the
    mean/max of `|d·|` over every circuit sample; they also land in the sweep table
-   and CSV.
+   and CSV. Both figures and the defect summary cards carry a hover **?** spelling
+   out the interpolation, which channel is the real cross-solver defect for the
+   coupling direction in use, and how they differ from **worst f-c defect** (which
+   the solver measures only at the window terminals, and normalises only above 0.1).
 
    Hovering a results plot reveals a **TikZ** button that downloads that one plot
    as `pgfplots` LaTeX (`interface_voltage.tex`, `interface_current.tex`,

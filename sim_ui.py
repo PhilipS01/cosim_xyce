@@ -313,6 +313,84 @@ HELP = {
         "outside the swept range are skipped. On the WR-iterations heatmap and line plots the line marks "
         "that x-location; on grid heatmaps it's drawn on the first (x) parameter axis.</div>"
     ),
+    # --- interface-defect metrics (see interface_defect / _make_defect_heatmap) ---------------
+    "defect_plot": (
+        "<div class='hh'>Field-circuit interface defect</div>"
+        "<div class='hn'>How far the two solvers disagree <b>inside</b> each window, not just at "
+        "its end:</div>"
+        "<div class='hf'>dV(t) = V_field(t) &minus; V(p)_circuit(t)<br>"
+        "dI(t) = I_field(t) &minus; I(Vmeas)_circuit(t)</div>"
+        "<div class='hn'>The field waveform has only <code>N_field_eval_intervals</code> nodes per "
+        "window, so it is <b>linearly interpolated</b> onto the circuit's time grid. That is "
+        "deliberate: the circuit is driven by the field's PWL carriers, which Xyce itself reads as a "
+        "linear interpolant between field nodes &mdash; so this is the defect the circuit actually "
+        "saw, field-grid reconstruction error included.</div>"
+        "<div class='hn'><b>Only one channel is a real cross-solver defect.</b> The other column of "
+        "<code>Field_waveform_solution.prn</code> is the circuit's own waveform resampled onto the "
+        "field grid, so: <b>voltage-driven</b> &rarr; <code>dI</code> is the transmission defect and "
+        "<code>dV</code> the field-grid <i>reconstruction error</i> of V(p); <b>current-driven</b> "
+        "&rarr; the roles swap. The legend names which is which for the run you just did.</div>"
+        "<div class='hn'>Both are worth reading: the reconstruction channel is exactly what moves "
+        "when you trade WR windows against field evaluations. Values are <b>signed</b> on linear "
+        "twin axes &mdash; the defect typically ramps inside a window and resets at the seam, and "
+        "that sawtooth is the content.</div>"
+        "<div class='hn'>Not the same as <b>worst f-c defect</b>, which the solver measures only at "
+        "the window <i>terminals</i> &mdash; the values the WR iteration is actively driving "
+        "together. This is what is left in between.</div>"
+    ),
+    "defect_heatmap": (
+        "<div class='hh'>Mean field-circuit defect</div>"
+        "<div class='hn'>One cell per parameter combination: <code>mean(|dV|)</code> and "
+        "<code>mean(|dI|)</code> of the interface defect above, averaged over <b>every circuit "
+        "sample of the whole run</b> (the interpolated defect, collapsed to one number).</div>"
+        "<div class='hn'>Mean of the <b>absolute</b> value, because the defect ramps and resets each "
+        "window and signs would partly cancel. Averaged over the whole run, not per window, so a "
+        "single bad window reads as a moderate mean &mdash; <code>max_V_defect</code> / "
+        "<code>max_I_defect</code> are in the summary card and the CSV for the worst instant.</div>"
+        "<div class='hn'>Units are <b>absolute</b> (V and A), so the two panels are not comparable "
+        "with each other, and neither is comparable with <b>worst f-c defect</b> (which is relative "
+        "above 0.1). As on the time plot, only one panel is the genuine cross-solver defect: "
+        "voltage-driven &rarr; <code>|dI|</code>, current-driven &rarr; <code>|dV|</code>.</div>"
+        "<div class='hn'>A cell that comes out <b>exactly zero</b> is drawn grey, not floored onto "
+        "the log colour scale &mdash; flooring would invent decades of range that are not there. "
+        "Blank = that combination's solve failed.</div>"
+    ),
+    "worst_FC_defect": (
+        "<div class='hh'>Worst f-c defect (field vs circuit)</div>"
+        "<div class='hn'>The transmission-condition residual at each window's <b>terminal</b>, "
+        "computed by the solver into <code>WR_error.txt</code>:</div>"
+        "<div class='hf'>relI_FC = |I_field &minus; I_circuit| / |I_field|<br>"
+        "relV_FC = |V_field &minus; V_circuit| / |V_field|</div>"
+        "<div class='hn'>The card shows the <b>max over both channels and all windows</b>, so it "
+        "does not say which quantity or which window it came from.</div>"
+        "<div class='hn'><b>Only relative above 0.1.</b> When the field value is smaller than that, "
+        "the normalisation is dropped and the figure is an <i>absolute</i> difference in amps or "
+        "volts &mdash; do not compare it against <code>WR_tolerance</code> as if it were "
+        "dimensionless.</div>"
+        "<div class='hn'>Which half matters depends on the coupling direction: voltage-driven &rarr; "
+        "<code>relI_FC</code> (the voltage matches trivially, since <code>Vmeas</code> is a 0 V "
+        "ammeter); current-driven &rarr; <code>relV_FC</code>.</div>"
+        "<div class='hn'>Distinct from <b>mean |dV| / |dI| defect</b>, which measure the same "
+        "disagreement across the whole window rather than only at its end.</div>"
+    ),
+    "mean_V_defect": (
+        "<div class='hh'>Mean |dV| defect</div>"
+        "<div class='hn'><code>mean(|V_field &minus; V(p)_circuit|)</code> over every circuit sample "
+        "of the run, with the field waveform interpolated onto the circuit grid. Absolute volts.</div>"
+        "<div class='hn'>In <b>voltage-driven</b> runs this is the field-grid <i>reconstruction "
+        "error</i> of V(p), not a cross-solver defect &mdash; the field file's V column is the "
+        "circuit's own V(p) resampled. In <b>current-driven</b> runs it IS the transmission defect. "
+        "See the interface-defect plot for the full picture.</div>"
+    ),
+    "mean_I_defect": (
+        "<div class='hh'>Mean |dI| defect</div>"
+        "<div class='hn'><code>mean(|I_field &minus; I(Vmeas)_circuit|)</code> over every circuit "
+        "sample of the run, with the field waveform interpolated onto the circuit grid. Absolute "
+        "amps.</div>"
+        "<div class='hn'>In <b>voltage-driven</b> runs this IS the cross-solver transmission defect "
+        "(the FEM's current against Xyce's). In <b>current-driven</b> runs the roles swap and this "
+        "becomes the field-grid reconstruction error. See the interface-defect plot.</div>"
+    ),
     "xp_panel": (
         "<div class='hh'>A-priori estimate (port impedance)</div>"
         "<div class='hn'><b>x<sub>P</sub>(f)</b> is the impedance the field sees looking INTO the circuit "
@@ -4117,6 +4195,13 @@ INDEX_HTML = """<!doctype html>
   .pbox .tikzbtn.busy { opacity:1; color:var(--muted); }
   .pbox .tikzbtn.ok { opacity:1; color:var(--ok); border-color:var(--ok); }
   .pbox .tikzbtn.err { opacity:1; color:var(--err); border-color:var(--err); }
+  /* Figure-level help sits top-LEFT so it never collides with the TikZ button, and stays visible
+     (unlike the button) because it is the only hint that a figure needs explaining. */
+  .pbox .help { position:absolute; top:8px; left:8px; margin-left:0; background:var(--bg);
+        border:1px solid var(--line-strong); width:16px; height:16px; line-height:15px; }
+  /* Summary cards carry their metric's help inline, after the label. */
+  .card .k .help { width:13px; height:13px; line-height:13px; font-size:9px; margin-left:5px;
+        vertical-align:1px; }
 
   pre#log { background:var(--field); border:1px solid var(--line); border-radius:0; padding:12px;
             color:var(--muted); font-size:11.5px; max-height:240px; overflow:auto; white-space:pre-wrap; }
@@ -4394,6 +4479,7 @@ INDEX_HTML = """<!doctype html>
       <figure class="pbox" id="box_wr"><img class="plot" id="p_wr" onclick="enlarge(this)">
         <button class="tikzbtn" onclick="exportPgf('wr',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
       <figure class="pbox" id="box_defect"><img class="plot" id="p_defect" onclick="enlarge(this)">
+        <span class="help" data-help="defect_plot">?</span>
         <button class="tikzbtn" onclick="exportPgf('defect',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
       <figure class="pbox" id="box_probe_v"><img class="plot" id="p_probe_v" onclick="enlarge(this)">
         <button class="tikzbtn" onclick="exportPgf('probe_v',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
@@ -4410,6 +4496,7 @@ INDEX_HTML = """<!doctype html>
       <figure class="pbox wide" id="box_sweep_iters2d"><img class="plot" id="p_sweep_iters2d" onclick="enlarge(this)">
         <button class="tikzbtn" onclick="exportPgf('sweep_iters2d',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
       <figure class="pbox wide" id="box_sweep_defect2d"><img class="plot" id="p_sweep_defect2d" onclick="enlarge(this)">
+        <span class="help" data-help="defect_heatmap">?</span>
         <button class="tikzbtn" onclick="exportPgf('sweep_defect2d',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
     </div>
     <div id="vlineBar" style="display:none">
@@ -4575,7 +4662,10 @@ function showSummary(sum){
   for (const k of order){ if (k in sum){
     const c = document.createElement('div'); c.className='card';
     if (k === 'solver_seconds') c.classList.add('cost');
-    c.innerHTML = '<div class="k">'+(labels[k]||k)+'</div><div class="v">'+fmt(sum[k])+'</div>';
+    // Metrics whose meaning is easy to misread (defect normalisation, which channel is real)
+    // carry the same hover help as the controls; the icon appears only where HELP has an entry.
+    const hlp = HELP[k] ? '<span class="help" data-help="'+k+'">?</span>' : '';
+    c.innerHTML = '<div class="k">'+(labels[k]||k)+hlp+'</div><div class="v">'+fmt(sum[k])+'</div>';
     el.appendChild(c);
   }}
 }
