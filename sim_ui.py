@@ -2331,26 +2331,86 @@ def run_sweep(base_params, keys, points, workers=None, on_done=None):
     return rows
 
 
-def make_sweep_plots(keys, rows, mode="single", free_keys=None, vlines=None):
+def make_sweep_plots(keys, rows, mode="single", free_keys=None, vlines=None, scales=None):
     """Convergence-study figure. Dispatches on the sweep shape:
       single / parallel -> 2x2 metric-vs-parameter line plots.
-      grid              -> 2x2 metric heatmaps over the two swept parameters.
+      grid              -> metric heatmaps over the two swept parameters.
     `keys` may be a single string (legacy) or a list of parameter names.
-    `vlines` = list of (value, label) reference lines drawn on the x-axis."""
+    `vlines` = list of (value, label) reference lines drawn on the x-axis.
+    `scales` = {key: "linear"|"log"} as the sweep declared them, so a log-spaced parameter gets a
+    log heatmap axis; omitted (CLI, older stored sweeps) -> inferred from the values."""
     if isinstance(keys, str):
         keys = [keys]
     # Dimensionality is set by the INDEPENDENT (free) parameters; percentage-linked
     # ones track a base and add no axis.
     dims = list(free_keys) if free_keys else list(keys)
     if mode == "grid" and len(dims) == 2:
-        out = _make_grid_plots(dims[0], dims[1], rows, vlines)
+        out = _make_grid_plots(dims[0], dims[1], rows, vlines, scales)
     elif mode == "grid" and len(dims) > 2:
         out = _make_index_plots(dims, rows, vlines)   # >2D: heatmap not meaningful
     else:
         out = _make_line_plots(keys, rows, mode, vlines)
+    # The per-window colormap's x is a COLUMN INDEX (one column per run), not the parameter value,
+    # so its cells are already evenly spaced and a log axis would mean nothing there.
     out.update(_make_iters_heatmap(dims, rows, mode, vlines))  # WR-iterations-per-window colormap
-    out.update(_make_total_iters_heatmap(dims, rows, mode, vlines))  # 2-D grid: total iterations
+    out.update(_make_total_iters_heatmap(dims, rows, mode, vlines, scales))  # 2-D: total iterations
     return out
+
+
+def _axis_is_log(values, scale=None):
+    """Should a heatmap axis carrying these sampled parameter values be log-scaled?
+
+    The sweep spec's own Spacing is authoritative when known -- that is what the user asked for.
+    Otherwise infer, which covers the headless CLI and sweeps stored before the scale was carried:
+    strictly positive values spanning at least a decade whose LOG spacing is uniform, and more
+    uniform than their linear spacing."""
+    v = np.asarray(sorted(float(x) for x in values), dtype=float)
+    if v.size < 2 or v.min() <= 0.0:
+        return False
+    if scale:
+        return scale == "log"
+    if v.size < 3 or v.max() / v.min() < 10.0:
+        return False
+
+    def spread(d):
+        m = float(np.mean(d))
+        return float(np.std(d) / m) if m > 0.0 else float("inf")
+
+    dl = spread(np.diff(np.log10(v)))
+    return dl < 0.05 and dl < spread(np.diff(v))
+
+
+def _cell_edges(values, log=False):
+    """pcolormesh cell edges from the sampled values: midpoints between them, GEOMETRIC midpoints
+    on a log axis so the cells come out uniform instead of crowding at the small end."""
+    v = np.asarray(values, dtype=float)
+    if log:
+        lv = np.log10(v)
+        if lv.size == 1:
+            return 10.0 ** np.array([lv[0] - 0.5, lv[0] + 0.5])
+        mid = (lv[:-1] + lv[1:]) / 2.0
+        return 10.0 ** np.concatenate([[2 * lv[0] - mid[0]], mid, [2 * lv[-1] - mid[-1]]])
+    if v.size == 1:
+        d = abs(v[0]) * 0.5 or 0.5
+        return np.array([v[0] - d, v[0] + d])
+    mid = (v[:-1] + v[1:]) / 2.0
+    return np.concatenate([[2 * v[0] - mid[0]], mid, [2 * v[-1] - mid[-1]]])
+
+
+def _heatmap_axis(ax, which, values, log):
+    """Pin one heatmap axis to the sampled parameter values, log-scaled when `log`.
+
+    Ticks go ON the samples either way: the auto-ticker would otherwise label pcolormesh cell EDGES
+    on a linear axis, and decade positions like 10^1.5 on a log one. Minor ticks are dropped so a
+    log axis does not sprout unlabelled decade subdivisions between two samples."""
+    from matplotlib.ticker import FuncFormatter, NullLocator
+    axis, set_scale, set_ticks = ((ax.xaxis, ax.set_xscale, ax.set_xticks) if which == "x"
+                                  else (ax.yaxis, ax.set_yscale, ax.set_yticks))
+    if log:
+        set_scale("log")
+        axis.set_minor_locator(NullLocator())
+        axis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:g}"))
+    set_ticks(list(values))
 
 
 def _make_line_plots(keys, rows, mode, vlines=None):
@@ -2421,8 +2481,8 @@ def _make_line_plots(keys, rows, mode, vlines=None):
     return {"sweep": _png(fig)}
 
 
-def _make_grid_plots(kx, ky, rows, vlines=None):
-    """2x2 heatmaps of key metrics over a 2-parameter grid (all combinations)."""
+def _make_grid_plots(kx, ky, rows, vlines=None, scales=None):
+    """Heatmaps of key metrics over a 2-parameter grid (all combinations)."""
     ok = [r for r in rows if r.get("ok")]
     if not ok:
         return {}
@@ -2441,16 +2501,10 @@ def _make_grid_plots(kx, ky, rows, vlines=None):
             g[iy[r["vals"][ky]], ix[r["vals"][kx]]] = val
         return g
 
-    # cell edges (midpoints) so pcolormesh centres cells on the sampled values
-    def edges(v):
-        v = np.array(v, dtype=float)
-        if len(v) == 1:
-            d = abs(v[0]) * 0.5 or 0.5
-            return np.array([v[0] - d, v[0] + d])
-        mid = (v[:-1] + v[1:]) / 2
-        return np.concatenate([[2 * v[0] - mid[0]], mid, [2 * v[-1] - mid[-1]]])
-
-    xe, ye = edges(xs), edges(ys)
+    scales = scales or {}
+    logx = _axis_is_log(xs, scales.get(kx))
+    logy = _axis_is_log(ys, scales.get(ky))
+    xe, ye = _cell_edges(xs, logx), _cell_edges(ys, logy)
     # Bottom row is the accuracy pair: worst vs mean final WR error over the windows. Each keeps its
     # own colour normalisation -- they differ by orders of magnitude, and a shared scale would flatten
     # the mean panel to one colour.
@@ -2476,10 +2530,10 @@ def _make_grid_plots(kx, ky, rows, vlines=None):
         fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04)
         ax.set_title(title, fontsize=10)
         ax.set_xlabel(lx); ax.set_ylabel(ly)
-        # Pin ticks to the actually-sampled parameter values (cell CENTRES). Without this the
-        # auto-ticker labels the pcolormesh cell EDGES instead (e.g. values [1,6,10] -> edges
-        # [-1.5,3.5,8,12]), so the axis looks shifted / spans past the sampled range.
-        ax.set_xticks(xs); ax.set_yticks(ys)
+        # Ticks sit on the actually-sampled parameter values (cell CENTRES); a log-spaced parameter
+        # additionally gets a log axis, so its cells are uniform instead of crowding at the small end.
+        _heatmap_axis(ax, "x", xs, logx)
+        _heatmap_axis(ax, "y", ys, logy)
         _draw_vlines(ax, vlines, data_x=True)   # x-axis is kx in real units
 
     fig.suptitle(f"Grid sweep: {LABELS.get(kx, kx)}  x  {LABELS.get(ky, ky)}", fontsize=12)
@@ -2602,7 +2656,8 @@ def _pgf_panel(title, xlabel, ylabel, series, extra=(), vlines=None, colvals=Non
 
 
 def _pgf_matrix_panel(title, xlabel, ylabel, xs, ys, M, bar_label, log=False, reverse_y=False,
-                      vlines=None, colvals=None, data_x=True, annotate=False):
+                      vlines=None, colvals=None, data_x=True, annotate=False,
+                      logx=False, logy=False):
     """One standalone tikzpicture holding a heatmap (pgfplots `matrix plot`). `M[row, col]` matches
     the PNG's pcolormesh; non-finite cells are emitted as nan and left as holes."""
     M = np.asarray(M, dtype=float)
@@ -2613,7 +2668,15 @@ def _pgf_matrix_panel(title, xlabel, ylabel, xs, ys, M, bar_label, log=False, re
     # colormap but PARAMETER VALUES (spacing ~1e-4) on a grid sweep, and a fixed 0.5 there puts the
     # reference line's endpoint astronomically outside the axis ("Dimension too large").
     yv = np.asarray(sorted(float(v) for v in ys), dtype=float)
-    pad = float(np.min(np.diff(yv))) / 2.0 if yv.size > 1 else (abs(float(yv[0])) * 0.5 or 0.5)
+    if logy:
+        # Half a cell GEOMETRICALLY: on a log axis min(ys) - pad would be <= 0 for a decade sweep,
+        # which is not a coordinate the axis can take at all.
+        g = (10.0 ** (float(np.min(np.diff(np.log10(yv)))) / 2.0) if yv.size > 1
+             else 10.0 ** 0.5)
+        ylim_lo, ylim_hi = float(yv[0]) / g, float(yv[-1]) * g
+    else:
+        pad = float(np.min(np.diff(yv))) / 2.0 if yv.size > 1 else (abs(float(yv[0])) * 0.5 or 0.5)
+        ylim_lo, ylim_hi = float(yv[0]) - pad, float(yv[-1]) + pad
 
     # pgfplots has no logarithmic COLOUR scale, so for a log panel the point meta carries
     # log10(value) and the colourbar is relabelled in powers of ten. Without this an error heatmap
@@ -2649,6 +2712,16 @@ def _pgf_matrix_panel(title, xlabel, ylabel, xs, ys, M, bar_label, log=False, re
             "colorbar", "colormap/viridis", "unbounded coords=jump",
             "colorbar style={" + ", ".join(bar_style) + "}",
             "enlargelimits=false", "axis on top"]
+    # A log-spaced parameter gets a log axis, with ticks pinned to the sampled values: pgfplots'
+    # own log ticker would otherwise label decade positions (10^1.5) that were never sampled.
+    for mode_key, on, vals in (("x", logx, xs), ("y", logy, ys)):
+        if not on:
+            continue
+        v = sorted(float(t) for t in vals)
+        opts += [f"{mode_key}mode=log",
+                 f"{mode_key}tick={{" + ",".join(f"{t:.8g}" for t in v) + "}",
+                 f"{mode_key}ticklabels={{" + ",".join(f"{t:g}" for t in v) + "}",
+                 f"minor {mode_key}tick={{}}"]
     if annotate:   # print the value in each cell, as the PNG does for small grids
         # NB: meta is log10(value) when log=True, so annotate+log would print exponents.
         opts += ["nodes near coords={\\pgfmathprintnumber[precision=0]{\\pgfplotspointmeta}}",
@@ -2662,8 +2735,7 @@ def _pgf_matrix_panel(title, xlabel, ylabel, xs, ys, M, bar_label, log=False, re
     body = (["\\begin{axis}[", "  " + ",\n  ".join(opts), "]",
              f"  \\addplot[matrix plot*, point meta=explicit, mesh/cols={M.shape[1]}] table[meta=C] {{",
              "    x y C"] + rows_out + ["  };"]
-            + _pgf_vlines(vlines, ((float(max(ys)) + pad, float(min(ys)) - pad) if reverse_y
-                                   else (float(min(ys)) - pad, float(max(ys)) + pad)),
+            + _pgf_vlines(vlines, ((ylim_hi, ylim_lo) if reverse_y else (ylim_lo, ylim_hi)),
                           colvals, data_x)
             + ["\\end{axis}"])
     return ["\\begin{tikzpicture}"] + body + ["\\end{tikzpicture}"]
@@ -2700,6 +2772,7 @@ def pgf_sweep_tex(which, sweep, vlines=None):
     rows = sweep.get("rows") or []
     mode = sweep.get("mode", "single")
     dims = list(sweep.get("free_keys") or keys)
+    scales = sweep.get("scales") or {}
     ok = [r for r in rows if r.get("ok")]
     if not ok or not dims:
         return None, None
@@ -2725,9 +2798,12 @@ def pgf_sweep_tex(which, sweep, vlines=None):
         ys = list(range(1, wmax + 1))
         xlabel = dims[0] if one else "run index (" + " x ".join(dims) + ")"
         colvals = [r["vals"][dims[0]] for r in okn] if dims else None
+        # x is a column index for a multi-parameter sweep and the swept VALUE for a 1-D one; y is
+        # the window number, always linear.
         pic = _pgf_matrix_panel("WR iterations per window", xlabel, "window", xs, ys, M,
                                 "WR iterations", reverse_y=True, vlines=vlines,
-                                colvals=colvals, data_x=one)
+                                colvals=colvals, data_x=one,
+                                logx=(one and _axis_is_log(xs, scales.get(dims[0]))))
         if pic is None:
             return None, None
         fname = f"sweep_{stem}_iterations_per_window.tex"
@@ -2753,7 +2829,9 @@ def pgf_sweep_tex(which, sweep, vlines=None):
             M[iy[r["vals"][ky]], ix[r["vals"][kx]]] = float(np.sum(r["wr_nit"]))
         pic = _pgf_matrix_panel(f"Total WR iterations: {kx} x {ky}", kx, ky, xs, ys, M,
                                 "total WR iterations", vlines=vlines,
-                                annotate=(M.size <= 144))
+                                annotate=(M.size <= 144),
+                                logx=_axis_is_log(xs, scales.get(kx)),
+                                logy=_axis_is_log(ys, scales.get(ky)))
         if pic is None:
             return None, None
         fname = f"sweep_{stem}_total_iterations.tex"
@@ -2788,10 +2866,11 @@ def pgf_sweep_tex(which, sweep, vlines=None):
                 ("final_I_field", "Final I_field", "A", False),
                 ("worst_WR_error", "Worst WR rel. error", "rel. error", True),
                 ("mean_WR_error", "Mean WR rel. error", "rel. error", True)]
+        gx, gy = _axis_is_log(xs, scales.get(kx)), _axis_is_log(ys, scales.get(ky))
         pics, names = [], []
         for nm, title, bar, log in spec:
             pic = _pgf_matrix_panel(title, kx, ky, xs, ys, grid(nm, log), bar, log=log,
-                                    vlines=vlines)
+                                    vlines=vlines, logx=gx, logy=gy)
             if pic:
                 pics.append(pic); names.append(title)
         if not pics:
@@ -2934,7 +3013,7 @@ def _make_iters_heatmap(dims, rows, mode, vlines=None):
 
 
 
-def _make_total_iters_heatmap(dims, rows, mode, vlines=None):
+def _make_total_iters_heatmap(dims, rows, mode, vlines=None, scales=None):
     """TOTAL WR iterations (summed over every window) for each point of a 2-parameter grid sweep:
     x = the first swept parameter, y = the second, colour = the whole run's iteration count. This is
     the "how expensive is this corner of the parameter space" view; _make_iters_heatmap instead
@@ -2959,21 +3038,18 @@ def _make_total_iters_heatmap(dims, rows, mode, vlines=None):
     for r in ok:
         M[iy[r["vals"][ky]], ix[r["vals"][kx]]] = float(np.sum(r["wr_nit"]))
 
-    def edges(v):
-        v = np.array(v, dtype=float)
-        if len(v) == 1:
-            d = abs(v[0]) * 0.5 or 0.5
-            return np.array([v[0] - d, v[0] + d])
-        mid = (v[:-1] + v[1:]) / 2
-        return np.concatenate([[2 * v[0] - mid[0]], mid, [2 * v[-1] - mid[-1]]])
-
+    scales = scales or {}
+    logx = _axis_is_log(xs, scales.get(kx))
+    logy = _axis_is_log(ys, scales.get(ky))
     fig_w = max(5.0, min(13.0, 2.2 + 0.85 * len(xs)))
     fig_h = max(3.4, min(9.0, 1.8 + 0.70 * len(ys)))
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    pcm = ax.pcolormesh(edges(xs), edges(ys), M, cmap="viridis", shading="flat")
+    pcm = ax.pcolormesh(_cell_edges(xs, logx), _cell_edges(ys, logy), M,
+                        cmap="viridis", shading="flat")
     cbar = fig.colorbar(pcm, ax=ax)
     cbar.set_label("total WR iterations")
-    ax.set_xticks(xs); ax.set_yticks(ys)
+    _heatmap_axis(ax, "x", xs, logx)
+    _heatmap_axis(ax, "y", ys, logy)
     ax.set_xlabel(kx); ax.set_ylabel(ky)
     # Annotate the cells while the grid is small enough to read; the colour scale carries it after.
     if M.size <= 144:
@@ -3286,7 +3362,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({
                 "ok": True,
                 "plots": make_sweep_plots(s["keys"], s["rows"], s["mode"],
-                                          s["free_keys"], vl_eval),
+                                          s["free_keys"], vl_eval, s.get("scales")),
                 "results": eval_vlines_report(body.get("vlines"), s["params"]),
             }))
             return
@@ -3298,7 +3374,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 vl_eval = eval_vlines(body.get("vlines"), s["params"])
                 plots = make_sweep_plots(s["keys"], s["rows"], s["mode"],
-                                         s["free_keys"], vl_eval)
+                                         s["free_keys"], vl_eval, s.get("scales"))
                 csv_path, files = export_sweep_csv(body.get("path") or "results/sweeps/sweep.csv",
                                                    s["keys"], s["rows"], plots,
                                                    base_params=s.get("params"))
@@ -3495,8 +3571,11 @@ class Handler(BaseHTTPRequestHandler):
             # Keep the result so reference lines can be re-drawn (Results section)
             # without re-solving. rows/keys are plain JSON-friendly data.
             global _LAST_SWEEP
+            # Only the FREE (range) rows carry a Spacing, and only they become plot axes.
+            scales = {sp["key"]: sp.get("scale", "linear") for sp in specs
+                      if not sp.get("link") and "expr" not in sp}
             _LAST_SWEEP = {"keys": keys, "rows": rows, "mode": mode,
-                           "free_keys": free_keys, "params": base}
+                           "free_keys": free_keys, "params": base, "scales": scales}
             self._send(200, json.dumps({
                 "ok": n_ok > 0,
                 "sweep_key": keys[0],
@@ -3506,7 +3585,7 @@ class Handler(BaseHTTPRequestHandler):
                 "n_ok": n_ok,
                 "workers": workers_used,
                 "sweep_seconds": total,
-                "plots": make_sweep_plots(keys, rows, mode, free_keys, vlines),
+                "plots": make_sweep_plots(keys, rows, mode, free_keys, vlines, scales),
                 "table": sweep_table(keys, rows),
             }))
         except Exception as e:

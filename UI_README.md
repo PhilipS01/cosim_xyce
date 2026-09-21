@@ -151,6 +151,14 @@ max WR iterations, total Xyce solves, final `I_field`, and the accuracy pair —
 worst and mean WR relative error, each on its own log colour scale (they differ
 by orders of magnitude, so a shared scale would flatten the mean panel).
 
+**Heatmap axes follow the sweep's Spacing.** A parameter swept `log` gets a
+log-scaled axis, so its cells come out uniform instead of crowding at the small
+end (four decades of `WR_tolerance` used to collapse into one unreadable band at
+the bottom). Ticks sit on the sampled values either way. This applies to the
+five metric heatmaps and the total-WR-iterations heatmap, in the PNG and the TikZ
+export alike. The *per-window* colormap is unaffected: its x is a column index —
+one column per run — not the parameter value, so its cells are already even.
+
 plus a WR-iterations-per-window colormap and a per-point table (rows that
 failed / didn't fully converge are red).
 
