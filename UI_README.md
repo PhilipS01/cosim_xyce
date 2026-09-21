@@ -45,6 +45,34 @@ python3 sim_ui.py sweep --param L_FEM --min 1e-7 --max 1e-5 --steps 8 --scale lo
    With `reference_overlay` on, the monolithic reference is re-solved and drawn on
    the two interface plots as a dotted black curve.
 
+   A fifth plot, **Field-circuit interface defect (within windows)**, appears when
+   both waveforms are present. It is the inner-window transmission residual,
+   sample by sample rather than only at the window terminals:
+
+   ```
+   dV(t) = V_field(t) - V(p)_circuit(t)
+   dI(t) = I_field(t) - I(Vmeas)_circuit(t)
+   ```
+
+   The field waveform lives on the coarser field grid, so it is linearly
+   interpolated onto the circuit grid — which is what Xyce itself does with the
+   PWL carriers, so this is the defect the circuit actually saw, reconstruction
+   error included. Values are **signed** on linear twin axes, because the defect
+   typically ramps inside a window and resets at the seam and that sawtooth is the
+   content.
+
+   **Only one channel is a real cross-solver defect.** `Field_waveform_solution.prn`
+   carries the *circuit's own* waveform, resampled onto the field grid, in the
+   other column — so with `coupling_mode = 0` (voltage-driven) `dI` is the
+   transmission defect and `dV` is the field-grid **reconstruction error** of
+   `V(p)`; with `coupling_mode = 1` the roles swap. The legend names which is
+   which for the run you just did. Both are worth reading: the reconstruction
+   channel is exactly what changes when you trade WR windows against field
+   evaluations.
+
+   Summary scalars `mean_V_defect` / `mean_I_defect` (and `max_*`) are the
+   mean/max of `|d·|` over every sample; they also land in the sweep table and CSV.
+
    Hovering a results plot reveals a **TikZ** button that downloads that one plot
    as `pgfplots` LaTeX (`interface_voltage.tex`, `interface_current.tex`,
    `wr_convergence.tex`, `probe_voltages.tex`, `probe_currents.tex`). The file is
@@ -150,6 +178,13 @@ A 2-parameter grid sweep draws these as **five heatmaps** (2×3, last cell blank
 max WR iterations, total Xyce solves, final `I_field`, and the accuracy pair —
 worst and mean WR relative error, each on its own log colour scale (they differ
 by orders of magnitude, so a shared scale would flatten the mean panel).
+
+A 2-parameter grid sweep also draws **Mean field-circuit defect**: two heatmaps
+of `mean |dV|` and `mean |dI|` (log colour scale), the inner-window defect above
+averaged over every sample of every window. Kept as its own figure rather than
+folded into the metric grid, because the two channels are not interchangeable —
+one is the cross-solver defect and the other the reconstruction error, and which
+is which flips with `coupling_mode`, so they are read as a pair.
 
 **Heatmap axes follow the sweep's Spacing.** A parameter swept `log` gets a
 log-scaled axis, so its cells come out uniform instead of crowding at the small

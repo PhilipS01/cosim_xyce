@@ -1275,6 +1275,76 @@ def _read_named_columns(path):
     return res
 
 
+def interface_defect(data):
+    """Inner-window field-vs-circuit transmission defect, sample by sample.
+
+    `worst_FC_defect` compares the two solvers only at each window's TERMINAL. This compares them
+    across the whole window, on the circuit's own time grid:
+
+        dV(t) = V_field(t) - V(p)_circuit(t)
+        dI(t) = I_field(t) - I(Vmeas)_circuit(t)
+
+    Sign matches the C++ terminal defect (field minus circuit). The field waveform lives on the
+    coarser field grid (N_field_eval_intervals per window), so it is LINEARLY interpolated onto the
+    circuit grid -- which is exactly what Xyce does with the PWL carriers, so this is the defect the
+    circuit actually saw, reconstruction error included.
+
+    Which channel is the real transmission defect depends on the coupling direction, because
+    Field_waveform_solution.prn's other column is the circuit's own waveform resampled onto the
+    field grid (MasterProcess writes vf_prev_k.pwl / i_prev_k.pwl through resampleWaveformUniform):
+      voltage-driven (coupling_mode=0) -- dI is the defect (FEM I_field vs Xyce I(Vmeas));
+                                          dV is the field-grid RECONSTRUCTION error of V(p).
+      current-driven (coupling_mode=1) -- the roles swap.
+    Returns None when either waveform is missing."""
+    c = data.get("circuit") or {}
+    fw = data.get("field_wave") or {}
+    tc = np.asarray(c.get("t", []), dtype=float)
+    tf = np.asarray(fw.get("t", []), dtype=float)
+    if tc.size == 0 or tf.size < 2:
+        return None
+    # np.interp needs an increasing grid; a window seam repeats its timestamp (carried start == the
+    # previous window's end), so collapse duplicates first.
+    tfu, keep = np.unique(tf, return_index=True)
+    if tfu.size < 2:
+        return None
+    Vf = np.asarray(fw.get("V", []), dtype=float)[keep]
+    If = np.asarray(fw.get("I", []), dtype=float)[keep]
+    m = (tc >= tfu[0]) & (tc <= tfu[-1])          # never extrapolate past the field waveform
+    t = tc[m]
+    if t.size == 0 or Vf.size != tfu.size or If.size != tfu.size:
+        return None
+    return {"t": t,
+            "dV": np.interp(t, tfu, Vf) - np.asarray(c["Vp"], dtype=float)[m],
+            "dI": np.interp(t, tfu, If) - np.asarray(c["I"], dtype=float)[m]}
+
+
+# Which defect channel is the genuine cross-solver one, per coupling_mode (see interface_defect).
+_DEFECT_CHANNEL = {0: "dI", 1: "dV"}
+
+
+def defect_roles(params):
+    """(dV role, dI role) -- which channel is the genuine cross-solver defect for this run."""
+    try:
+        cm = int(round(float((params or {}).get("coupling_mode", 0))))
+    except (TypeError, ValueError):
+        cm = 0
+    real, recon = "transmission defect", "field-grid reconstruction"
+    return (recon, real) if cm == 0 else (real, recon)
+
+
+def defect_labels(params, tex=False):
+    """Legend labels for the two defect channels.
+
+    Two renderings because the consumers differ: matplotlib reads mathtext, while the pgfplots
+    label goes through _tex_escape -- which only passes a string through untouched when it is
+    math from end to end, hence the \\mathrm{} wrapper rather than plain text after the symbol."""
+    rv, ri = defect_roles(params)
+    if tex:
+        return (r"$\Delta V\;\mathrm{(" + rv.replace(" ", r"\ ") + ")}$",
+                r"$\Delta I\;\mathrm{(" + ri.replace(" ", r"\ ") + ")}$")
+    return (f"$\\Delta$V  ({rv})", f"$\\Delta$I  ({ri})")
+
+
 def read_wr_error(path):
     # Columns: Time, WR_TotalRelErr, N_iterations, Converged[, relI_FC, relV_FC]
     # relI_FC/relV_FC (cross-solver transmission defect) are optional -> NaN for older files.
@@ -1312,7 +1382,7 @@ def _png(fig):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def make_plots(data):
+def make_plots(data, params=None):
     plots = {}
     c, fw, fld, wr = data["circuit"], data["field_wave"], data["field"], data["wr"]
     ref = data.get("ref")                      # monolithic reference (optional overlay)
@@ -1383,6 +1453,28 @@ def make_plots(data):
             ax.set_xlabel("time (s)"); ax.set_ylabel("current (A)")
             ax.set_title("Probe currents"); ax.grid(True, alpha=.3); ax.legend(fontsize=8, loc="upper right")
             plots["probe_i"] = _png(fig)
+
+    # 6) Inner-window field-circuit defect. SIGNED and linear on purpose: the defect typically ramps
+    # inside a window and resets at the seam, and that sawtooth is the thing worth seeing. Twin axes
+    # because the two channels carry different units (V and A).
+    d = interface_defect(data)
+    if d and d["t"].size:
+        lv, li = defect_labels(params)
+        fig, ax = plt.subplots(figsize=(8, 3.2))
+        ax.plot(d["t"], d["dV"], lw=0.9, color="tab:blue", label=lv)
+        ax.axhline(0.0, lw=0.8, color="k", alpha=.35)
+        ax.set_xlabel("time (s)")
+        ax.set_ylabel(r"$\Delta$V = V field $-$ V circuit (V)", color="tab:blue")
+        ax.tick_params(axis="y", labelcolor="tab:blue")
+        ax.grid(True, alpha=.3)
+        ax2 = ax.twinx()
+        ax2.plot(d["t"], d["dI"], "--", lw=0.9, color="tab:red", label=li)
+        ax2.set_ylabel(r"$\Delta$I = I field $-$ I circuit (A)", color="tab:red")
+        ax2.tick_params(axis="y", labelcolor="tab:red")
+        lines = ax.get_lines()[:1] + ax2.get_lines()[:1]
+        ax.legend(lines, [l.get_label() for l in lines], fontsize=8, loc="upper right")
+        ax.set_title("Field-circuit interface defect (within windows)")
+        plots["defect"] = _png(fig)
     return plots
 
 
@@ -1569,6 +1661,31 @@ def pgfplots_tex(name, data, params=None):
         body = left + right
         fname = "wr_convergence.tex"
 
+    elif name == "defect":
+        d = interface_defect(data)
+        if not d or not d["t"].size:
+            return None, None
+        lv, li = defect_labels(params, tex=True)
+        # Twin axes, as in the PNG: dV in volts on the left, dI in amps on the right. Both are
+        # SIGNED, so no log scale and no clamping -- the intra-window sawtooth is the content.
+        t0, t1 = float(np.min(d["t"])), float(np.max(d["t"]))
+        pad = 0.02 * (t1 - t0) or 1e-12
+        xr = [f"xmin={t0 - pad:.8g}", f"xmax={t1 + pad:.8g}"]
+        left = _pgf_axis("Field-circuit interface defect (within windows)", "time (s)",
+                         r"$\Delta V = V_\mathrm{field} - V_\mathrm{circuit}\;(\mathrm{V})$",
+                         _pgf_plot((lv, d["t"], d["dV"], {"color": "C0", "nolegend": True})),
+                         extra=xr + ["axis y line*=left", "ylabel style={color=C0}",
+                                     "yticklabel style={color=C0}"])
+        right = _pgf_axis("", "", r"$\Delta I = I_\mathrm{field} - I_\mathrm{circuit}\;(\mathrm{A})$",
+                          ["  \\addlegendimage{color=C0, line width=0.8pt, mark=none}",
+                           f"  \\addlegendentry{{{_tex_escape(lv)}}}"]
+                          + _pgf_plot((li, d["t"], d["dI"], {**dash, "color": "C3"}))
+                          + [f"  \\draw[gray, thin] (axis cs:{t0:.8g},0) -- (axis cs:{t1:.8g},0);"],
+                          extra=xr + ["axis y line*=right", "axis x line=none", "grid=none",
+                                      "ylabel style={color=C3}", "yticklabel style={color=C3}"])
+        body = left + right
+        fname = "interface_defect.tex"
+
     elif name in ("probe_v", "probe_i"):
         want = "V(" if name == "probe_v" else "I("
         names = [n for n in pr["names"] if n.upper().startswith(want)]
@@ -1647,6 +1764,15 @@ def scalar_summary(data):
         fc = np.concatenate([wr.get("fcI", np.array([])), wr.get("fcV", np.array([]))])
         if fc.size and not np.all(np.isnan(fc)):
             s["worst_FC_defect"] = float(np.nanmax(fc))
+    # INNER-window field-circuit defect: the same comparison across every sample of every window
+    # rather than only at the terminals. Averaged over |.| so window-to-window sign changes do not
+    # cancel; max alongside it for the worst instant.
+    d = interface_defect(data)
+    if d and d["t"].size:
+        s["mean_V_defect"] = float(np.mean(np.abs(d["dV"])))
+        s["max_V_defect"] = float(np.max(np.abs(d["dV"])))
+        s["mean_I_defect"] = float(np.mean(np.abs(d["dI"])))
+        s["max_I_defect"] = float(np.max(np.abs(d["dI"])))
     return s
 
 
@@ -2354,6 +2480,7 @@ def make_sweep_plots(keys, rows, mode="single", free_keys=None, vlines=None, sca
     # so its cells are already evenly spaced and a log axis would mean nothing there.
     out.update(_make_iters_heatmap(dims, rows, mode, vlines))  # WR-iterations-per-window colormap
     out.update(_make_total_iters_heatmap(dims, rows, mode, vlines, scales))  # 2-D: total iterations
+    out.update(_make_defect_heatmap(dims, rows, mode, vlines, scales))  # 2-D: mean interface defect
     return out
 
 
@@ -2844,6 +2971,49 @@ def pgf_sweep_tex(which, sweep, vlines=None):
                                 "WRmaxSteps and the run aborted)."])
         return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + pic + [""])
 
+    # ---- 2-parameter grid -> mean inner-window interface defect -------------
+    if which == "defect2d":
+        if mode != "grid" or len(dims) != 2:
+            return None, None
+        kx, ky = dims[0], dims[1]
+        xs = sorted({r["vals"][kx] for r in rows if r.get("vals")})
+        ys = sorted({r["vals"][ky] for r in rows if r.get("vals")})
+        if not xs or not ys:
+            return None, None
+        ix = {v: i for i, v in enumerate(xs)}
+        iy = {v: i for i, v in enumerate(ys)}
+        gx, gy = _axis_is_log(xs, scales.get(kx)), _axis_is_log(ys, scales.get(ky))
+        pics, names = [], []
+        for nm, name, title, unit in (
+                ("mean_V_defect", "Mean |dV| (field - circuit)",
+                 r"$\mathrm{Mean}\;|\Delta V|\;(\mathrm{field}-\mathrm{circuit})$", "V"),
+                ("mean_I_defect", "Mean |dI| (field - circuit)",
+                 r"$\mathrm{Mean}\;|\Delta I|\;(\mathrm{field}-\mathrm{circuit})$", "A")):
+            M = np.full((len(ys), len(xs)), np.nan)
+            for r in ok:
+                v = r.get(nm)
+                if v is not None and np.isfinite(float(v)):
+                    M[iy[r["vals"][ky]], ix[r["vals"][kx]]] = max(float(v), 1e-18)
+            pic = _pgf_matrix_panel(title, kx, ky, xs, ys, M, f"mean defect ({unit})", log=True,
+                                    vlines=vlines, logx=gx, logy=gy)
+            if pic:
+                pics.append(pic); names.append(name)
+        if not pics:
+            return None, None
+        fname = f"sweep_{stem}_interface_defect.tex"
+        head = _pgf_sweep_head(fname,
+                               f"Mean field-circuit interface defect over the "
+                               f"{LABELS.get(kx, kx)} x {LABELS.get(ky, ky)} grid.", names,
+                               ["Colour is |field - circuit| averaged over EVERY sample of every "
+                                "window, not just the window terminals. Which channel is the real "
+                                "cross-solver defect flips with coupling_mode: voltage-driven -> "
+                                "dI, current-driven -> dV; the other channel is the field-grid "
+                                "reconstruction error."])
+        body = []
+        for nm, pic in zip(names, pics):
+            body += [f"% --- {nm} ---"] + pic + [""]
+        return fname, "\n".join(head + [""] + _pgf_colordefs() + [""] + body)
+
     # ---- 2-parameter grid -> heatmaps ---------------------------------------
     if mode == "grid" and len(dims) == 2:
         kx, ky = dims[0], dims[1]
@@ -3068,6 +3238,61 @@ def _make_total_iters_heatmap(dims, rows, mode, vlines=None, scales=None):
     return {"iters2d": _png(fig)}
 
 
+def _make_defect_heatmap(dims, rows, mode, vlines=None, scales=None):
+    """Mean inner-window field-circuit defect over a 2-parameter grid: |dV| and |dI| averaged over
+    every sample of every window (see interface_defect), one panel each.
+
+    Kept out of the main grid figure because the two channels are not interchangeable: one of them
+    is the genuine cross-solver defect and the other the field-grid reconstruction error, and which
+    is which flips with coupling_mode -- so they are read as a pair, not as two more metrics."""
+    if mode != "grid" or len(dims) != 2:
+        return {}
+    ok = [r for r in rows if r.get("ok")]
+    if not ok or not any(r.get("mean_V_defect") is not None for r in ok):
+        return {}
+    kx, ky = dims[0], dims[1]
+    xs = sorted({r["vals"][kx] for r in rows if r.get("vals")})
+    ys = sorted({r["vals"][ky] for r in rows if r.get("vals")})
+    if not xs or not ys:
+        return {}
+    ix = {v: i for i, v in enumerate(xs)}
+    iy = {v: i for i, v in enumerate(ys)}
+
+    def grid(name):
+        g = np.full((len(ys), len(xs)), np.nan)
+        for r in ok:
+            v = r.get(name)
+            if v is not None and np.isfinite(float(v)):
+                g[iy[r["vals"][ky]], ix[r["vals"][kx]]] = max(float(v), 1e-18)
+        return g
+
+    scales = scales or {}
+    logx = _axis_is_log(xs, scales.get(kx))
+    logy = _axis_is_log(ys, scales.get(ky))
+    xe, ye = _cell_edges(xs, logx), _cell_edges(ys, logy)
+    from matplotlib.colors import LogNorm
+    fig, axes = plt.subplots(1, 2, figsize=(11.4, 4.2))
+    for ax, (name, title, unit) in zip(
+            axes.flat,
+            [("mean_V_defect", r"mean $|\Delta V|$   (field $-$ circuit)", "V"),
+             ("mean_I_defect", r"mean $|\Delta I|$   (field $-$ circuit)", "A")]):
+        g = grid(name)
+        finite = g[np.isfinite(g)]
+        norm = LogNorm(vmin=finite.min(), vmax=finite.max()) if finite.size else None
+        pcm = ax.pcolormesh(xe, ye, g, cmap="inferno", norm=norm, shading="flat")
+        cbar = fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(f"mean defect ({unit})")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel(kx); ax.set_ylabel(ky)
+        _heatmap_axis(ax, "x", xs, logx)
+        _heatmap_axis(ax, "y", ys, logy)
+        _draw_vlines(ax, vlines, data_x=True)
+    fig.suptitle(f"Mean field-circuit defect: {LABELS.get(kx, kx)}  x  {LABELS.get(ky, ky)}",
+                 fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return {"defect2d": _png(fig)}
+
+
 def _draw_vlines(ax, vlines, colvals=None, data_x=False):
     """Draw user reference lines. If data_x, `value` is an x-data coordinate
     (axis already in parameter units); otherwise interpolate to a column position
@@ -3095,7 +3320,8 @@ def sweep_table(keys, rows):
         keys = [keys]
     valcols = [f"p:{k}" for k in keys]         # one column per swept parameter
     metric = ["ok", "max_WR_iterations", "mean_WR_iterations",
-              "total_xyce_solves", "worst_WR_error", "mean_WR_error", "all_converged",
+              "total_xyce_solves", "worst_WR_error", "mean_WR_error",
+              "mean_V_defect", "mean_I_defect", "all_converged",
               "solver_seconds", "final_I_field", "final_V_field"]
 
     def rowout(r):
@@ -3415,7 +3641,8 @@ class Handler(BaseHTTPRequestHandler):
                     # Reference lines are a live UI field, not part of the stored sweep -> re-evaluate
                     # against the sweep's base params, exactly as /sweep_replot does.
                     vl = eval_vlines(body.get("vlines"), _LAST_SWEEP.get("params") or {})
-                    which = {"sweep_iters": "iters", "sweep_iters2d": "iters2d"}.get(nm, "sweep")
+                    which = {"sweep_iters": "iters", "sweep_iters2d": "iters2d",
+                             "sweep_defect2d": "defect2d"}.get(nm, "sweep")
                     fname, tex = pgf_sweep_tex(which, _LAST_SWEEP, vl)
                 else:
                     fname, tex = pgfplots_tex(nm, _LAST_RUN["data"], _LAST_RUN.get("params"))
@@ -3485,7 +3712,7 @@ class Handler(BaseHTTPRequestHandler):
                 summary["sec_per_xyce_solve"] = round(elapsed / summary["total_xyce_solves"], 5)
             self._send(200, json.dumps({
                 "ok": True,
-                "plots": make_plots(data),
+                "plots": make_plots(data, params),
                 "summary": summary,
                 "solver_seconds": elapsed,
                 "log": log_tail,
@@ -4125,6 +4352,8 @@ INDEX_HTML = """<!doctype html>
         <button class="tikzbtn" onclick="exportPgf('current',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
       <figure class="pbox" id="box_wr"><img class="plot" id="p_wr" onclick="enlarge(this)">
         <button class="tikzbtn" onclick="exportPgf('wr',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox" id="box_defect"><img class="plot" id="p_defect" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('defect',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
       <figure class="pbox" id="box_probe_v"><img class="plot" id="p_probe_v" onclick="enlarge(this)">
         <button class="tikzbtn" onclick="exportPgf('probe_v',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
       <figure class="pbox" id="box_probe_i"><img class="plot" id="p_probe_i" onclick="enlarge(this)">
@@ -4139,6 +4368,8 @@ INDEX_HTML = """<!doctype html>
         <button class="tikzbtn" onclick="exportPgf('sweep_iters',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
       <figure class="pbox wide" id="box_sweep_iters2d"><img class="plot" id="p_sweep_iters2d" onclick="enlarge(this)">
         <button class="tikzbtn" onclick="exportPgf('sweep_iters2d',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
+      <figure class="pbox wide" id="box_sweep_defect2d"><img class="plot" id="p_sweep_defect2d" onclick="enlarge(this)">
+        <button class="tikzbtn" onclick="exportPgf('sweep_defect2d',this)" title="Export as LaTeX pgfplots">TikZ</button></figure>
     </div>
     <div id="vlineBar" style="display:none">
       <div class="btns" style="margin-top:12px;align-items:center;gap:10px">
@@ -4298,8 +4529,8 @@ function setStatus(msg, cls){
 function showSummary(sum){
   const el = document.getElementById('summary'); el.innerHTML = '';
   const fmt = v => (typeof v === 'number') ? (Number.isInteger(v) ? String(v) : (Math.abs(v)<1e-3||Math.abs(v)>=1e5 ? v.toExponential(4) : v.toPrecision(6))) : String(v);
-  const order = ['solver_seconds','total_xyce_solves','sec_per_xyce_solve','windows','max_WR_iterations','worst_WR_error','worst_FC_defect','all_converged','final_time_s','final_V_field','final_I_field'];
-  const labels = {solver_seconds:'solver time (s)', total_xyce_solves:'Xyce solves', sec_per_xyce_solve:'s / Xyce solve', final_time_s:'final time (s)', final_V_field:'final V_field', final_I_field:'final I_field', max_WR_iterations:'max WR iters', worst_WR_error:'worst WR error', worst_FC_defect:'worst f-c defect', all_converged:'all converged'};
+  const order = ['solver_seconds','total_xyce_solves','sec_per_xyce_solve','windows','max_WR_iterations','worst_WR_error','mean_WR_error','worst_FC_defect','mean_V_defect','mean_I_defect','all_converged','final_time_s','final_V_field','final_I_field'];
+  const labels = {solver_seconds:'solver time (s)', total_xyce_solves:'Xyce solves', sec_per_xyce_solve:'s / Xyce solve', final_time_s:'final time (s)', final_V_field:'final V_field', final_I_field:'final I_field', max_WR_iterations:'max WR iters', worst_WR_error:'worst WR error', worst_FC_defect:'worst f-c defect', mean_WR_error:'mean WR error', mean_V_defect:'mean |dV| defect', mean_I_defect:'mean |dI| defect', all_converged:'all converged'};
   for (const k of order){ if (k in sum){
     const c = document.createElement('div'); c.className='card';
     if (k === 'solver_seconds') c.classList.add('cost');
@@ -4368,6 +4599,7 @@ async function run(){
       setPlot('p_wr', j.plots.wr);
       setPlot('p_probe_v', j.plots.probe_v);
       setPlot('p_probe_i', j.plots.probe_i);
+      setPlot('p_defect', j.plots.defect);
       loadCircuit();  // the solver regenerated the netlist; refresh the schematic
     }
   } catch(e){ setStatus('Request failed: '+e, 'err'); }
@@ -4630,6 +4862,7 @@ function vlinePreview(){
         setPlot('p_sweep', j.plots ? j.plots.sweep : null);
         setPlot('p_sweep_iters', j.plots ? j.plots.iters : null);
         setPlot('p_sweep_iters2d', j.plots ? j.plots.iters2d : null);
+        setPlot('p_sweep_defect2d', j.plots ? j.plots.defect2d : null);
         showVlineVals(j.results);
       }
     } catch(e){ /* leave plots as-is */ }
@@ -4695,6 +4928,7 @@ async function runSweep(){
       setPlot('p_sweep', j.plots ? j.plots.sweep : null);
       setPlot('p_sweep_iters', j.plots ? j.plots.iters : null);
       setPlot('p_sweep_iters2d', j.plots ? j.plots.iters2d : null);
+      setPlot('p_sweep_defect2d', j.plots ? j.plots.defect2d : null);
       showSweepTable(j.table);
       document.getElementById('vlineBar').style.display = '';   // enable post-processing lines
     }
