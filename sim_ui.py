@@ -117,6 +117,9 @@ LABELS = {k: l for (k, l, _d, _kind, _s) in PARAMS}
 CHOICES = {k: s for (k, _l, _d, kind, s) in PARAMS if kind == "choice"}
 # Numeric params are sweepable (a "choice" metric switch is not a continuum).
 SWEEPABLE = [k for (k, _l, _d, kind, _s) in PARAMS if kind in ("float", "int")]
+# Lower bound of the params that declare a slider range, used to reject a derived sweep value that
+# lands outside what the control itself would allow (e.g. N_xyce_samples = 0).
+SLIDER_MIN = {k: s[0] for (k, _l, _d, _kind, s) in PARAMS if s}
 # Studio-only switches: they drive what the UI does with a run, not what the solver computes, so they
 # must NOT reach sim_config.txt as real lines (the C++ LoadConfig would log "unknown key ... ignored").
 # write_config round-trips them as "# ui:" comments instead; LoadConfig strips everything after '#'.
@@ -255,6 +258,29 @@ HELP = {
         "<div class='hn'>Emitted into the netlist's <code>.print</code> and captured per window into "
         "<code>Probes_solution.prn</code>; shown as the <b>Probe voltages</b> / <b>Probe currents</b> "
         "plots in Results. The port <code>V(p)</code> and interface current are already plotted.</div>"
+    ),
+    "sweep_types": (
+        "<div class='hh'>Parameter row types</div>"
+        "<div class='hn'><b>Range</b> &mdash; an independently swept dimension (Min &rarr; Max over "
+        "Steps, linear or log). The sweep mode (parallel / grid) applies to these only.</div>"
+        "<div class='hn'><b>% of&hellip;</b> &mdash; tracks another swept parameter at a fixed "
+        "percentage. Adds no dimension. Use it for a ROM that must stay a fixed fraction of the "
+        "field, e.g. <code>L_ROM</code> = 90% of <code>L_FEM</code>.</div>"
+        "<div class='hn'><b>Expression</b> &mdash; computed per point from the other parameters. "
+        "Adds no dimension. Names available: any config parameter (its value <i>at this point</i>), "
+        "your circuit-spec R/L/C element names, <code>base_&lt;name&gt;</code> for a parameter's "
+        "<i>pre-sweep</i> value, and <code>abs min max sqrt pi</code>. Integer parameters are "
+        "rounded; a value below the control's own minimum rejects the sweep before anything "
+        "solves.</div>"
+        "<div class='hn'><b>Constant Xyce resolution.</b> The printed step is "
+        "<code>dt_print = t_end / (N_field_windows &times; N_xyce_samples)</code>, so sweeping "
+        "<code>N_field_windows</code> changes the resolution unless <code>N_xyce_samples</code> "
+        "falls with it &mdash; which no percentage can express. Add <code>N_xyce_samples</code> as "
+        "an Expression:<br><code>base_N_field_windows*base_N_xyce_samples/N_field_windows</code>"
+        "<br>That product is the total number of printed samples over the whole run, so the literal "
+        "form <code>20000/N_field_windows</code> works too. Now "
+        "<code>N_field_windows</code> &times; <code>N_field_eval_intervals</code> can be gridded "
+        "with the Xyce sample spacing held fixed.</div>"
     ),
     "sweep_jobs": (
         "<div class='hh'>Parallel jobs</div>"
@@ -2085,22 +2111,52 @@ def eval_vlines_report(exprs, params):
     return out
 
 
-def build_sweep_points(specs, mode):
+def _coerce_sweep_value(key, value, where):
+    """Round a derived sweep value to the parameter's kind and reject one the control would not
+    accept. Raised at BUILD time, before any solving, so a bad expression costs nothing."""
+    if not math.isfinite(value):
+        raise ValueError(f"'{where}' evaluated to {value} for {key}")
+    if KINDS.get(key) in ("int", "choice"):
+        value = int(round(value))
+    lo = SLIDER_MIN.get(key)
+    if lo is not None and value < lo:
+        raise ValueError(f"'{where}' gives {key} = {value}, below its minimum of {lo:g} "
+                         f"-- widen the constant or narrow the swept range")
+    return value
+
+
+def build_sweep_points(specs, mode, base_params=None):
     """Turn a list of per-parameter sweep specs into (keys, points).
 
     A "free" spec is an independently swept range: {key, min, max, steps, scale}.
     A "linked" spec tracks another swept parameter as a fixed percentage and adds
     no new dimension: {key, link:{base, pct}} -> value = pct/100 * base_value.
+    A "derived" spec is an arbitrary expression over the other parameters and adds
+    no new dimension either: {key, expr} -> value = eval(expr) at each point.
+
+    Derived rows are what a constant-resolution study needs. dt_print =
+    t_end / (N_field_windows * N_xyce_samples), so holding the Xyce sample spacing fixed while
+    N_field_windows is swept means N_xyce_samples must fall as 1/N_field_windows -- a relationship
+    no percentage can express. The expression namespace is the reference-line one (config params +
+    circuit-spec R/L/C names + abs/min/max/sqrt/pi), plus this point's swept values, plus every
+    parameter's PRE-SWEEP value under a `base_` prefix. So the constant-resolution row is
+    `base_N_field_windows*base_N_xyce_samples/N_field_windows`, and the literal form
+    `20000/N_field_windows` works too -- that product IS the total number of printed samples over
+    the whole run.
 
     Modes (applied to the FREE specs only):
       "single"   -- one free parameter, a plain 1D sweep.
       "parallel" -- N free parameters advance in lock-step (same step count);
                     point i is (p1[i], p2[i], ...). Lists truncate to min length.
       "grid"     -- every combination of the free parameters (Cartesian product).
-    Linked values are appended to each point after the free values.
+    Linked and derived values are appended to each point after the free values.
     """
-    free = [s for s in specs if not s.get("link")]
+    free = [s for s in specs if not s.get("link") and "expr" not in s]
     linked = [s for s in specs if s.get("link")]
+    derived = [s for s in specs if "expr" in s and not s.get("link")]
+    for s in derived:
+        if not str(s.get("expr") or "").strip():
+            raise ValueError(f"'{s['key']}' is set to Expression but the expression is empty")
     if not free:
         raise ValueError("a sweep needs at least one independent (range) parameter")
     free_keys = [s["key"] for s in free]
@@ -2120,13 +2176,35 @@ def build_sweep_points(specs, mode):
         if s["link"]["base"] not in fidx:
             raise ValueError(f"linked parameter '{s['key']}' references "
                              f"'{s['link']['base']}', which is not an independently swept parameter")
-    keys = free_keys + [s["key"] for s in linked]
+    keys = free_keys + [s["key"] for s in linked] + [s["key"] for s in derived]
+
+    # Namespace shared by every derived row. `base_<key>` freezes the pre-sweep value of each
+    # parameter, so an expression can reference where the sweep started without hardcoding it.
+    env0 = _vline_env(base_params or {})
+    for k in DEFAULTS:
+        if k in env0:
+            env0["base_" + k] = env0[k]
+
     points = []
     for pt in base_pts:
         vals = list(pt)
+        env = dict(env0)
+        env.update({k: float(v) for k, v in zip(free_keys, pt)})
         for s in linked:
-            frac = float(s["link"]["pct"]) / 100.0
-            vals.append(pt[fidx[s["link"]["base"]]] * frac)
+            v = pt[fidx[s["link"]["base"]]] * (float(s["link"]["pct"]) / 100.0)
+            vals.append(v)
+            env[s["key"]] = float(v)
+        # In spec order, so a derived row may reference an earlier derived row.
+        for s in derived:
+            expr = str(s["expr"]).strip()
+            try:
+                raw = float(eval(expr, env))       # arithmetic only: builtins stripped by _vline_env
+            except Exception as e:
+                raise ValueError(f"{s['key']}: cannot evaluate '{expr}' "
+                                 f"({type(e).__name__}: {e})")
+            v = _coerce_sweep_value(s["key"], raw, expr)
+            vals.append(v)
+            env[s["key"]] = float(v)
         points.append(tuple(vals))
     return keys, points, free_keys
 
@@ -3307,7 +3385,7 @@ class Handler(BaseHTTPRequestHandler):
             keylist = [s["key"] for s in specs]
             if len(keylist) != len(set(keylist)):
                 raise ValueError("each swept parameter must be distinct")
-            keys, points, free_keys = build_sweep_points(specs, mode)
+            keys, points, free_keys = build_sweep_points(specs, mode, base)
             vlines = eval_vlines(body.get("vlines"), base)
             workers = int(body.get("workers") or 0) or None
             workers_used = max(1, min(workers or (os.cpu_count() or 1), len(points) or 1))
@@ -3477,6 +3555,7 @@ INDEX_HTML = """<!doctype html>
   .sw-row { display:flex; gap:8px; align-items:flex-end; flex-wrap:nowrap; margin-top:8px; }
   .sw-row .ctl { flex:1 1 0; min-width:0; }
   .sw-row .ctl.sw-rm { flex:0 0 auto; }
+  .sw-row .ctl.sw-expr { flex:2.6 1 0; }      /* an expression needs more room than a box */
   .sw-row .sw-del { width:34px; height:34px; padding:0; display:inline-flex;
        align-items:center; justify-content:center; font-size:16px; line-height:1; }
   .ctl.disabled { opacity:.4; }
@@ -3755,7 +3834,7 @@ INDEX_HTML = """<!doctype html>
     </div>
     <div id="status"></div>
     <details class="fold" style="margin-top:20px">
-      <summary>Convergence study (parameter sweep)</summary>
+      <summary>Convergence study (parameter sweep)<span class="help" data-help="sweep_types">?</span></summary>
       <div class="fold-body">
         <div id="sw_params"></div>
         <div class="btns" style="margin-top:10px">
@@ -4221,7 +4300,8 @@ function addSweepParam(key){
       '<select class="choice sw-key">'+sweepOptionsHtml(sel)+'</select></div></div>'+
     '<div class="ctl"><label>Type</label><div class="inputs">'+
       '<select class="choice sw-type" onchange="updateSweepMode()">'+
-      '<option value="range">Range</option><option value="link">% of&hellip;</option></select></div></div>'+
+      '<option value="range">Range</option><option value="link">% of&hellip;</option>'+
+      '<option value="expr">Expression</option></select></div></div>'+
     // range cells
     '<div class="ctl sw-range"><label>Min</label><div class="inputs">'+
       '<input type="number" class="sw-min" step="any" value="0"></div></div>'+
@@ -4237,6 +4317,10 @@ function addSweepParam(key){
       '<input type="number" class="sw-pct" step="any" value="50"></div></div>'+
     '<div class="ctl sw-link" style="display:none"><label>of</label><div class="inputs">'+
       '<select class="choice sw-base">'+sweepOptionsHtml(baseDefault?baseDefault[0]:sel)+'</select></div></div>'+
+    // derived cell (an expression over the other parameters); adds no sweep dimension
+    '<div class="ctl sw-expr" style="display:none"><label>Expression</label><div class="inputs">'+
+      '<input type="text" class="sw-x" spellcheck="false" '+
+      'placeholder="e.g. base_N_field_windows*base_N_xyce_samples/N_field_windows"></div></div>'+
     '<div class="ctl sw-rm"><label>&nbsp;</label><div class="inputs">'+
       '<button type="button" class="small sw-del" title="Remove parameter" '+
       'onclick="removeSweepParam(this)">&times;</button></div></div>';
@@ -4249,30 +4333,36 @@ function removeSweepParam(btn){
   btn.closest('.sw-row').remove();
   updateSweepMode();
 }
-function rowIsLink(row){ return row.querySelector('.sw-type').value === 'link'; }
+// 'range' = an independently swept dimension; 'link' (% of) and 'expr' are DERIVED from the
+// others and add no dimension of their own.
+function rowType(row){ return row.querySelector('.sw-type').value; }
+function rowIsRange(row){ return rowType(row) === 'range'; }
 function updateSweepMode(){
   const mode = document.getElementById('sw_mode').value;
   const rows = Array.from(document.querySelectorAll('#sw_params .sw-row'));
-  const rangeRows = rows.filter(r => !rowIsLink(r));
+  const rangeRows = rows.filter(rowIsRange);
   const firstRange = rangeRows[0] || null;
   const step0 = firstRange ? firstRange.querySelector('.sw-steps').value : '';
   const freeKeys = rangeRows.map(r => r.querySelector('.sw-key').value);
-  let nLink = 0;
+  let nLink = 0, nExpr = 0;
   rows.forEach((row, i) => {
-    const linked = rowIsLink(row);
+    const kind = rowType(row);
+    const linked = kind === 'link';
     if (linked) nLink++;
+    if (kind === 'expr') nExpr++;
     // Show only the cells for this row's type.
-    row.querySelectorAll('.sw-range').forEach(c => c.style.display = linked ? 'none' : '');
+    row.querySelectorAll('.sw-range').forEach(c => c.style.display = (kind === 'range') ? '' : 'none');
     row.querySelectorAll('.sw-link').forEach(c => c.style.display = linked ? '' : 'none');
+    row.querySelectorAll('.sw-expr').forEach(c => c.style.display = (kind === 'expr') ? '' : 'none');
     // Column labels only on the first row; the rest align underneath it.
     row.querySelectorAll('label').forEach(l => l.style.display = (i === 0) ? '' : 'none');
-    if (!linked){
+    if (kind === 'range'){
       // Parallel locks every free parameter to the first range row's step count.
       const inp = row.querySelector('.sw-steps');
       const lock = (mode === 'parallel' && row !== firstRange);
       inp.disabled = lock;
       if (lock) inp.value = step0;
-    } else {
+    } else if (linked) {
       // Base dropdown lists the independently swept (range) parameters, minus self.
       const bsel = row.querySelector('.sw-base'), cur = bsel.value;
       const selfKey = row.querySelector('.sw-key').value;
@@ -4286,7 +4376,9 @@ function updateSweepMode(){
   });
   const nFree = rangeRows.length;
   const note = document.getElementById('sweepNote');
-  const linkNote = nLink ? '  Linked (% of) parameters track their base and add no dimension.' : '';
+  const linkNote = (nLink ? '  Linked (% of) parameters track their base and add no dimension.' : '')
+    + (nExpr ? '  Expression parameters are computed per point from the others (names: any parameter'
+             + ', plus base_<name> for its pre-sweep value) and add no dimension.' : '');
   if (nFree <= 1)
     note.textContent = 'Single parameter: holds all other fields fixed and runs the solver once per swept value.' + linkNote;
   else if (mode === 'parallel')
@@ -4296,14 +4388,16 @@ function updateSweepMode(){
 }
 function collectSweepSpecs(mode){
   const rows = Array.from(document.querySelectorAll('#sw_params .sw-row'));
-  const rangeRows = rows.filter(r => !rowIsLink(r));
+  const rangeRows = rows.filter(rowIsRange);
   const firstRange = rangeRows[0] || null;
   const step0 = firstRange ? parseInt(firstRange.querySelector('.sw-steps').value, 10) : 8;
   return rows.map(row => {
     const key = row.querySelector('.sw-key').value;
-    if (rowIsLink(row))
+    if (rowType(row) === 'link')
       return { key, link: { base: row.querySelector('.sw-base').value,
                             pct: parseFloat(row.querySelector('.sw-pct').value) } };
+    if (rowType(row) === 'expr')
+      return { key, expr: (row.querySelector('.sw-x').value || '').trim() };
     return {
       key,
       min: parseFloat(row.querySelector('.sw-min').value),

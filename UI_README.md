@@ -152,6 +152,59 @@ Cells are labelled with their count while the grid is at most 144 cells; a blank
 cell is a combination whose solve failed (a window hit `WRmaxSteps` and the run
 aborted).
 
+### Parameter row types
+
+Each row in the panel is one of three kinds, chosen in its **Type** column:
+
+| type | meaning | adds a dimension? |
+| --- | --- | --- |
+| **Range** | independently swept, Min → Max over Steps (linear or log) | yes — the sweep mode applies to these |
+| **% of…** | tracks another swept parameter at a fixed percentage | no |
+| **Expression** | computed per point from the other parameters | no |
+
+An **Expression** row is evaluated once per sweep point. Available names:
+
+- any config parameter — its value *at this point*, so `N_field_windows` inside
+  the expression is the value this point is being run at;
+- `base_<name>` — that parameter's **pre-sweep** value (whatever the Properties
+  panel holds), so you needn't hardcode where the sweep started;
+- your circuit-spec `R`/`L`/`C` element names (`Rs`, `Ls`, …);
+- `abs`, `min`, `max`, `sqrt`, `pi`.
+
+Integer parameters are rounded. A value below the control's own minimum (or a
+name that doesn't resolve, or a division by zero) rejects the whole sweep with a
+message naming the row — before anything solves.
+
+#### Holding the Xyce resolution constant
+
+The printed step is
+
+```
+dt_print = t_end / (N_field_windows × N_xyce_samples)
+```
+
+so sweeping `N_field_windows` silently changes the Xyce sample spacing unless
+`N_xyce_samples` falls with it — a `1/x` relationship no percentage can express.
+Add `N_xyce_samples` as an **Expression** row:
+
+```
+base_N_field_windows*base_N_xyce_samples/N_field_windows
+```
+
+That product is the total number of printed samples over the whole run, so the
+literal form `20000/N_field_windows` does the same thing. With it in place you
+can grid **WR windows (total)** against **Field evals per window** and know the
+only things changing are the two you swept:
+
+| `N_field_windows` | `N_field_eval_intervals` | `N_xyce_samples` | `dt_print` |
+| --- | --- | --- | --- |
+| 25 | 1 · 2 · 4 | 800 | 1e-07 |
+| 50 | 1 · 2 · 4 | 400 | 1e-07 |
+| 100 | 1 · 2 · 4 | 200 | 1e-07 |
+
+Derived rows appear in the per-point table and the exported CSV like any other
+parameter, so the value actually used is always on the record.
+
 Both sweep figures carry the same **TikZ** button as the results plots. Because
 the on-screen figures are composites, the exported `.tex` holds **one
 independent `tikzpicture` per panel** — copy the one you want into its own file,
@@ -174,8 +227,9 @@ python3 sim_ui.py sweep --param WR_tolerance --min 1e-4 --max 1e-2 --steps 6 --s
 `log` (needs strictly positive min/max); `--out` sets the plot file (default
 `sweep.png`).
 
-> Note: a sweep overwrites `sim_config.txt` with each point's values and leaves
-> it holding the last swept value when it finishes.
+> Note: every sweep point solves in its own temporary directory (that is what lets
+> points run concurrently), so a sweep leaves `sim_config.txt` and the other
+> working-tree files exactly as it found them.
 
 ## A-priori convergence estimate (port impedance `x_P`)
 
