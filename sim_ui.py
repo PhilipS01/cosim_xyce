@@ -2262,6 +2262,93 @@ def _all_config_numeric():
     return d
 
 
+# Source TYPEs and the numeric fields a sweep can drive, in spec order after <name> <a> <b>.
+# {V,I}PWL is deliberately absent: its field list is variable-length (t1 v1 t2 v2 ...), so there is
+# no stable name for "the third number".
+_SOURCE_FIELDS = {
+    "VSIN":   [("amp", "amplitude (V)"), ("freq", "frequency (Hz)")],
+    "ISIN":   [("amp", "amplitude (A)"), ("freq", "frequency (Hz)")],
+    "VDC":    [("val", "level (V)")],
+    "IDC":    [("val", "level (A)")],
+    "VPULSE": [("v1", "initial level (V)"), ("v2", "pulsed level (V)"),
+               ("td", "delay (s)"), ("tr", "rise time (s)")],
+    "IPULSE": [("v1", "initial level (A)"), ("v2", "pulsed level (A)"),
+               ("td", "delay (s)"), ("tr", "rise time (s)")],
+    "VPWM":   [("v1", "low level (V)"), ("v2", "high level (V)"),
+               ("freq", "frequency (Hz)"), ("duty", "duty cycle")],
+    "IPWM":   [("v1", "low level (A)"), ("v2", "high level (A)"),
+               ("freq", "frequency (Hz)"), ("duty", "duty cycle")],
+}
+SOURCE_PREFIX = "src_"
+
+
+def _spec_rows(spec):
+    """[(line index, [tokens])] for the element lines of a circuit spec (comments/blanks dropped)."""
+    rows = []
+    for i, line in enumerate((spec or "").splitlines()):
+        body = line.split("#", 1)[0].strip()
+        if body:
+            rows.append((i, body.split()))
+    return rows
+
+
+def source_params(spec=None):
+    """Sweepable fields of the circuit's source -> {key: {"label", "value", "line", "pos"}}.
+
+    Only when the spec holds EXACTLY ONE source. With two, "the source's frequency" names nothing
+    and a sweep would have to guess which line to rewrite; with none there is nothing to sweep.
+    Returns an empty dict in either case, which is what hides the options from the sweep dropdown.
+
+    Registers the keys in LABELS as a side effect, so every downstream `LABELS.get(k, k)` (plot
+    titles, axis labels, the sweep table) names the field instead of echoing the raw key. They are
+    refreshed on each call, so renaming the source in the spec renames them too."""
+    if spec is None:
+        spec = read_spec()
+    found = []
+    for idx, tok in _spec_rows(spec):
+        typ = tok[0].upper()
+        if typ in _SOURCE_FIELDS:
+            found.append((idx, typ, tok))
+        elif typ in ("VPWL", "IPWL"):
+            found.append((idx, typ, tok))      # counts as a source, but exposes no fields
+    if len(found) != 1:
+        return {}
+    idx, typ, tok = found[0]
+    fields = _SOURCE_FIELDS.get(typ, [])
+    name = tok[1] if len(tok) > 1 else typ
+    out = {}
+    for pos, (field, what) in enumerate(fields):
+        col = 4 + pos                          # <TYPE> <name> <a> <b> then the numeric fields
+        if col >= len(tok):
+            break                              # spec line is short -> that field is not authored
+        try:
+            value = float(tok[col])
+        except ValueError:
+            continue                           # a non-numeric field cannot be swept
+        key = SOURCE_PREFIX + field
+        LABELS[key] = f"{name} {what}"
+        out[key] = {"label": LABELS[key], "value": value, "line": idx, "pos": col}
+    return out
+
+
+def apply_source_params(spec, overrides):
+    """`spec` with the single source's fields replaced by `overrides` ({src_<field>: value}).
+
+    Rewrites only the numeric token in place, so comments, spacing of other lines, and every other
+    element survive untouched. Unknown keys are ignored (the caller may pass a mixed dict)."""
+    info = source_params(spec)
+    edits = {info[k]["pos"]: v for k, v in (overrides or {}).items() if k in info}
+    if not edits:
+        return spec
+    line_no = next(iter(info.values()))["line"]
+    lines = spec.splitlines()
+    tok = lines[line_no].split("#", 1)[0].strip().split()
+    for pos, v in edits.items():
+        tok[pos] = f"{float(v):.10g}"
+    lines[line_no] = " ".join(tok)
+    return "\n".join(lines) + "\n"
+
+
 def _spec_element_values(spec):
     """Map R/L/C element names in a circuit spec to their numeric value, so
     reference-line expressions can name real circuit elements (e.g. Rs, Ls).
@@ -2296,7 +2383,9 @@ def _vline_env(params):
     (e.g. Rs, Ls), then the live params (highest precedence), plus math helpers."""
     env = {"__builtins__": {}}
     src = dict(_all_config_numeric())
-    src.update(_spec_element_values((params or {}).get("circuit_spec")))
+    spec = (params or {}).get("circuit_spec")
+    src.update(_spec_element_values(spec))
+    src.update({k: v["value"] for k, v in source_params(spec).items()})
     src.update(params or {})
     for k, v in src.items():
         try:
@@ -2392,8 +2481,10 @@ def build_sweep_points(specs, mode, base_params=None):
     if not free:
         raise ValueError("a sweep needs at least one independent (range) parameter")
     free_keys = [s["key"] for s in free]
+    # Source fields (src_*) live in the circuit spec, not in PARAMS, so they carry no KINDS entry;
+    # they are continuous by nature.
     per = [sweep_values(float(s["min"]), float(s["max"]), int(s["steps"]),
-                        s.get("scale", "linear"), KINDS[s["key"]]) for s in free]
+                        s.get("scale", "linear"), KINDS.get(s["key"], "float")) for s in free]
     if len(free) == 1 or mode == "single":
         base_pts = [(v,) for v in per[0]]
         free_keys = free_keys[:1]
@@ -2455,6 +2546,13 @@ def _sweep_point(base_params, keys, pt):
         params = dict(base_params)
         for k, v in zip(keys, pt):
             params[k] = v
+        # Source fields are not config keys: they are numbers inside circuit_spec.txt, so they are
+        # applied by rewriting that line. write_config only emits keys it knows, so leaving them in
+        # `params` would be harmless -- popping them keeps the dict honest for the row's `vals`.
+        overrides = {k: params.pop(k) for k in list(params) if k.startswith(SOURCE_PREFIX)}
+        if overrides:
+            params["circuit_spec"] = apply_source_params(
+                params.get("circuit_spec") or read_spec(), overrides)
         write_config(params, d)
         write_spec(params, d)
         write_probes(params, d)
@@ -3815,6 +3913,9 @@ class Handler(BaseHTTPRequestHandler):
                 "directives": parsed["directives"],
                 "nodes": parsed["nodes"],
                 "raw": parsed["raw"],
+                # Spec-dependent: the source's fields appear only while the circuit has exactly one.
+                "sweep_params": sweep_options(
+                    (params or {}).get("circuit_spec") if params else None),
             }))
         except Exception as e:
             self._send(200, json.dumps({
@@ -4047,9 +4148,12 @@ class Handler(BaseHTTPRequestHandler):
                           "max": body["max"], "steps": body["steps"],
                           "scale": body.get("scale", "linear")}]
                 mode = "single"
+            src_keys = set(source_params(base.get("circuit_spec")))
             for s in specs:
-                if s["key"] not in SWEEPABLE:
-                    raise ValueError(f"'{s['key']}' is not a sweepable parameter")
+                if s["key"] not in SWEEPABLE and s["key"] not in src_keys:
+                    hint = ("" if src_keys else
+                            " -- source fields need exactly one source in the circuit")
+                    raise ValueError(f"'{s['key']}' is not a sweepable parameter{hint}")
             keylist = [s["key"] for s in specs]
             if len(keylist) != len(set(keylist)):
                 raise ValueError("each swept parameter must be distinct")
@@ -4188,9 +4292,17 @@ def _sweep_options_html():
     )
 
 
+def sweep_options(spec=None):
+    """[[key, label], ...] for the sweep-parameter selects: the config params plus whatever fields
+    the circuit's single source exposes (nothing, when it has none or several)."""
+    src = source_params(spec)
+    return ([[k, LABELS.get(k, k)] for k in SWEEPABLE]
+            + [[k, v["label"]] for k, v in src.items()])
+
+
 def _sweep_options_js():
     """JS array literal [[value,label],...] for building sweep-parameter selects."""
-    return json.dumps([[k, LABELS.get(k, k)] for k in SWEEPABLE])
+    return json.dumps(sweep_options())
 
 
 INDEX_HTML = """<!doctype html>
@@ -4715,7 +4827,9 @@ const DEFAULTS = __DEFAULTS__;
 const PRESETS = __PRESETS__;
 const VISIBLE_WHEN = __VISIBILITY__;
 const HELP = __HELP__;
-const SWEEP_OPTS = __SWEEP_OPTS_JS__;
+// Mutable: the source's own fields join the list only while the circuit has exactly one
+// source, so it is refreshed from every /netlist reply (see refreshSweepOpts).
+let SWEEP_OPTS = __SWEEP_OPTS_JS__;
 
 // hover help: position:fixed tooltip so it escapes the controls panel's overflow clipping.
 function helpShow(t){ const key=t.getAttribute('data-help'); if(!HELP[key])return;
@@ -5021,6 +5135,23 @@ function showSweepTable(tbl){
 
 // ---- dynamic N-parameter sweep rows ----
 let sweepRowSeq = 0;
+// The sweep dropdown is spec-dependent (source fields come and go), so re-render every row's
+// parameter select in place, keeping each row's current choice when it still exists.
+function refreshSweepOpts(opts){
+  if (!opts || !opts.length) return;
+  SWEEP_OPTS = opts;
+  const valid = new Set(opts.map(o => o[0]));
+  document.querySelectorAll('#sw_params .sw-row').forEach(row => {
+    for (const cls of ['.sw-key', '.sw-base']){
+      const sel = row.querySelector(cls);
+      if (!sel) continue;
+      const cur = sel.value;
+      sel.innerHTML = sweepOptionsHtml(valid.has(cur) ? cur : (opts[0] || [''])[0]);
+    }
+  });
+  updateSweepMode();   // the "% of..." base lists are derived from the range rows' keys
+}
+
 function sweepOptionsHtml(sel){
   return SWEEP_OPTS.map(o => '<option value="'+o[0]+'"'+(o[0]===sel?' selected':'')+'>'+o[1]+'</option>').join('');
 }
@@ -5298,6 +5429,7 @@ async function loadCircuit(){
       showNetlist(j);
       pwlRenderButtons();  // refresh the ✎ PWL edit buttons in the spec box
       pbRefresh();         // refresh probe target dropdowns from the (possibly preset-loaded) spec
+      refreshSweepOpts(j.sweep_params);   // source fields appear/vanish with the edited spec
       syncSchemHeight();  // locked text just changed the left-block height -> recap the schematic
     }
   } catch(e){ /* leave circuit box empty on failure */ }

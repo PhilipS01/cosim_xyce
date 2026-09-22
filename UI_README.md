@@ -249,10 +249,36 @@ Each row in the panel is one of three kinds, chosen in its **Type** column:
 | **% of…** | tracks another swept parameter at a fixed percentage | no |
 | **Expression** | computed per point from the other parameters | no |
 
+### Sweeping the source
+
+The circuit side lives in `circuit_spec.txt`, not in `sim_config.txt`, so its
+numbers were out of reach of the sweep. When the spec holds **exactly one
+source**, its fields now join the parameter dropdown:
+
+| source | fields |
+| --- | --- |
+| `VSIN` / `ISIN` | `src_amp`, `src_freq` |
+| `VDC` / `IDC` | `src_val` |
+| `VPULSE` / `IPULSE` | `src_v1`, `src_v2`, `src_td`, `src_tr` |
+| `VPWM` / `IPWM` | `src_v1`, `src_v2`, `src_freq`, `src_duty` |
+
+They are labelled with the source's own name (`Bemf frequency (Hz)`), sweep like
+any other parameter — range, `% of…`, or **Expression** — and can be named inside
+an expression or a reference line. Each point rewrites that one number in the
+spec line, leaving comments, spacing and every other element untouched.
+
+Requires exactly one source: with two, "the source's frequency" names nothing and
+the sweep would have to guess which line to rewrite, so the options disappear from
+the dropdown and an explicit `src_*` key is refused. `{V,I}PWL` counts as a source
+but exposes no fields — its `t1 v1 t2 v2 …` list has no stable name for "the third
+number". The dropdown refreshes whenever the schematic does, so editing the spec
+adds or removes the options live.
+
 An **Expression** row is evaluated once per sweep point. Available names:
 
 - any config parameter — its value *at this point*, so `N_field_windows` inside
   the expression is the value this point is being run at;
+- the source fields above (`src_freq`, `src_amp`, …) when the circuit has one source;
 - `base_<name>` — that parameter's **pre-sweep** value (whatever the Properties
   panel holds), so you needn't hardcode where the sweep started;
 - your circuit-spec `R`/`L`/`C` element names (`Rs`, `Ls`, …);
