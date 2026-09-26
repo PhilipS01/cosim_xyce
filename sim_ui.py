@@ -150,18 +150,20 @@ PRESETS = {
     "P2: Sine I (bare)": {"coupling_mode": 1,
                           "circuit_spec": "ISIN Bemf 0 p 1 50\n"},
     # Switch circuits (SW = time-gated switch, closed during [tclose, topen); emitted as a Xyce native
-    # Generic Switch, S device + .MODEL SWITCH). 2-way (SPDT) switch: wiper w throws between the source
-    # branch (node a, drv closed early) and the freewheel branch (fw closed after), with cap w->0.
-    # P3 and P6 share that topology and differ only in the source (sine / DC); Ron/C set the damping --
-    # an undamped cap<->coil freewheel driven on resonance rings hard (see the validation-vs-cosim study).
-    "P3: 2-way switch (sine U, C)": {"t_end": 1.6e-3, "N_field_windows": 100,
-        "coupling_mode": 0, "WRmaxSteps": 40, "L_FEM": 1.68e-7, "R_FEM": 5e-4,
-        "circuit_spec": "VSIN Bemf a p 1 20000\nC Csw 0 w 0.37e-3\n"
-                        "SW drv w a 0 1e-3 1e-3 1e12 0.1e-3\nSW fw w p 1e-3 1e30 1e-3 1e12 0.1e-3\n"},
-    "P4: 2-way switch (AC vs R)": {"t_end": 2.0e-2, "N_field_windows": 50,
+    # Generic Switch, S device + .MODEL SWITCH). P3 throws the port between an AC source branch and a
+    # resistive load branch, both to ground.
+    "P3: 2-way switch (AC vs R)": {"t_end": 2.0e-2, "N_field_windows": 50,
         "coupling_mode": 0, "WRmaxSteps": 40,
         "circuit_spec": "VSIN Bemf p bac 1 50\nR Rload p br 1e4\n"
                         "SW ac bac 0 0 6e-3 1e-3 1e9 1e-5\nSW rd br 0 6e-3 1e30 1e-3 1e9 1e-5\n"},
+    # 2-way (SPDT) switch: wiper w throws between the source branch (node a, drv closed early) and the
+    # freewheel branch (fw closed after), with cap w->0. P4 and P6 share that topology and differ only
+    # in the source (sine / DC); Ron/C set the damping -- an undamped cap<->coil freewheel driven on
+    # resonance rings hard (see the validation-vs-cosim study).
+    "P4: 2-way switch (sine U, C)": {"t_end": 1.6e-3, "N_field_windows": 100,
+        "coupling_mode": 0, "WRmaxSteps": 40, "L_FEM": 1.68e-7, "R_FEM": 5e-4,
+        "circuit_spec": "VSIN Bemf a p 1 20000\nC Csw 0 w 0.37e-3\n"
+                        "SW drv w a 0 1e-3 1e-3 1e12 0.1e-3\nSW fw w p 1e-3 1e30 1e-3 1e12 0.1e-3\n"},
     # window 1 straddles the whole ramp edge (stiff transient) -> more WR iters (WRmaxSteps=40)
     "P5: Step/ramp V + RL": {"t_end": 2.0e-2, "N_field_windows": 50,
                              "coupling_mode": 0, "WRmaxSteps": 40,
@@ -842,7 +844,7 @@ def _elk_layout(recs, gnd="0", port="p"):
 # Hand-placed layouts for the built-in presets. ELK is a fine general fallback, but for the fixed
 # preset topologies a tuned by-hand placement reads far cleaner (source left / field ROM right,
 # orthogonal columns). Keyed by the preset's exact set of physical net names (which is stable per
-# preset and shared by P1/P3 and P4/P5 -- same topology, different source), so an edited/custom
+# preset and shared by P4/P6 -- same topology, different source), so an edited/custom
 # circuit whose nets differ simply misses and falls back to ELK. Coordinates are in ELK's pixel
 # convention (y DOWN, ~40 px = 1 cm); `routes` are per-element orthogonal polylines keyed by the
 # element's unordered node pair (the component symbol lands on the polyline's longest segment).
@@ -872,7 +874,7 @@ _MANUAL_LAYOUTS = {
                    frozenset({"p", "nx"}): [(240, 0), (360, 0), (360, 120)],
                    frozenset({"nx", "0"}): [(360, 120), (360, 360), (240, 360)]},
         "size": (360, 360)},
-    # P3 / P6: SPDT wiper w (cap w->gnd) throws between the source branch (a, up) and the freewheel
+    # P4 / P6: SPDT wiper w (cap w->gnd) throws between the source branch (a, up) and the freewheel
     # straight to the port (fw: w->p); same topology, source differs (sine / DC). Interface on the right.
     frozenset({"a", "w", "p", "nx", "0"}): {
         "nets": {"w": (40, 120), "a": (160, 40), "p": (300, 120),
@@ -883,7 +885,7 @@ _MANUAL_LAYOUTS = {
                    frozenset({"a", "p"}): [(160, 40), (300, 40), (300, 120)],
                    frozenset({"nx", "0"}): [(420, 120), (420, 240), (330, 240)]},
         "size": (420, 240)},
-    # P4: two parallel branches from port p to gnd -- (V + switch) and (R + switch) -- plus the
+    # P3: two parallel branches from port p to gnd -- (V + switch) and (R + switch) -- plus the
     # interface (ammeter + field ROM) as the third column. Top rail = p, bottom rail = gnd.
     # Verticals are 140 (> the 120 top-rail reach) so each column's device (V / R / ammeter) lands on
     # its vertical segment at the same height, not up on the top rail.
