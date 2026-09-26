@@ -1284,10 +1284,17 @@ def interface_defect(data):
         dV(t) = V_field(t) - V(p)_circuit(t)
         dI(t) = I_field(t) - I(Vmeas)_circuit(t)
 
-    Sign matches the C++ terminal defect (field minus circuit). The field waveform lives on the
-    coarser field grid (N_field_eval_intervals per window), so it is LINEARLY interpolated onto the
-    circuit grid -- which is exactly what Xyce does with the PWL carriers, so this is the defect the
-    circuit actually saw, reconstruction error included.
+    Sign matches the C++ terminal defect (field minus circuit). The field waveform is LINEARLY
+    INTERPOLATED onto the circuit grid, so the defect is reported at every circuit sample rather
+    than only where the two grids meet. That is deliberate: the circuit is driven by the field's
+    PWL carriers, which Xyce itself reads as a linear interpolant between field nodes, so this is
+    the defect the circuit actually saw -- field-grid reconstruction error included.
+
+    Grid shapes, measured rather than assumed: Circuit_solution.prn carries Xyce's RAW ADAPTIVE
+    time points (thousands per run, not the dt_print coupling grid), while the field waveform has
+    N_field_eval_intervals nodes per window. The field nodes are a subset of the circuit's times --
+    the interface PWL carriers put a breakpoint at each one and Xyce must step onto it -- so the
+    interpolation only fills in BETWEEN field nodes and never extrapolates at them.
 
     Which channel is the real transmission defect depends on the coupling direction, because
     Field_waveform_solution.prn's other column is the circuit's own waveform resampled onto the
@@ -1300,22 +1307,29 @@ def interface_defect(data):
     fw = data.get("field_wave") or {}
     tc = np.asarray(c.get("t", []), dtype=float)
     tf = np.asarray(fw.get("t", []), dtype=float)
-    if tc.size == 0 or tf.size < 2:
+    Vc = np.asarray(c.get("Vp", []), dtype=float)
+    Ic = np.asarray(c.get("I", []), dtype=float)
+    if tc.size == 0 or tf.size < 2 or Vc.size != tc.size or Ic.size != tc.size:
         return None
-    # np.interp needs an increasing grid; a window seam repeats its timestamp (carried start == the
-    # previous window's end), so collapse duplicates first.
+    # np.interp needs an increasing grid; a window seam repeats its timestamp (the carried start
+    # equals the previous window's end), so collapse duplicates first.
     tfu, keep = np.unique(tf, return_index=True)
     if tfu.size < 2:
         return None
-    Vf = np.asarray(fw.get("V", []), dtype=float)[keep]
-    If = np.asarray(fw.get("I", []), dtype=float)[keep]
+    Vf = np.asarray(fw.get("V", []), dtype=float)
+    If = np.asarray(fw.get("I", []), dtype=float)
+    if Vf.size != tf.size or If.size != tf.size:
+        return None
+    Vf, If = Vf[keep], If[keep]
     m = (tc >= tfu[0]) & (tc <= tfu[-1])          # never extrapolate past the field waveform
     t = tc[m]
-    if t.size == 0 or Vf.size != tfu.size or If.size != tfu.size:
+    if t.size == 0:
         return None
     return {"t": t,
-            "dV": np.interp(t, tfu, Vf) - np.asarray(c["Vp"], dtype=float)[m],
-            "dI": np.interp(t, tfu, If) - np.asarray(c["I"], dtype=float)[m]}
+            "dV": np.interp(t, tfu, Vf) - Vc[m],
+            "dI": np.interp(t, tfu, If) - Ic[m],
+            "n_field": int(tfu.size),
+            "n_samples": int(t.size)}
 
 
 # Which defect channel is the genuine cross-solver one, per coupling_mode (see interface_defect).
@@ -1454,9 +1468,10 @@ def make_plots(data, params=None):
             ax.set_title("Probe currents"); ax.grid(True, alpha=.3); ax.legend(fontsize=8, loc="upper right")
             plots["probe_i"] = _png(fig)
 
-    # 6) Inner-window field-circuit defect. SIGNED and linear on purpose: the defect typically ramps
-    # inside a window and resets at the seam, and that sawtooth is the thing worth seeing. Twin axes
-    # because the two channels carry different units (V and A).
+    # 6) Inner-window field-circuit defect, on the circuit grid (field waveform interpolated onto
+    # it). SIGNED and linear on purpose: the defect typically ramps inside a window and resets at
+    # the seam, and that sawtooth is the thing worth seeing. Twin axes because the two channels
+    # carry different units (V and A).
     d = interface_defect(data)
     if d and d["t"].size:
         lv, li = defect_labels(params)
@@ -1764,9 +1779,10 @@ def scalar_summary(data):
         fc = np.concatenate([wr.get("fcI", np.array([])), wr.get("fcV", np.array([]))])
         if fc.size and not np.all(np.isnan(fc)):
             s["worst_FC_defect"] = float(np.nanmax(fc))
-    # INNER-window field-circuit defect: the same comparison across every sample of every window
-    # rather than only at the terminals. Averaged over |.| so window-to-window sign changes do not
-    # cancel; max alongside it for the worst instant.
+    # INNER-window field-circuit defect: the same comparison across every circuit sample of every
+    # window rather than only at the terminals, with the field waveform interpolated onto the
+    # circuit grid. Averaged over |.| so window-to-window sign changes do not cancel; max alongside
+    # it for the worst instant.
     d = interface_defect(data)
     if d and d["t"].size:
         s["mean_V_defect"] = float(np.mean(np.abs(d["dV"])))
@@ -2989,11 +3005,13 @@ def pgf_sweep_tex(which, sweep, vlines=None):
                  r"$\mathrm{Mean}\;|\Delta V|\;(\mathrm{field}-\mathrm{circuit})$", "V"),
                 ("mean_I_defect", "Mean |dI| (field - circuit)",
                  r"$\mathrm{Mean}\;|\Delta I|\;(\mathrm{field}-\mathrm{circuit})$", "A")):
+            # A log colour scale cannot carry an exact zero, and flooring it would invent a value.
+            # Zeros are emitted as holes; the header comment says so.
             M = np.full((len(ys), len(xs)), np.nan)
             for r in ok:
                 v = r.get(nm)
-                if v is not None and np.isfinite(float(v)):
-                    M[iy[r["vals"][ky]], ix[r["vals"][kx]]] = max(float(v), 1e-18)
+                if v is not None and np.isfinite(float(v)) and abs(float(v)) > 0.0:
+                    M[iy[r["vals"][ky]], ix[r["vals"][kx]]] = abs(float(v))
             pic = _pgf_matrix_panel(title, kx, ky, xs, ys, M, f"mean defect ({unit})", log=True,
                                     vlines=vlines, logx=gx, logy=gy)
             if pic:
@@ -3004,11 +3022,15 @@ def pgf_sweep_tex(which, sweep, vlines=None):
         head = _pgf_sweep_head(fname,
                                f"Mean field-circuit interface defect over the "
                                f"{LABELS.get(kx, kx)} x {LABELS.get(ky, ky)} grid.", names,
-                               ["Colour is |field - circuit| averaged over EVERY sample of every "
-                                "window, not just the window terminals. Which channel is the real "
-                                "cross-solver defect flips with coupling_mode: voltage-driven -> "
-                                "dI, current-driven -> dV; the other channel is the field-grid "
-                                "reconstruction error."])
+                               ["Colour is |field - circuit| averaged over every instant where BOTH "
+                                "solvers have a sample (no interpolation), not just the window "
+                                "terminals. Which channel is the real cross-solver defect flips with "
+                                "coupling_mode: voltage-driven -> dI, current-driven -> dV; the "
+                                "other channel is the field-grid reconstruction error.",
+                                "A BLANK cell is either a combination whose solve failed or one "
+                                "whose defect is EXACTLY zero -- a log colour scale cannot carry a "
+                                "zero, and flooring it would invent a value. The on-screen figure "
+                                "separates the two (grey = exactly zero)."])
         body = []
         for nm, pic in zip(names, pics):
             body += [f"% --- {nm} ---"] + pic + [""]
@@ -3259,11 +3281,14 @@ def _make_defect_heatmap(dims, rows, mode, vlines=None, scales=None):
     iy = {v: i for i, v in enumerate(ys)}
 
     def grid(name):
+        # Exact zeros are kept as 0, NOT floored: a defect of exactly zero (every field node landing
+        # on a coupling-PWL node, so the resample is a straight pick) is qualitatively different
+        # from a tiny one, and clamping it to 1e-18 would invent 14 decades of dynamic range.
         g = np.full((len(ys), len(xs)), np.nan)
         for r in ok:
             v = r.get(name)
             if v is not None and np.isfinite(float(v)):
-                g[iy[r["vals"][ky]], ix[r["vals"][kx]]] = max(float(v), 1e-18)
+                g[iy[r["vals"][ky]], ix[r["vals"][kx]]] = abs(float(v))
         return g
 
     scales = scales or {}
@@ -3277,12 +3302,26 @@ def _make_defect_heatmap(dims, rows, mode, vlines=None, scales=None):
             [("mean_V_defect", r"mean $|\Delta V|$   (field $-$ circuit)", "V"),
              ("mean_I_defect", r"mean $|\Delta I|$   (field $-$ circuit)", "A")]):
         g = grid(name)
-        finite = g[np.isfinite(g)]
-        norm = LogNorm(vmin=finite.min(), vmax=finite.max()) if finite.size else None
-        pcm = ax.pcolormesh(xe, ye, g, cmap="inferno", norm=norm, shading="flat")
-        cbar = fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04)
+        pos = g[np.isfinite(g) & (g > 0.0)]
+        n_zero = int(np.sum(np.isfinite(g) & (g == 0.0)))
+        cmap = plt.get_cmap("inferno").copy()
+        cmap.set_under("#cfd8dc")          # exactly zero -- a distinct flat colour, not "very small"
+        norm, plot = None, g
+        if pos.size:
+            vmin = float(pos.min())
+            vmax = max(float(pos.max()), vmin * 10.0)
+            norm = LogNorm(vmin=vmin, vmax=vmax)
+            plot = np.where(np.isfinite(g) & (g == 0.0), vmin / 10.0, g)   # push zeros under vmin
+        pcm = ax.pcolormesh(xe, ye, plot, cmap=cmap, norm=norm, shading="flat")
+        cbar = fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04,
+                            extend="min" if n_zero else "neither")
         cbar.set_label(f"mean defect ({unit})")
-        ax.set_title(title, fontsize=10)
+        sub = ""
+        if n_zero == int(np.sum(np.isfinite(g))):
+            sub = "  -- all exactly 0"
+        elif n_zero:
+            sub = f"  -- {n_zero} cell(s) exactly 0 (grey)"
+        ax.set_title(title + sub, fontsize=10)
         ax.set_xlabel(kx); ax.set_ylabel(ky)
         _heatmap_axis(ax, "x", xs, logx)
         _heatmap_axis(ax, "y", ys, logy)

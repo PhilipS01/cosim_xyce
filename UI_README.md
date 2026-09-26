@@ -54,12 +54,19 @@ python3 sim_ui.py sweep --param L_FEM --min 1e-7 --max 1e-5 --steps 8 --scale lo
    dI(t) = I_field(t) - I(Vmeas)_circuit(t)
    ```
 
-   The field waveform lives on the coarser field grid, so it is linearly
-   interpolated onto the circuit grid — which is what Xyce itself does with the
-   PWL carriers, so this is the defect the circuit actually saw, reconstruction
-   error included. Values are **signed** on linear twin axes, because the defect
-   typically ramps inside a window and resets at the seam and that sawtooth is the
-   content.
+   The field waveform has only `N_field_eval_intervals` nodes per window, so it is
+   **linearly interpolated onto the circuit grid** and the defect is reported at
+   every circuit sample. That is deliberate: the circuit is driven by the field's
+   PWL carriers, which Xyce itself reads as a linear interpolant between field
+   nodes, so this is the defect the circuit actually saw — field-grid
+   reconstruction error included. `Circuit_solution.prn` carries Xyce's *raw
+   adaptive* time points (thousands per run, not the `dt_print` coupling grid), and
+   the field nodes are a subset of them — the PWL carriers put a breakpoint at each
+   one, which Xyce must step onto — so the interpolation only fills in *between*
+   field nodes and never extrapolates at them.
+
+   Values are **signed** on linear twin axes, because the defect typically ramps
+   inside a window and resets at the seam and that sawtooth is the content.
 
    **Only one channel is a real cross-solver defect.** `Field_waveform_solution.prn`
    carries the *circuit's own* waveform, resampled onto the field grid, in the
@@ -71,7 +78,8 @@ python3 sim_ui.py sweep --param L_FEM --min 1e-7 --max 1e-5 --steps 8 --scale lo
    evaluations.
 
    Summary scalars `mean_V_defect` / `mean_I_defect` (and `max_*`) are the
-   mean/max of `|d·|` over every sample; they also land in the sweep table and CSV.
+   mean/max of `|d·|` over every circuit sample; they also land in the sweep table
+   and CSV.
 
    Hovering a results plot reveals a **TikZ** button that downloads that one plot
    as `pgfplots` LaTeX (`interface_voltage.tex`, `interface_current.tex`,
@@ -181,10 +189,15 @@ by orders of magnitude, so a shared scale would flatten the mean panel).
 
 A 2-parameter grid sweep also draws **Mean field-circuit defect**: two heatmaps
 of `mean |dV|` and `mean |dI|` (log colour scale), the inner-window defect above
-averaged over every sample of every window. Kept as its own figure rather than
-folded into the metric grid, because the two channels are not interchangeable —
-one is the cross-solver defect and the other the reconstruction error, and which
-is which flips with `coupling_mode`, so they are read as a pair.
+averaged over every circuit sample. Kept as its own figure rather than folded
+into the metric grid, because the two channels are not interchangeable — one is
+the cross-solver defect and the other the reconstruction error, and which is
+which flips with `coupling_mode`, so they are read as a pair.
+
+Should a cell come out **exactly zero**, it is drawn grey (a `set_under` colour,
+with the count in the panel title) rather than floored onto the log scale, which
+would invent decades of dynamic range that aren't there. The TikZ export has no
+equivalent, so it emits such cells as holes and says so in its header comment.
 
 **Heatmap axes follow the sweep's Spacing.** A parameter swept `log` gets a
 log-scaled axis, so its cells come out uniform instead of crowding at the small
