@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/1285906340.svg)](https://doi.org/10.5281/zenodo.22978638)
 # cosim_xyce — WR field/circuit co-simulation
 
 Waveform-relaxation (WR) co-simulation coupling a **Xyce** SPICE circuit to a
